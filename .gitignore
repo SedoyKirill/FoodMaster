@@ -1,0 +1,68 @@
+# --- Secrets and local configuration -----------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.python-version
+uv.lock.bak
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+
+# --- Node / frontend ---------------------------------------------------------
+node_modules/
+web/dist/
+web/.vite/
+web/stats.html
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.eslintcache
+
+# --- Project data (large, regenerable, or machine-local) ---------------------
+# Cached raw HTML from the recipe importer (M2) and scraped store payloads (M3).
+data/raw/
+data/cache/
+# Local database dumps produced by the backup job (M1) — they live in a volume.
+backups/
+*.dump
+*.sql.gz
+# Hugging Face / sentence-transformers model cache when running outside Docker.
+.hf_cache/
+models/
+
+# --- Editors and OS ----------------------------------------------------------
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Claude Code local state -------------------------------------------------
+.claude/settings.local.json

@@ -1,0 +1,38 @@
+# Normalize line endings.
+# The host has core.autocrlf=true; without these rules shell scripts would be
+# checked out with CRLF and fail inside Linux containers ("bad interpreter").
+* text=auto eol=lf
+
+# Files that MUST keep LF: they are copied into Linux images or parsed by Linux tools.
+*.sh            text eol=lf
+*.bash          text eol=lf
+Dockerfile      text eol=lf
+*.dockerfile    text eol=lf
+.dockerignore   text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.toml          text eol=lf
+*.env           text eol=lf
+*.mako          text eol=lf
+
+# Windows-only scripts keep CRLF so they open cleanly in Windows editors.
+*.ps1           text eol=crlf
+*.psm1          text eol=crlf
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+
+# Binary assets: never touch.
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.webp          binary
+*.ico           binary
+*.woff          binary
+*.woff2         binary
+*.pdf           binary
+*.dump          binary
+*.sqlite3       binary
+
+# Keep generated API types out of diff noise but still versioned.
+web/src/api/schema.d.ts linguist-generated=true
