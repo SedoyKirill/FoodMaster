@@ -25,6 +25,8 @@ dependencies = [
     # python:3.12-slim ships no system zoneinfo database, so ZoneInfo("Europe/Moscow")
     # would raise and the nightly cron jobs would never be scheduled.
     "tzdata>=2025.1",
+    # M2 parses recipe pages; app.recipes imports it at module level.
+    "selectolax>=0.3.30,<0.4",
 ]
 
 [project.optional-dependencies]
@@ -38,9 +40,8 @@ ml = [
 solver = [
     "ortools>=9.15,<10.0",
 ]
-# M2/M3: HTML and catalogue parsing.
+# M3: store adapter rules.
 parsing = [
-    "selectolax>=0.3.30,<0.4",
     "pyyaml>=6.0,<7.0",
 ]
 
@@ -126,7 +127,7 @@ warn_unreachable = true
 exclude = ["^alembic/", "^web/"]
 
 [[tool.mypy.overrides]]
-module = ["apscheduler.*", "pgvector.*"]
+module = ["apscheduler.*", "pgvector.*", "selectolax.*"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------
