@@ -1,0 +1,29 @@
+# Optional overlay: copy nightly dumps to a NAS SMB share.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.nas.yml up -d
+#
+# and set BACKUP_DIR=/mnt/nas-backup plus the NAS_* values in .env.
+#
+# Why a cifs volume rather than a bind mount: with the WSL2 backend you cannot
+# bind-mount a Windows mapped drive letter or a UNC path into a container. The
+# share has to be mounted by the Linux side, which is what this does.
+#
+# Only finished dump files go to the NAS. The Postgres data directory stays on
+# a local volume — network filesystems do not provide honest file locking, and
+# putting PGDATA on one is a reliable way to corrupt the database.
+services:
+  scheduler:
+    volumes:
+      - nas_backups:/mnt/nas-backup
+
+volumes:
+  nas_backups:
+    driver: local
+    driver_opts:
+      type: cifs
+      device: "//${NAS_HOST}/${NAS_SHARE}"
+      # uid/gid MUST match the `app` user baked into the image, or the
+      # non-root process cannot write. noserverino avoids inode-number
+      # collisions some NAS firmwares produce; nobrl avoids byte-range-lock
+      # errors. Neither weakens anything for write-once dump files.
+      o: "username=${NAS_USER},password=${NAS_PASSWORD},uid=10001,gid=10001,file_mode=0640,dir_mode=0750,vers=3.0,noserverino,nobrl"

@@ -1,0 +1,47 @@
+# Keep the build context small and keep secrets out of the image.
+.git
+.gitignore
+.gitattributes
+.github
+
+# Never bake a real .env into an image.
+.env
+.env.*
+!.env.example
+
+# Python local state
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Node local state. NOTE: web/ itself must NOT be excluded — the web-build
+# stage needs it from M6 onwards.
+web/node_modules
+web/dist
+web/.vite
+
+# Generated and bulky data
+data/raw
+data/cache
+backups
+*.dump
+*.sql.gz
+
+# Windows-only helper scripts (scripts/docker/*.sh is copied explicitly)
+scripts/*.ps1
+
+# Docs and specs
+docs
+README.md
+README.ru.md
+TZ-M*.md
+CLAUDE.md
+
+# Tests do not ship in the runtime image
+tests

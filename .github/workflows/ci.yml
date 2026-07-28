@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The workflow talks to the service container over localhost.
+  TEST_DATABASE_URL: postgresql+asyncpg://ration:ration@127.0.0.1:5432/ration_test
+  DATABASE_URL: postgresql+asyncpg://ration:ration@127.0.0.1:5432/ration_test
+
+jobs:
+  quality:
+    name: lint, types, tests
+    runs-on: ubuntu-latest
+
+    services:
+      db:
+        # Same image as production, so pgvector and pg_trgm behave identically.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: ration
+          POSTGRES_PASSWORD: ration
+          POSTGRES_DB: ration
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U ration -d ration"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Type check
+        run: uv run mypy
+
+      - name: Tests
+        run: uv run pytest -q
+
+      - name: Migrations round-trip
+        # Proves the migration is reversible, which no unit test covers.
+        run: |
+          uv run alembic upgrade head
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+          uv run alembic check
+
+  image:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -14,9 +14,11 @@ inference, a modern typed frontend (React + OpenAPI).
 
 ## Target environment
 
-- **Host**: desktop PC, Windows 11, RTX 3070 8 GB VRAM, Docker Desktop (WSL2).
+- **Host**: desktop PC, Windows 10 22H2 / 11, RTX 3070 8 GB VRAM, Docker
+  Desktop (WSL2). Verified on Windows 10 Pro 22H2 (build 19045).
 - **Users**: one family. UI — browser at `http://localhost:8000`.
-  Optional access from phones over home Wi-Fi (`WEB_EXPOSE=1`).
+  Optional access from phones over home Wi-Fi (`WEB_BIND_IP=0.0.0.0`; the
+  spec called this knob `WEB_EXPOSE` — see `docs/setup.md`).
 - **Everything in Docker**: Postgres, Ollama (GPU passthrough), API+web, task
   scheduler — a single `docker compose up -d` starts the whole system,
   `docker compose down` stops it.
@@ -92,24 +94,33 @@ buttons and algorithms first.
 ## Repository layout
 
 ```
-ration/
-├── docker-compose.yml        # db, ollama(GPU), api, scheduler
+.
+├── docker-compose.yml        # db, ollama(GPU), ollama-init, api, scheduler
+├── docker-compose.nas.yml    # optional: copy backups to a NAS SMB share
 ├── Dockerfile                # multi-stage: web build → Python image
 ├── .env.example
-├── pyproject.toml
-├── alembic/                  # migrations
+├── pyproject.toml            # dependencies plus ruff/mypy/pytest config
+├── uv.lock                   # pinned versions, committed
+├── alembic/                  # migrations (every table created in 0001)
 ├── app/
-│   ├── core/                 # M1: config, DB, shared models
+│   ├── core/                 # M1: config, clock, DB, models, errors, logs, backups
+│   ├── api/                  # FastAPI routes /api/v1 (per module)
 │   ├── recipes/              # M2: recipes, embeddings, search
 │   ├── store/                # M3: store adapters (5ka, lenta), matching
 │   ├── nutrition/            # M4: calories, macros, cooking loss
 │   ├── planner/              # M5: meal plan, optimizer, llm/
 │   ├── finance/              # M7: diary, expenses, analytics
-│   └── api/                  # FastAPI routes /api/v1 (per module)
+│   └── scheduler/            # the APScheduler process and its jobs
 ├── web/                      # M6: React SPA (Vite + TypeScript)
+├── tests/                    # pytest; unit/ needs no DB, the rest does
 ├── docs/                     # public docs: *.md (EN) + *.ru.md (RU)
-└── scripts/                  # one-off scripts: recipe import, embedding backfill
+├── data/                     # reference CSVs; data/raw/ is a git-ignored cache
+└── scripts/                  # dev.ps1, restore.ps1, docker/entrypoint.sh
 ```
+
+The Docker Compose project name is set explicitly (`name: ration`): Compose
+derives it from the directory name keeping only `[a-z0-9_-]`, so "Проект EDA"
+would become `eda`. Removing that line orphans the volumes.
 
 ## Languages & documentation
 
@@ -139,9 +150,11 @@ ration/
   provide reliable file locking — a recipe for database corruption; besides,
   a home NAS's ARM CPU and 1 GB RAM couldn't handle Postgres+pgvector.
 - Optional NAS setup: a nightly scheduler job runs `pg_dump`; if `BACKUP_DIR`
-  (a mounted NAS SMB share) is set in `.env`, the dump is copied there
-  (rotation — TZ-M1). If unset, dumps stay in a local volume.
-- Restore: `scripts/restore.ps1 <dump>` (TZ-M1).
+  is set in `.env`, the dump is copied there (14-dump rotation). If unset,
+  dumps stay in a local volume. An SMB share cannot be bind-mounted with the
+  WSL2 backend, so it is mounted through `docker-compose.nas.yml` — details in
+  `docs/backup-restore.md`.
+- Restore: `scripts/restore.ps1 -Dump <dump>`; `-List` shows what is available.
 
 ## Quick start (one-time, part of M1)
 
@@ -149,8 +162,12 @@ ration/
    (Settings → Resources → WSL integration; recent NVIDIA driver).
 2. `copy .env.example .env` (defaults are fine for local use).
 3. `docker compose up -d` — brings up everything: Postgres, Ollama (pulls
-   qwen3:8b ~5.2 GB on first start), API with migrations, task scheduler.
-4. Open `http://localhost:8000` — the first-run wizard creates your family.
+   qwen3:8b ~5.2 GB on first start, in the background, blocking nothing),
+   API with migrations, task scheduler.
+4. Open `http://localhost:8000` — the first-run wizard creates your family (M6).
+
+See `docs/setup.md` for phone access, auto-start after a reboot, disk space
+and WSL2 memory tuning.
 
 Daily use: `docker compose up -d` to start, `docker compose down` to stop.
 DB data lives in volumes and survives shutdowns. No Python or Node needed on

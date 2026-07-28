@@ -1,0 +1,208 @@
+# Ration / FoodMaster — the whole system.
+#
+#   docker compose up -d      turn on
+#   docker compose down       turn off (data survives in named volumes)
+#
+# The explicit `name` is load-bearing: Compose derives the project name from the
+# directory, keeping only [a-z0-9_-] after lowercasing, so "Проект EDA" would
+# become "eda" — silently sharing volumes with any other folder that normalises
+# the same way, and orphaning the database if the folder is ever renamed.
+name: ration
+
+x-app: &app
+  image: ration/app:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+    target: runtime
+    args:
+      # M2 flips this to "--extra ml" to add CPU-only torch + sentence-transformers.
+      APP_EXTRAS: "${APP_EXTRAS-}"
+  restart: unless-stopped
+  env_file: [.env]
+  environment: &app-env
+    # Compose overrides exactly the two values that differ between "inside
+    # Docker" and "on the Windows host"; .env carries the Docker-side truth and
+    # scripts/dev.ps1 injects the host-side one as process environment.
+    DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ration}:${POSTGRES_PASSWORD:-ration}@db:5432/${POSTGRES_DB:-ration}
+    OLLAMA_URL: http://ollama:11434
+    HF_HOME: /cache/hf
+    TZ: ${APP_TIMEZONE:-Europe/Moscow}
+  networks: [ration_net]
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ration}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ration}
+      POSTGRES_DB: ${POSTGRES_DB:-ration}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
+      TZ: ${APP_TIMEZONE:-Europe/Moscow}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      # HNSW index builds fall back to a slow on-disk path below ~128MB.
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - max_parallel_maintenance_workers=2
+      - -c
+      - work_mem=32MB
+      # Pure overhead on sub-100ms OLTP queries and pgvector distance calls.
+      - -c
+      - jit=off
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Read-only so scripts/restore.ps1 can run pg_restore *inside* this
+      # container, where the client version always matches the server.
+      - backups:/backups:ro
+    ports:
+      # Loopback only — never on the LAN, even when WEB_BIND_IP=0.0.0.0.
+      # Published so scripts/dev.ps1, pytest and a DB client on the host work.
+      - host_ip: "127.0.0.1"
+        published: "${DB_PORT:-5432}"
+        target: 5432
+    healthcheck:
+      # The -h is load-bearing. During initdb the official entrypoint runs a
+      # temporary server on the unix socket only; a socket-based pg_isready
+      # would report healthy, api would connect and then get disconnected.
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-ration} -d ${POSTGRES_DB:-ration}",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 20s
+    networks: [ration_net]
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    environment:
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-10m}
+      # 8 GB of VRAM: a second resident model means CPU offload and ~10x latency.
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_NUM_PARALLEL: "1"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - ollama_models:/root/.ollama
+    ports:
+      - host_ip: "127.0.0.1"
+        published: "${OLLAMA_PORT:-11434}"
+        target: 11434
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              # All three are load-bearing, and getting this wrong fails
+              # SILENTLY — Ollama just reports "inference compute id=cpu" and
+              # runs ~20x slower:
+              #   compute  -> injects libcuda.so; without it there is no CUDA
+              #              device at all, only a CPU runner
+              #   utility  -> injects nvidia-smi and libnvidia-ml, which
+              #              TZ-M1's acceptance check runs
+              # Verify with: docker compose exec ollama ollama ps
+              # (the PROCESSOR column must not say "100% CPU").
+              capabilities: ["gpu", "compute", "utility"]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks: [ration_net]
+
+  # One-shot: pulls the model on first start, then exits 0. Seeing
+  # "ollama-init  Exited (0)" in `docker compose ps` is the normal state.
+  # Nothing depends on it, so `up -d` returns while ~5 GB downloads in the
+  # background; /health reports ollama_model until it lands.
+  ollama-init:
+    image: ollama/ollama:latest
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:8b}
+    entrypoint: ["/bin/sh", "-c"]
+    # $$ escapes Compose interpolation so the container's shell expands it.
+    # The exact match on column 1 matters: a plain grep for "qwen3:8b" also
+    # matches "qwen3:8b-instruct" and would skip a genuinely missing model.
+    command:
+      - >
+        if ollama list | awk '{print $$1}' | grep -qx "$$OLLAMA_MODEL"; then
+          echo "model $$OLLAMA_MODEL already present";
+        else
+          echo "pulling $$OLLAMA_MODEL ..."; ollama pull "$$OLLAMA_MODEL";
+        fi
+    networks: [ration_net]
+
+  api:
+    <<: *app
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      <<: *app-env
+      RUN_MIGRATIONS: "1"
+      APP_ROLE: api
+    command:
+      [
+        "uvicorn",
+        "app.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--proxy-headers",
+        "--forwarded-allow-ips",
+        "*",
+        "--no-access-log",
+      ]
+    ports:
+      - host_ip: "${WEB_BIND_IP:-127.0.0.1}"
+        published: "${WEB_PORT:-8000}"
+        target: 8000
+        protocol: tcp
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      # Covers `alembic upgrade head` on a cold volume, including index builds.
+      start_period: 90s
+
+  scheduler:
+    <<: *app
+    depends_on:
+      db:
+        condition: service_healthy
+      # Guarantees migrations have finished before any job touches the schema.
+      api:
+        condition: service_healthy
+    environment:
+      <<: *app-env
+      RUN_MIGRATIONS: "0"
+      APP_ROLE: scheduler
+    command: ["python", "-m", "app.scheduler.main"]
+    volumes:
+      - hf_cache:/cache/hf
+      - backups:/backups
+
+volumes:
+  pgdata:
+  ollama_models:
+  hf_cache:
+  backups:
+
+networks:
+  ration_net:
+    name: ration_net
