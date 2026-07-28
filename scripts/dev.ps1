@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Development mode: infrastructure in Docker, the app natively with hot reload.
 
@@ -30,6 +30,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# PowerShell 5.1 garbles Cyrillic output without this.
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -37,10 +38,30 @@ Set-Location $repoRoot
 
 function Write-Step($message) { Write-Host "==> $message" -ForegroundColor Cyan }
 
+function Invoke-Native {
+    <#
+      Run a native command and fail only on a non-zero exit code.
+
+      PowerShell 5.1 wraps anything a native program writes to stderr in an
+      ErrorRecord, and `docker compose` reports normal progress there; under
+      $ErrorActionPreference = 'Stop' that would abort the script even though
+      docker exited 0. The command is taken as a script block because a
+      ValueFromRemainingArguments parameter silently swallows tokens that look
+      like parameter names (`-d ration` would arrive as a bare `ration`).
+    #>
+    param([Parameter(Mandatory = $true, Position = 0)][scriptblock]$Command)
+
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $Command } finally { $ErrorActionPreference = $previous }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Команда `"$Command`" завершилась с кодом $LASTEXITCODE"
+    }
+}
+
 # --- Docker -----------------------------------------------------------------
 Write-Step 'Проверяю Docker'
-docker info *> $null
-if (-not $?) {
+try { Invoke-Native { docker info 2>$null } | Out-Null } catch {
     Write-Host 'Docker Desktop не запущен. Запустите его и повторите.' -ForegroundColor Red
     exit 1
 }
@@ -53,12 +74,12 @@ if (-not (Test-Path '.env')) {
 # The container would otherwise already own port 8000 and uvicorn would die
 # with WinError 10048.
 Write-Step 'Останавливаю контейнеры api и scheduler (порт 8000 нужен локально)'
-docker compose stop api scheduler *> $null
+Invoke-Native { docker compose stop api scheduler 2>$null }
 
 $services = @('db')
 if (-not $NoOllama) { $services += @('ollama', 'ollama-init') }
 Write-Step "Поднимаю инфраструктуру: $($services -join ', ')"
-docker compose up -d @services
+Invoke-Native { docker compose up -d @services 2>$null }
 
 Write-Step 'Жду готовности базы'
 $deadline = (Get-Date).AddMinutes(3)
@@ -86,8 +107,11 @@ if ($ResetDb) {
     # Never `docker compose down -v`: that would also destroy the 5+ GB Ollama
     # model volume.
     Write-Step 'Пересоздаю базу ration'
-    docker compose exec -T db psql -U ration -d postgres -v ON_ERROR_STOP=1 `
-        -c 'DROP DATABASE IF EXISTS ration WITH (FORCE);' -c 'CREATE DATABASE ration OWNER ration;'
+    Invoke-Native {
+        docker compose exec -T db psql -U ration -d postgres -v ON_ERROR_STOP=1 `
+            -c 'DROP DATABASE IF EXISTS ration WITH (FORCE);' `
+            -c 'CREATE DATABASE ration OWNER ration;'
+    }
 }
 
 Write-Step 'Применяю миграции'

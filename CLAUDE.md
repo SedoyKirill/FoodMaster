@@ -108,3 +108,13 @@ docker compose down                       # stop; data survives in named volumes
   NAS or any network share — see `docker-compose.nas.yml` for the supported way
   to put *dumps* on a NAS.
 - `.env` must be saved as UTF-8; it contains Russian comments.
+- **`.ps1` files with non-ASCII content need a UTF-8 BOM.** PowerShell 5.1 reads
+  scripts in the system ANSI codepage otherwise, and every Cyrillic string
+  literal becomes a parse error. Both scripts in `scripts/` carry one.
+- **Wrap native commands in `Invoke-Native { ... }` inside PowerShell scripts.**
+  PowerShell 5.1 turns anything a native program writes to stderr into an
+  ErrorRecord — `docker compose` reports normal progress there — which aborts
+  the script under `$ErrorActionPreference = 'Stop'` even on exit code 0. Pass a
+  script block, never a parameter with `ValueFromRemainingArguments`: that
+  silently swallows tokens that look like parameter names, so `-d ration`
+  arrives as a bare `ration`.
