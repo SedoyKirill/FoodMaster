@@ -66,3 +66,7 @@ desktop.ini
 
 # --- Claude Code local state -------------------------------------------------
 .claude/settings.local.json
+
+# Import run log (generated)
+data/import.log
+data/import.log.err
