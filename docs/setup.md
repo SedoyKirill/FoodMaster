@@ -99,8 +99,42 @@ possible.
 
 Docker Desktop keeps images and volumes in `ext4.vhdx` on drive C:. The project
 needs 25-30 GB (app image ~0.4 GB, Ollama image ~3 GB, model 5.2 GB, Postgres,
-up to 14 GB of dumps). If C: is tight, relocate the store:
+up to 14 GB of dumps). The supported way to relocate the store is
 Settings → Resources → Advanced → Disk image location.
+
+### When the supported way does not work
+
+On the WSL2 backend, changing the disk image location is a known Docker Desktop
+defect ([docker/for-win#13408](https://github.com/docker/for-win/issues/13408),
+[#14163](https://github.com/docker/for-win/issues/14163)): the setting is saved
+but the disk stays where it was. The `DataFolder` key in
+`%APPDATA%\Docker\settings-store.json` does not help either.
+
+The reliable workaround is an NTFS junction. Docker keeps writing to its usual
+path and the filesystem transparently redirects:
+
+```powershell
+# 1. Stop Docker completely
+docker desktop stop
+wsl --shutdown
+
+# 2. Move the data (robocopy /MOVE copies, then removes the source)
+robocopy "$env:LOCALAPPDATA\Docker\wsl" "F:\DockerData" /E /MOVE /R:1 /W:1
+
+# 3. Put a link where the folder was
+cmd /c mklink /J "$env:LOCALAPPDATA\Docker\wsl" "F:\DockerData"
+
+# 4. Start Docker and confirm the file on F: is growing
+docker desktop start
+Get-ChildItem F:\DockerData -Recurse -Filter *.vhdx
+```
+
+This does not depend on any Docker setting and survives Docker updates. To
+revert, delete the link and move the files back.
+
+Note that `ext4.vhdx` **never shrinks by itself** after images and volumes are
+deleted. If it has grown, `docker builder prune -af` frees space inside it (the
+build cache is regenerable), but the file keeps its size.
 
 ## WSL2 memory
 

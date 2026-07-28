@@ -100,8 +100,42 @@ Settings → General → «Start Docker Desktop when you sign in». Полнос
 
 Docker Desktop хранит образы и тома в `ext4.vhdx` на диске C:. Проекту нужно
 25–30 ГБ (образ приложения ~0.4 ГБ, образ Ollama ~3 ГБ, модель 5.2 ГБ, Postgres,
-до 14 ГБ дампов). Если на C: мало места, перенесите хранилище:
+до 14 ГБ дампов). Штатный способ перенести хранилище —
 Settings → Resources → Advanced → Disk image location.
+
+### Если штатный способ не срабатывает
+
+На бэкенде WSL2 смена расположения образа — известный дефект Docker Desktop
+([docker/for-win#13408](https://github.com/docker/for-win/issues/13408),
+[#14163](https://github.com/docker/for-win/issues/14163)): настройка сохраняется,
+но диск остаётся на прежнем месте. Ключ `DataFolder` в
+`%APPDATA%\Docker\settings-store.json` тоже не помогает.
+
+Надёжный обходной путь — точка соединения NTFS. Docker продолжает писать по
+своему обычному пути, а файловая система прозрачно перенаправляет запись:
+
+```powershell
+# 1. Полностью остановить Docker
+docker desktop stop
+wsl --shutdown
+
+# 2. Перенести данные (robocopy /MOVE копирует и убирает источник)
+robocopy "$env:LOCALAPPDATA\Docker\wsl" "F:\DockerData" /E /MOVE /R:1 /W:1
+
+# 3. Поставить на место папки ссылку
+cmd /c mklink /J "$env:LOCALAPPDATA\Docker\wsl" "F:\DockerData"
+
+# 4. Запустить Docker и убедиться, что файл на F: растёт
+docker desktop start
+Get-ChildItem F:\DockerData -Recurse -Filter *.vhdx
+```
+
+Способ не зависит от настроек Docker и переживает его обновления. Откат —
+удалить ссылку и перенести файлы обратно.
+
+Важно: `ext4.vhdx` **не уменьшается сам** после удаления образов и томов. Если
+файл разросся, освободить место внутри него помогает `docker builder prune -af`
+(кеш сборки регенерируется), но размер самого файла останется прежним.
 
 ## Память WSL2
 
