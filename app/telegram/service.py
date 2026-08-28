@@ -22,13 +22,14 @@ from .callbacks import (
 )
 from .render import (
     BUTTON_TEXT_LIMIT, CallbackReply, HELP_TEXT, MEAL_LABELS, NOT_LINKED_TEXT,
-    Reply, STALE_TEXT, TELEGRAM_LIMIT, alternatives_keyboard, format_day,
+    Reply, STALE_TEXT, TELEGRAM_LIMIT, alternatives_keyboard, build_keyboard, format_day,
     format_recipe, format_shopping, format_shopping_header, format_week,
     page_of_item, shopping_keyboard, shopping_page, split_for_telegram,
     today_keyboard,
 )
 from .repository import BotRepository, bot_session
 from .scenes import auth
+from .scenes import plan as plan_scene
 
 __all__ = [
     "BUTTON_TEXT_LIMIT", "BotRepository", "CallbackReply", "HELP_TEXT",
@@ -99,7 +100,17 @@ async def handle_message(
         if todays and todays[0].get("plan_id"):
             keyboard = today_keyboard(todays[0]["plan_id"], todays)
         return Reply(format_day(meals, today), keyboard)
-    if lowered in {"/week", "неделя", "план", "📅 неделя"}:
+
+    if app_repository is not None and dialogs is not None:
+        session = bot_session(context)
+        if lowered in {"/new", "➕ составить меню"}:
+            return await plan_scene.begin(dialogs, user_id)
+        if lowered in {"/plan", "/menu", "меню", "📅 меню", "/week", "неделя", "📅 неделя"}:
+            return await _active_plan_reply(app_repository, session)
+        if lowered in {"/history", "история", "🗂 история"}:
+            return await plan_scene.history_reply(app_repository, session)
+
+    if lowered in {"/week", "неделя", "план", "📅 неделя", "📅 меню", "меню"}:
         meals = await repository.latest_plan_meals(context["household_id"])
         return Reply(format_week(meals))
     if lowered in {"/shopping", "покупки", "🛒 покупки"}:
@@ -116,6 +127,26 @@ async def handle_message(
 
 def _stale() -> CallbackReply:
     return CallbackReply(toast=STALE_TEXT, show_alert=True, edit=Reply(STALE_TEXT))
+
+
+async def _active_plan_reply(app_repository: Any, session: dict[str, Any]) -> Reply:
+    """Активный план бота — последний собранный (TZ-M7 А4).
+
+    Выбранный из истории план не хранится в состоянии диалога: любая команда
+    и любая кнопка главного меню это состояние очищают (§4.2), так что запись
+    не пережила бы и одного нажатия. Идентификатор плана и так едет в каждой
+    кнопке, поэтому открытый из истории план листается и правится как обычно.
+    """
+    latest = await app_repository.latest_plan(session)
+    if latest is None:
+        return Reply(
+            "📅 Плана пока нет.",
+            build_keyboard([[{
+                "text": "➕ Составить меню",
+                "callback_data": encode_callback("n", "pl", "new"),
+            }]]),
+        )
+    return plan_scene.day_reply(latest, 1)
 
 
 async def handle_callback(
@@ -167,12 +198,39 @@ async def handle_callback(
         return await auth.unlink(app_repository, session)
 
     try:
+        # --- мастер и экраны меню (TZ-M7 §5.3–5.4) ---------------------------
+        if verb == "n" and parts[:1] == ["pl"]:
+            result = await plan_scene.handle_callback(
+                app_repository, dialogs, session, user_id, parts, today
+            )
+            if result is not None:
+                return result
+        if verb == "o":
+            return await plan_scene.toggle_cuisine(
+                dialogs, app_repository, user_id, parts[0] if parts else ""
+            )
+        if verb == "y" and parts[:1] == ["pd"]:
+            return await plan_scene.delete(
+                app_repository, session, parts[1] if len(parts) > 1 else ""
+            )
+        if verb == "p" and parts[:1] == ["pl"]:
+            page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+            return CallbackReply(
+                edit=await plan_scene.history_reply(app_repository, session, page)
+            )
         if verb == "p":
             return await _turn_page(app_repository, session, parts)
 
         plan_id = unpack_uuid(parts[0]) if parts else None
         if plan_id is None:
             return CallbackReply(toast="Не понял кнопку.")
+
+        if verb == "d":
+            day_number = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+            found = await app_repository.get_plan(session, plan_id)
+            if found is None:
+                return _stale()
+            return CallbackReply(edit=plan_scene.day_reply(found, day_number))
 
         if verb == "c":
             return CallbackReply(edit=Reply("Оставили как есть."))

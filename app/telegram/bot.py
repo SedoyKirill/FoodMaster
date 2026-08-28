@@ -15,13 +15,14 @@ from zoneinfo import ZoneInfo
 import asyncpg
 import httpx
 
-from app.web.database import AppRepository
+from app.web.database import PLANNER_WARM_INTERVAL_SECONDS, AppRepository
 from app.web.ratelimit import RateLimiter
 
+from .callbacks import heavy_placeholder
 from .fsm import CANCEL_DATA, CANCEL_TEXT, DialogStore
 from .repository import BotRepository
 from .router import TOO_FAST_TEXT, Actor, Incoming, Router, parse_update
-from .scenes import SceneContext, auth
+from .scenes import SceneContext, auth, plan
 from .service import (
     CallbackReply, Reply, callback_verb, handle_callback, handle_message,
     split_for_telegram,
@@ -32,7 +33,7 @@ log = logging.getLogger("ration.telegram")
 #: постоянная reply-клавиатура с основными командами
 KEYBOARD = {
     "keyboard": [
-        [{"text": "🍽 Сегодня"}, {"text": "📅 Неделя"}],
+        [{"text": "🍽 Сегодня"}, {"text": "📅 Меню"}],
         [{"text": "🛒 Покупки"}],
     ],
     "resize_keyboard": True,
@@ -43,8 +44,6 @@ POLL_TIMEOUT_SECONDS = 50
 ERROR_BACKOFF_SECONDS = 5
 #: часовой пояс семьи — тот же, что у ночного сборщика
 TIMEZONE = ZoneInfo(os.getenv("LENTA_TIMEZONE", "Europe/Moscow"))
-#: тяжёлые глаголы уходят в фоновую задачу, чтобы не морозить конвейер
-HEAVY_VERBS = {"x", "v"}
 #: приёмка TZ-M7 §9.9 — «⏳» не живёт дольше минуты; запас на доставку правки
 HEAVY_TIMEOUT_SECONDS = 45.0
 
@@ -53,7 +52,8 @@ HEAVY_TIMEOUT_SECONDS = 45.0
 BOT_COMMANDS = [
     ("start", "Начать и привязать аккаунт"),
     ("today", "Меню на сегодня"),
-    ("week", "Текущий план"),
+    ("plan", "Текущий план по дням"),
+    ("new", "Составить новое меню"),
     ("shopping", "Список покупок"),
     ("web", "Войти в веб-приложение"),
     ("unlink", "Отвязать Telegram"),
@@ -356,19 +356,17 @@ class BotApp:
             return
         verb = callback_verb(data)
 
-        if verb in HEAVY_VERBS:
+        placeholder_text = heavy_placeholder(data)
+        if placeholder_text is not None:
             refusal = self.router.acquire_heavy(actor)
             if refusal is not None:
                 await self.client.answer_callback_query(callback_id, refusal)
                 return
-            await self.client.answer_callback_query(
-                callback_id, "Подбираю варианты…" if verb == "x" else "Меняю блюдо…"
-            )
+            await self.client.answer_callback_query(callback_id, "Работаю…")
             await self.client.send_chat_action(actor.chat_id)
-            # плейсхолдер: для замены редактируем сообщение с кнопками —
+            # плейсхолдер: где можно, редактируем сообщение с кнопками —
             # заодно исчезает клавиатура и даблклик невозможен физически
             placeholder_id = actor.message_id
-            placeholder_text = "⏳ Ищу альтернативы…" if verb == "x" else "⏳ Применяю замену…"
             if verb == "x":
                 placeholder_id = await self.client.send_message(
                     actor.chat_id, placeholder_text, None
@@ -488,6 +486,24 @@ async def wait_for_schema(pool, *, attempts: int = 60, delay: float = 5.0) -> No
     raise SystemExit("Схема БД устарела: web не накатил DDL TZ-M7. Перезапустите web.")
 
 
+async def keep_planner_warm(app_repository: AppRepository) -> None:
+    """Держать кэш матчера тёплым, как это делает веб (N1).
+
+    Сбой прогрева — не повод ронять бота: меню соберётся и по холодному кэшу,
+    просто медленнее.
+    """
+    while True:
+        try:
+            warmed = await app_repository.warm_planner_caches()
+            if warmed:
+                log.info("Прогрев планировщика: %s ингредиентов", warmed)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("Прогрев планировщика не удался", exc_info=True)
+        await asyncio.sleep(PLANNER_WARM_INTERVAL_SECONDS)
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     # httpx на INFO печатает полный URL запроса, а в нём — токен бота.
@@ -508,7 +524,15 @@ async def main() -> None:
     # channel='telegram' — чтобы audit_log не помечал действия бота как 'web'.
     app_repository = AppRepository(database_url, channel="telegram")
     app_repository.pool = pool
-    router = Router(dialogs=DialogStore(pool), scenes={auth.SCENE: auth.handle_step})
+    router = Router(
+        dialogs=DialogStore(pool),
+        scenes={auth.SCENE: auth.handle_step, plan.SCENE: plan.handle_step},
+    )
+
+    # N1: мемоизация матчера живёт в экземпляре репозитория, а он у бота свой.
+    # Без прогрева первая же сборка меню считала бы кэш прямо в запросе и не
+    # уложилась бы в отведённые «⏳» секунды.
+    warm_task = asyncio.create_task(keep_planner_warm(app_repository))
 
     offset: int | None = None
     async with httpx.AsyncClient() as http:

@@ -474,6 +474,39 @@ class FakeRepository:
             "products": self.products,
         }
 
+    async def create_plan(
+        self,
+        session: dict[str, Any],
+        *,
+        starts_on: date,
+        days: int,
+        budget_kop: int | None = None,
+        cuisines: list[str] | None = None,
+        price_tier: str = "balanced",
+    ) -> dict[str, Any]:
+        """Как AppRepository.create_plan: сырьё → build_plan → сохранение."""
+        from app.web.database import PRICE_TIERS, UNKNOWN_TIER_TEXT
+        from app.web.planner import build_plan
+
+        if session.get("role") == "viewer":
+            raise PermissionError("Режим просмотра не позволяет создавать планы")
+        if price_tier not in PRICE_TIERS:
+            raise ValueError(UNKNOWN_TIER_TEXT)
+        cuisines = list(cuisines or [])
+        data = await self.planner_data(session, cuisines)
+        plan = build_plan(
+            household_id=str(session["household_id"]), starts_on=starts_on, days=days,
+            cuisines=cuisines, price_tier=price_tier, budget_kop=budget_kop, **data,
+        )
+        plan_id = await self.save_plan(
+            session, starts_on, days, budget_kop, cuisines, price_tier, plan
+        )
+        plan["id"] = plan_id
+        plan["starts_on"] = starts_on
+        plan["days"] = days
+        plan["budget_kop"] = budget_kop
+        return plan
+
     async def save_plan(
         self,
         session: dict[str, Any],

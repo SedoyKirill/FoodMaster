@@ -698,6 +698,28 @@ class RowDictTests(unittest.TestCase):
         self.assertEqual(converted["name"], "Молоко")
 
 
+class CreatePlanTests(unittest.TestCase):
+    """Сборка плана живёт в слое данных: её зовут и веб, и бот (TZ-M7 §2)."""
+
+    def test_viewer_is_rejected_before_any_query(self) -> None:
+        pool = FakePool()
+        repository = repository_with_pool(pool)
+        with self.assertRaises(PermissionError):
+            run_async(repository.create_plan(
+                session(role="viewer"), starts_on=date(2026, 9, 1), days=3
+            ))
+        self.assertEqual(pool.calls, [])
+
+    def test_unknown_tier_is_rejected_before_any_query(self) -> None:
+        pool = FakePool()
+        repository = repository_with_pool(pool)
+        with self.assertRaises(ValueError):
+            run_async(repository.create_plan(
+                session(), starts_on=date(2026, 9, 1), days=3, price_tier="золотой"
+            ))
+        self.assertEqual(pool.calls, [])
+
+
 class TelegramAccountSqlTests(unittest.TestCase):
     """TZ-M7 §3.2–3.4: аккаунт без пароля, код входа, отвязка."""
 

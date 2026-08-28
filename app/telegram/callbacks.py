@@ -80,3 +80,25 @@ def parse_callback(data: str) -> tuple[str, list[str]] | None:
 def callback_verb(data: str) -> str:
     parsed = parse_callback(data or "")
     return parsed[0] if parsed else ""
+
+
+#: Кнопки, за которыми стоят секунды работы: их обрабатывает фоновая задача
+#: с плейсхолдером «⏳», чтобы конвейер апдейтов не замирал. Ключ — глагол или
+#: глагол с первыми аргументами; значение — что показать вместо ответа.
+HEAVY_PLACEHOLDERS: dict[tuple[str, ...], str] = {
+    ("x",): "⏳ Ищу альтернативы…",
+    ("v",): "⏳ Применяю замену…",
+    ("n", "pl", "go"): "⏳ Собираем меню… обычно 10–20 секунд.",
+}
+
+
+def heavy_placeholder(data: str) -> str | None:
+    """Текст плейсхолдера, если кнопка тяжёлая; иначе None."""
+    parsed = parse_callback(data or "")
+    if parsed is None:
+        return None
+    verb, parts = parsed
+    for key, text in HEAVY_PLACEHOLDERS.items():
+        if (verb, *parts[:len(key) - 1]) == key:
+            return text
+    return None

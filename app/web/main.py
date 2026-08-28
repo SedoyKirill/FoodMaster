@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import functools
 import mimetypes
 import os
 import time
@@ -17,17 +16,17 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+
 from .database import (
     PLANNER_WARM_INTERVAL_SECONDS, AppRepository, AuthenticationError, ConflictError,
 )
 from .payloads import (
-    EXPIRED_TEXT, PRICE_TIERS, STORAGE_AREAS, UNIT_CODES, UNKNOWN_STORAGE_TEXT,
-    UNKNOWN_TIER_TEXT, UNKNOWN_UNIT_TEXT, AuthPayload, InventoryPayload,
+    EXPIRED_TEXT, STORAGE_AREAS, UNIT_CODES, UNKNOWN_STORAGE_TEXT,
+    UNKNOWN_UNIT_TEXT, AuthPayload, InventoryPayload,
     PasswordPayload, PersonPatchPayload, PersonPayload, PlanPayload,
     PurchasePayload, RatingPayload, ReplaceMealPayload, ReviewPayload,
     RulePayload, SettingsPayload, TelegramLoginPayload,
 )
-from .planner import build_plan
 from .ratelimit import RateLimiter
 
 
@@ -359,38 +358,21 @@ async def delete_inventory(item_id: uuid.UUID, repo: Repo, session: Mutating) ->
 
 @router.post("/api/plans/generate", status_code=201)
 async def generate_plan(payload: PlanPayload, repo: Repo, session: Mutating) -> dict[str, Any]:
-    if session["role"] == "viewer":
-        raise HTTPException(status_code=403, detail="Режим просмотра не позволяет создавать планы")
-    if payload.price_tier not in PRICE_TIERS:
-        raise HTTPException(status_code=422, detail=UNKNOWN_TIER_TEXT)
-    data = await repo.planner_data(session, payload.cuisines)
     budget_kop = int(payload.budget_rub * 100) if payload.budget_rub is not None else None
     try:
-        # K7: скоринг 500 рецептов + CP-SAT занимают до десятков секунд —
-        # в отдельном потоке, иначе весь event loop (и /health) замирает.
-        plan = await asyncio.to_thread(
-            functools.partial(
-                build_plan,
-                household_id=str(session["household_id"]),
-                starts_on=payload.starts_on,
-                days=payload.days,
-                cuisines=payload.cuisines,
-                price_tier=payload.price_tier,
-                budget_kop=budget_kop,
-                **data,
-            )
+        # Сборка живёт в слое данных: тот же вызов делает бот (TZ-M7 §2).
+        return await repo.create_plan(
+            session,
+            starts_on=payload.starts_on,
+            days=payload.days,
+            budget_kop=budget_kop,
+            cuisines=payload.cuisines,
+            price_tier=payload.price_tier,
         )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    plan_id = await repo.save_plan(
-        session, payload.starts_on, payload.days, budget_kop, payload.cuisines,
-        payload.price_tier, plan
-    )
-    plan["id"] = plan_id
-    plan["starts_on"] = payload.starts_on
-    plan["days"] = payload.days
-    plan["budget_kop"] = budget_kop
-    return plan
 
 
 @router.get("/api/plans")

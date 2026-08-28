@@ -13,8 +13,9 @@ from typing import Any
 
 import asyncpg
 
+from .payloads import PRICE_TIERS, UNKNOWN_TIER_TEXT
 from .planner import (
-    ProductMatcher, ProductMatcherCache, _base_quantity, clean_dish_title,
+    ProductMatcher, ProductMatcherCache, _base_quantity, build_plan, clean_dish_title,
     warm_product_matcher,
 )
 from .security import hash_password, new_token, token_hash, validate_login, verify_password
@@ -972,14 +973,33 @@ class AppRepository:
             LEFT JOIN LATERAL (
                 SELECT jsonb_agg(jsonb_build_object(
                     'ingredient_text', i.ingredient_text,
-                    'normalized_name', i.normalized_name,
+                    -- Унифицированное имя из справочника (волна Haiku):
+                    -- «масло сливочное», «butter» и «сливочного масла» —
+                    -- одна позиция. Догадки ниже 0.7 не подставляются,
+                    -- исходное имя остаётся запасным вариантом.
+                    'normalized_name', COALESCE(
+                        NULLIF(c.canonical_name, ''), i.normalized_name
+                    ),
+                    'source_name', i.normalized_name,
+                    'base_name', c.base_name,
                     'quantity_min', i.quantity_min,
                     'quantity_max', i.quantity_max,
                     'unit_code', i.unit_code,
                     'is_to_taste', i.is_to_taste
                 ) ORDER BY i.position) AS items
                 FROM recipe_library.recipe_ingredients i
+                LEFT JOIN recipe_library.ingredient_canonical c
+                       ON c.raw_name = i.normalized_name
+                      AND c.is_ingredient
+                      AND COALESCE(c.confidence, 0) >= 0.7
                 WHERE i.recipe_id = p.id
+                  -- Мусор из книг («правильно резать лук 122») в покупки
+                  -- не попадает.
+                  AND NOT EXISTS (
+                        SELECT 1 FROM recipe_library.ingredient_canonical x
+                        WHERE x.raw_name = i.normalized_name
+                          AND NOT x.is_ingredient
+                  )
             ) ing ON TRUE
             """,
             PLANNER_RECIPE_LIMIT,
@@ -1059,6 +1079,51 @@ class AppRepository:
             "SELECT term, canonical, kind FROM app_core.ingredient_synonyms"
         )
         return [row_dict(row) for row in rows]
+
+    async def create_plan(
+        self,
+        session: dict[str, Any],
+        *,
+        starts_on: date,
+        days: int,
+        budget_kop: int | None = None,
+        cuisines: list[str] | None = None,
+        price_tier: str = "balanced",
+    ) -> dict[str, Any]:
+        """Собрать и сохранить план: сырьё → решатель → БД → готовый payload.
+
+        Живёт в слое данных, а не в HTTP-обработчике, потому что то же самое
+        делает бот (TZ-M7 §2: веб и бот вызывают один слой). ``ValueError`` —
+        нечего ставить в слоты, ``PermissionError`` — роль только смотрит.
+        """
+        if session.get("role") == "viewer":
+            raise PermissionError("Режим просмотра не позволяет создавать планы")
+        if price_tier not in PRICE_TIERS:
+            raise ValueError(UNKNOWN_TIER_TEXT)
+        cuisines = list(cuisines or [])
+        data = await self.planner_data(session, cuisines)
+        # K7: скоринг 500 рецептов и CP-SAT занимают до десятков секунд —
+        # в отдельном потоке, иначе замирает весь event loop (и /health).
+        plan = await asyncio.to_thread(
+            functools.partial(
+                build_plan,
+                household_id=str(session["household_id"]),
+                starts_on=starts_on,
+                days=days,
+                cuisines=cuisines,
+                price_tier=price_tier,
+                budget_kop=budget_kop,
+                **data,
+            )
+        )
+        plan_id = await self.save_plan(
+            session, starts_on, days, budget_kop, cuisines, price_tier, plan
+        )
+        plan["id"] = plan_id
+        plan["starts_on"] = starts_on
+        plan["days"] = days
+        plan["budget_kop"] = budget_kop
+        return plan
 
     async def save_plan(
         self,
