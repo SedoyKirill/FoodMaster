@@ -18,6 +18,7 @@ import httpx
 from app.web.database import AppRepository
 from app.web.ratelimit import RateLimiter
 
+from .fsm import CANCEL_DATA, CANCEL_TEXT, DialogStore
 from .repository import BotRepository
 from .router import TOO_FAST_TEXT, Actor, Incoming, Router, parse_update
 from .service import (
@@ -298,9 +299,16 @@ class BotApp:
                 await self.client.send_message(actor.chat_id, refusal, MENU)
             return
         try:
-            reply = await handle_message(
-                self.bot_repository, actor.user_id, text, self._today()
-            )
+            route, state = await self.router.route_text(actor, text)
+            if route == "cancel":
+                reply = Reply(CANCEL_TEXT)
+            elif route == "scene":
+                scene = self.router.scenes[state.scene]
+                reply = await scene(self, actor, text, state)
+            else:
+                reply = await handle_message(
+                    self.bot_repository, actor.user_id, text, self._today()
+                )
         except Exception:
             log.exception("Ошибка обработки сообщения от %s", actor.user_id)
             reply = Reply("Что-то сломалось на моей стороне. Попробуйте ещё раз чуть позже.")
@@ -323,6 +331,16 @@ class BotApp:
             return
         if not self.router.allow_callback(actor):
             await self.client.answer_callback_query(callback_id, TOO_FAST_TEXT, True)
+            return
+        if data == CANCEL_DATA:
+            # «✖ Отмена» есть на каждом шаге сцены (TZ-M7 §4.2)
+            if self.router.dialogs is not None:
+                await self.router.dialogs.clear(actor.user_id)
+            await self.client.answer_callback_query(callback_id)
+            if actor.message_id is not None:
+                await self.client.edit_message_text(
+                    actor.chat_id, actor.message_id, CANCEL_TEXT
+                )
             return
         verb = callback_verb(data)
 
@@ -474,12 +492,13 @@ async def main() -> None:
     # channel='telegram' — чтобы audit_log не помечал действия бота как 'web'.
     app_repository = AppRepository(database_url, channel="telegram")
     app_repository.pool = pool
+    router = Router(dialogs=DialogStore(pool))
 
     offset: int | None = None
     async with httpx.AsyncClient() as http:
         client = TelegramClient(token, http)
         await client.set_my_commands(BOT_COMMANDS)
-        app = BotApp(client, bot_repository, app_repository)
+        app = BotApp(client, bot_repository, app_repository, router=router)
         log.info("Бот запущен, ожидаю сообщения (long polling).")
         while True:
             try:

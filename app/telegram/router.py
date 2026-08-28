@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable, Mapping
 
 from app.web.ratelimit import RateLimiter
+
+from .fsm import DialogState, DialogStore, is_cancel
 
 #: TZ-M7 §3.5
 MESSAGES_PER_MINUTE = 20
@@ -27,6 +29,11 @@ REFUSAL_EVERY_SECONDS = 60.0
 #: приёмка §9.6 ищет в ответе именно эту фразу
 TOO_FAST_TEXT = "Слишком часто, подождите немного."
 BUSY_TEXT = "Уже работаю, секунду…"
+
+#: подписи кнопок главного меню: нажатие на них прерывает начатую форму
+MENU_BUTTONS = frozenset({
+    "🍽 сегодня", "📅 неделя", "🛒 покупки", "🧊 запасы", "📖 рецепты", "⚙️ настройки",
+})
 
 
 @dataclass(frozen=True)
@@ -101,7 +108,17 @@ class Router:
     не спали.
     """
 
-    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        *,
+        dialogs: DialogStore | None = None,
+        scenes: Mapping[str, Any] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        #: хранилище незавершённых форм; None — сцен ещё нет (до T4)
+        self.dialogs = dialogs
+        #: реестр сцен по имени; наполняется в T4–T9
+        self.scenes: Mapping[str, Any] = scenes or {}
         self.messages = RateLimiter(MESSAGES_PER_MINUTE, 60.0, clock=clock)
         self.callbacks = RateLimiter(CALLBACKS_PER_MINUTE, 60.0, clock=clock)
         self.heavy = RateLimiter(1, HEAVY_EVERY_SECONDS, clock=clock)
@@ -143,3 +160,26 @@ class Router:
 
     def release_heavy(self, actor: Actor) -> None:
         self.in_flight.discard(actor.user_id)
+
+    async def route_text(self, actor: Actor, text: str) -> tuple[str, DialogState | None]:
+        """Куда отдать текст: «cancel», «scene» (с состоянием) или «command».
+
+        Порядок разбора — из §4.2: отмена сильнее всего; команда или кнопка
+        меню прерывают начатую форму (иначе из неё было бы не выбраться);
+        свободный текст идёт в активную сцену, если она есть и не протухла.
+        """
+        text = (text or "").strip()
+        if is_cancel(text):
+            if self.dialogs is not None:
+                await self.dialogs.clear(actor.user_id)
+            return "cancel", None
+        if self.dialogs is None:
+            return "command", None
+        if text.startswith("/") or text.lower() in MENU_BUTTONS:
+            await self.dialogs.clear(actor.user_id)
+            return "command", None
+        state = await self.dialogs.load(actor.user_id)
+        if state is None or state.scene not in self.scenes:
+            # сцену выпилили или в базе мусор — не роняем разговор
+            return "command", None
+        return "scene", state

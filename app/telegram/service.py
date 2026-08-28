@@ -1,359 +1,42 @@
-"""Логика Telegram-бота: выборки, клавиатуры и тексты ответов.
+"""Легаси-обработчики бота и фасад совместимости (TZ-M7 §2).
 
-Никакого сетевого кода — всё принимает пул asyncpg / AppRepository (или стабы
-в тестах) и возвращает декларативные Reply/CallbackReply для транспорта.
+Модуль разъехался: кодек — в ``callbacks.py``, тексты и клавиатуры — в
+``render.py``, запросы — в ``repository.py``, разбор входящего — в
+``router.py``. Здесь остались плоский каскад ``handle_message`` /
+``handle_callback`` (в T4–T9 его заменят сцены) и реэкспорты, чтобы импорты
+не пришлось править одним заходом. После T9 модуль удаляется.
 
-Модуль постепенно разъезжается по TZ-M7 §2: запросы уехали в ``repository.py``,
-разбор входящего — в ``router.py``. Здесь остаётся фасад совместимости и
-легаси-каскад ``handle_message``/``handle_callback``, который в T4–T9 заменят
-сцены; после этого модуль удаляется.
+Никакого сетевого кода: на вход — репозитории (или стабы в тестах), на выход —
+декларативные Reply/CallbackReply для транспорта.
 """
 
 from __future__ import annotations
 
-import base64
-import uuid as uuid_mod
-from dataclasses import dataclass, field
 from datetime import date
-from decimal import Decimal
 from typing import Any
 
 from app.web.planner import clean_dish_title
 
+from .callbacks import (
+    callback_verb, encode_callback, pack_uuid, parse_callback, unpack_uuid,
+)
+from .render import (
+    BUTTON_TEXT_LIMIT, CallbackReply, HELP_TEXT, MEAL_LABELS, NOT_LINKED_TEXT,
+    Reply, STALE_TEXT, TELEGRAM_LIMIT, alternatives_keyboard, format_day,
+    format_recipe, format_shopping, format_shopping_header, format_week,
+    shopping_keyboard, shopping_page, split_for_telegram, today_keyboard,
+)
 from .repository import BotRepository, bot_session
 
-MEAL_LABELS = {"breakfast": "Завтрак", "lunch": "Обед", "dinner": "Ужин"}
-
-HELP_TEXT = (
-    "Я — Супостат, враг голода. Показываю меню и список покупок вашей семьи.\n\n"
-    "Команды:\n"
-    "🍽 Сегодня — меню дня: рецепты и замена блюд по кнопкам\n"
-    "📅 Неделя — весь текущий план\n"
-    "🛒 Покупки — чек-лист: жмите на позицию, чтобы отметить купленное\n\n"
-    "Планы составляются в веб-приложении «Рацион»."
-)
-
-NOT_LINKED_TEXT = (
-    "Ваш Telegram ещё не привязан к семье.\n\n"
-    "Откройте веб-приложение «Рацион» → Настройки → «Привязать Telegram», "
-    "получите команду вида «/start link_…» и отправьте её мне в течение 10 минут."
-)
-
-STALE_TEXT = (
-    "Данные обновились, кнопки устарели — нажмите 🛒 Покупки или 🍽 Сегодня ещё раз."
-)
-
-
-# --- результаты обработчиков -------------------------------------------------
-
-@dataclass
-class Reply:
-    """Одно сообщение: текст + опциональная inline-клавиатура."""
-
-    text: str
-    keyboard: dict[str, Any] | None = None
-
-
-@dataclass
-class CallbackReply:
-    """Эффекты обработки нажатия кнопки."""
-
-    toast: str = ""
-    show_alert: bool = False
-    edit: Reply | None = None          # перерисовать сообщение с кнопкой
-    sends: list[Reply] = field(default_factory=list)  # новые сообщения
-
-
-# --- кодек callback_data (≤ 64 байта) ---------------------------------------
-
-def pack_uuid(value: Any) -> str:
-    """UUID → 22 символа base64url (без «=»)."""
-    value = value if isinstance(value, uuid_mod.UUID) else uuid_mod.UUID(str(value))
-    return base64.urlsafe_b64encode(value.bytes).rstrip(b"=").decode("ascii")
-
-
-def unpack_uuid(text: str) -> uuid_mod.UUID | None:
-    try:
-        raw = base64.urlsafe_b64decode(text + "==")
-        return uuid_mod.UUID(bytes=raw)
-    except (ValueError, TypeError):
-        return None
-
-
-def encode_callback(verb: str, *parts: Any) -> str:
-    encoded = "|".join([verb, *[str(part) for part in parts]])
-    assert len(encoded.encode("utf-8")) <= 64, f"callback_data длиннее 64 байт: {encoded!r}"
-    return encoded
-
-
-def parse_callback(data: str) -> tuple[str, list[str]] | None:
-    if not data or "|" not in data:
-        return None
-    verb, *parts = data.split("|")
-    if verb not in {"s", "r", "x", "v", "c"}:
-        return None
-    return verb, parts
-
-
-def callback_verb(data: str) -> str:
-    parsed = parse_callback(data or "")
-    return parsed[0] if parsed else ""
-
-
-# --- форматирование (чистые функции) -----------------------------------------
-
-_MONTHS = (
-    "января", "февраля", "марта", "апреля", "мая", "июня",
-    "июля", "августа", "сентября", "октября", "ноября", "декабря",
-)
-_WEEKDAYS = ("понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье")
-
-_UNIT_LABELS = {
-    "g": "г", "kg": "кг", "ml": "мл", "l": "л", "piece": "шт", "tbsp": "ст. л.",
-    "tsp": "ч. л.", "cup": "стакан", "bunch": "пучок", "clove": "зубчик",
-    "pinch": "щепотка", "slice": "ломтик", "can": "банка", "pack": "упаковка",
-}
-
-TELEGRAM_LIMIT = 4000
-
-
-def _date_label(value: date) -> str:
-    return f"{_WEEKDAYS[value.weekday()]}, {value.day} {_MONTHS[value.month - 1]}"
-
-
-def _macros_text(meal: dict[str, Any]) -> str:
-    if meal.get("estimated_protein") is None:
-        return ""
-    return (
-        f" · Б/Ж/У {meal['estimated_protein']}/{meal['estimated_fat']}"
-        f"/{meal['estimated_carb']} г"
-    )
-
-
-def _meal_line(meal: dict[str, Any]) -> str:
-    title = clean_dish_title(str(meal.get("title") or "Блюдо"))
-    label = MEAL_LABELS.get(str(meal.get("meal_type")), str(meal.get("meal_type")))
-    kcal = meal.get("estimated_kcal")
-    kcal_text = f" · ≈{kcal} ккал" if kcal is not None else ""
-    return f"• {label}: {title}{kcal_text}{_macros_text(meal)}"
-
-
-def format_day(meals: list[dict[str, Any]], day: date) -> str:
-    todays = [meal for meal in meals if meal.get("meal_date") == day]
-    if not todays:
-        return (
-            f"🍽 На {_date_label(day)} блюд в плане нет.\n"
-            "Загляните в веб-приложение и составьте новый план."
-        )
-    lines = [f"🍽 Меню на {_date_label(day)}:"] + [_meal_line(meal) for meal in todays]
-    known = [meal["estimated_kcal"] for meal in todays if meal.get("estimated_kcal") is not None]
-    if known:
-        suffix = "" if len(known) == len(todays) else f" (по {len(known)} из {len(todays)} блюд)"
-        lines.append(f"Итого ≈{sum(known)} ккал{suffix}")
-    return "\n".join(lines)
-
-
-def format_week(meals: list[dict[str, Any]]) -> str:
-    if not meals:
-        return "📅 Плана пока нет — составьте его в веб-приложении «Рацион»."
-    lines = ["📅 Текущий план:"]
-    current: date | None = None
-    for meal in meals:
-        meal_date = meal.get("meal_date")
-        if meal_date != current:
-            current = meal_date
-            lines.append("")
-            lines.append(_date_label(meal_date) if isinstance(meal_date, date) else str(meal_date))
-        lines.append(_meal_line(meal))
-    return "\n".join(lines)
-
-
-def _quantity_text(item: dict[str, Any]) -> str:
-    quantity = Decimal(str(item["buy_quantity"])).normalize()
-    unit = _UNIT_LABELS.get(str(item.get("unit_code")), str(item.get("unit_code") or ""))
-    return f"{quantity:f} {unit}".strip()
-
-
-def _to_buy(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        item for item in items
-        if item.get("buy_quantity") is not None
-        and Decimal(str(item["buy_quantity"])) > 0
-    ]
-
-
-def format_shopping_header(items: list[dict[str, Any]]) -> str:
-    buyable = _to_buy(items)
-    if not items:
-        return "🛒 Списка покупок нет — сначала составьте план."
-    remaining = [item for item in buyable if item.get("purchased_at") is None]
-    if not remaining:
-        return "🛒 Всё куплено. Отличная работа!"
-    total_kop = sum(int(item.get("estimated_cost_kop") or 0) for item in remaining)
-    total = f" ≈{total_kop / 100:.0f} ₽" if total_kop else ""
-    return (
-        f"🛒 Осталось купить {len(remaining)} из {len(buyable)} позиций{total}.\n"
-        "Нажимайте на позиции, чтобы отметить купленное (повторное нажатие снимает отметку)."
-    )
-
-
-def format_shopping(items: list[dict[str, Any]]) -> str:
-    """Плоский текстовый список (используется, когда кнопки не нужны)."""
-    buyable = _to_buy(items)
-    if not items:
-        return "🛒 Списка покупок нет — сначала составьте план."
-    remaining = [item for item in buyable if item.get("purchased_at") is None]
-    if not remaining:
-        return "🛒 Всё куплено. Отличная работа!"
-    lines = ["🛒 Осталось купить:"]
-    total_kop = 0
-    for item in remaining:
-        packs = item.get("pack_count")
-        pack_text = f" ({packs} уп.)" if packs else ""
-        cost = item.get("estimated_cost_kop")
-        cost_text = ""
-        if cost is not None:
-            total_kop += int(cost)
-            cost_text = f" — {int(cost) / 100:.0f} ₽"
-        lines.append(f"• {item['normalized_name']}: {_quantity_text(item)}{pack_text}{cost_text}")
-    if total_kop:
-        lines.append(f"Итого ≈{total_kop / 100:.0f} ₽")
-    return "\n".join(lines)
-
-
-def format_recipe(detail: dict[str, Any], meal: dict[str, Any] | None = None) -> str:
-    """Карточка рецепта: КБЖУ берём из блюда плана (уже в масштабе семьи)."""
-    lines = [f"📖 {clean_dish_title(str(detail.get('title') or 'Рецепт'))}"]
-    meta = []
-    if detail.get("source_page_start"):
-        meta.append(f"стр. {detail['source_page_start']}")
-    if detail.get("source_servings_min"):
-        meta.append(f"порций в книге: {detail['source_servings_min']}")
-    if detail.get("time_total_minutes"):
-        meta.append(f"~{detail['time_total_minutes']} мин")
-    if meta:
-        lines.append(" · ".join(str(part) for part in meta))
-    if meal is not None and meal.get("estimated_kcal") is not None:
-        lines.append(
-            f"≈{meal['estimated_kcal']} ккал на всё блюдо{_macros_text(meal)}"
-        )
-    ingredients = detail.get("ingredients") or []
-    if ingredients:
-        lines.append("")
-        lines.append("Ингредиенты:")
-        for ingredient in ingredients:
-            text = str(
-                ingredient.get("raw_text")
-                or ingredient.get("ingredient_text")
-                or ingredient.get("normalized_name")
-                or ""
-            ).strip()
-            if ingredient.get("is_to_taste") and "вкус" not in text.lower():
-                text += " — по вкусу"
-            lines.append(f"• {text}")
-    steps = detail.get("steps") or []
-    if steps:
-        lines.append("")
-        lines.append("Приготовление:")
-        for step in steps:
-            lines.append("")
-            lines.append(f"{step.get('position')}. {str(step.get('instruction') or '').strip()}")
-    return "\n".join(lines)
-
-
-def split_for_telegram(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
-    """Резка длинного текста по абзацам → строкам → жёсткому срезу."""
-    if len(text) <= limit:
-        return [text] if text else []
-
-    def _split_units(units: list[str], separator: str) -> list[str]:
-        chunks: list[str] = []
-        current = ""
-        for unit in units:
-            candidate = f"{current}{separator}{unit}" if current else unit
-            if len(candidate) <= limit:
-                current = candidate
-                continue
-            if current:
-                chunks.append(current)
-            while len(unit) > limit:
-                chunks.append(unit[:limit])
-                unit = unit[limit:]
-            current = unit
-        if current:
-            chunks.append(current)
-        return chunks
-
-    paragraphs = text.split("\n\n")
-    safe_units: list[str] = []
-    for paragraph in paragraphs:
-        if len(paragraph) > limit:
-            safe_units.extend(_split_units(paragraph.split("\n"), "\n"))
-        else:
-            safe_units.append(paragraph)
-    return [chunk for chunk in _split_units(safe_units, "\n\n") if chunk.strip()]
-
-
-# --- inline-клавиатуры --------------------------------------------------------
-
-MAX_SHOPPING_BUTTONS = 90  # лимит Bot API — 100 кнопок на сообщение
-_BUTTON_TEXT_LIMIT = 60
-
-
-def today_keyboard(plan_id: Any, meals: list[dict[str, Any]]) -> dict[str, Any] | None:
-    rows = []
-    plan = pack_uuid(plan_id)
-    for meal in meals:
-        if not meal.get("id"):
-            continue
-        label = MEAL_LABELS.get(str(meal.get("meal_type")), "Блюдо")
-        packed = pack_uuid(meal["id"])
-        rows.append([
-            {"text": f"📖 {label}", "callback_data": encode_callback("r", plan, packed)},
-            {"text": f"🔁 {label}", "callback_data": encode_callback("x", plan, packed)},
-        ])
-    return {"inline_keyboard": rows} if rows else None
-
-
-def shopping_keyboard(plan_id: Any, items: list[dict[str, Any]]) -> dict[str, Any] | None:
-    rows = []
-    plan = pack_uuid(plan_id)
-    for item in _to_buy(items)[:MAX_SHOPPING_BUTTONS]:
-        if not item.get("id"):
-            continue
-        mark = "✅" if item.get("purchased_at") else "☐"
-        cost = item.get("estimated_cost_kop")
-        cost_text = f" — {int(cost) / 100:.0f} ₽" if cost else ""
-        text = f"{mark} {item['normalized_name']} · {_quantity_text(item)}{cost_text}"
-        if len(text) > _BUTTON_TEXT_LIMIT:
-            text = text[:_BUTTON_TEXT_LIMIT - 1] + "…"
-        rows.append([
-            {"text": text, "callback_data": encode_callback("s", plan, pack_uuid(item["id"]))}
-        ])
-    return {"inline_keyboard": rows} if rows else None
-
-
-def alternatives_keyboard(
-    plan_id: Any, meal_id: Any, alternatives: list[dict[str, Any]]
-) -> dict[str, Any]:
-    plan = pack_uuid(plan_id)
-    meal = pack_uuid(meal_id)
-    rows = []
-    for index, alternative in enumerate(alternatives[:3], 1):
-        title = clean_dish_title(str(alternative.get("title") or ""))
-        if alternative.get("draft"):
-            title += " (черновик)"
-        page = alternative.get("source_page_start")
-        page_text = f" · стр. {page}" if page else ""
-        text = f"{index}. {title}{page_text}"
-        if len(text) > _BUTTON_TEXT_LIMIT:
-            text = text[:_BUTTON_TEXT_LIMIT - 1] + "…"
-        rows.append([{
-            "text": text,
-            "callback_data": encode_callback("v", plan, meal, int(alternative["recipe_id"])),
-        }])
-    rows.append([{"text": "✖ Оставить как есть", "callback_data": encode_callback("c", plan)}])
-    return {"inline_keyboard": rows}
+__all__ = [
+    "BUTTON_TEXT_LIMIT", "BotRepository", "CallbackReply", "HELP_TEXT",
+    "MEAL_LABELS", "NOT_LINKED_TEXT", "Reply", "STALE_TEXT", "TELEGRAM_LIMIT",
+    "alternatives_keyboard", "bot_session", "callback_verb", "encode_callback",
+    "format_day", "format_recipe", "format_shopping", "format_shopping_header",
+    "format_week", "handle_callback", "handle_message", "pack_uuid",
+    "parse_callback", "shopping_keyboard", "split_for_telegram",
+    "today_keyboard", "unpack_uuid",
+]
 
 
 # --- обработка входящих сообщений --------------------------------------------
@@ -403,7 +86,7 @@ async def handle_message(
         keyboard = None
         if items and items[0].get("plan_id"):
             keyboard = shopping_keyboard(items[0]["plan_id"], items)
-        return Reply(format_shopping_header(items), keyboard)
+        return Reply(format_shopping_header(items, shopping_page(items)), keyboard)
 
     return Reply(f"Не понял команду.\n\n{HELP_TEXT}")
 
@@ -430,16 +113,23 @@ async def handle_callback(
         return CallbackReply(toast="Не понял кнопку.")
     verb, parts = parsed
 
+    # счётчик страниц «2/5» — не кнопка, а подпись: гасим спиннер и всё
+    if verb == "n" and parts[:1] == ["noop"]:
+        return CallbackReply()
+
     context = await bot_repository.context_for_user(user_id)
     if context is None:
         return CallbackReply(toast=NOT_LINKED_TEXT, show_alert=True)
     session = bot_session(context)
 
-    plan_id = unpack_uuid(parts[0]) if parts else None
-    if plan_id is None:
-        return CallbackReply(toast="Не понял кнопку.")
-
     try:
+        if verb == "p":
+            return await _turn_page(app_repository, session, parts)
+
+        plan_id = unpack_uuid(parts[0]) if parts else None
+        if plan_id is None:
+            return CallbackReply(toast="Не понял кнопку.")
+
         if verb == "c":
             return CallbackReply(edit=Reply("Оставили как есть."))
 
@@ -460,9 +150,13 @@ async def handle_callback(
                 return _stale()
             target["purchased_at"] = result.get("purchased_at")
             action = "Куплено" if make_purchased else "Снята отметка"
+            page = _page_of_item(items, item_id)
             return CallbackReply(
                 toast=f"{action}: {target.get('normalized_name')}",
-                edit=Reply(format_shopping_header(items), shopping_keyboard(plan_id, items)),
+                edit=Reply(
+                    format_shopping_header(items, shopping_page(items, page)),
+                    shopping_keyboard(plan_id, items, page),
+                ),
             )
 
         if verb == "r":
@@ -548,3 +242,36 @@ async def handle_callback(
         return CallbackReply(toast=str(exc), show_alert=True)
 
     return CallbackReply(toast="Не понял кнопку.")
+
+
+async def _turn_page(app_repository: Any, session: dict, parts: list[str]) -> CallbackReply:
+    """Листание длинного списка (глагол ``p``): пока только чек-лист покупок."""
+    scope = parts[0] if parts else ""
+    if scope != "sh" or len(parts) < 3:
+        return CallbackReply(toast="Не понял кнопку.")
+    plan_id = unpack_uuid(parts[1])
+    page = int(parts[2]) if parts[2].isdigit() else 1
+    if plan_id is None:
+        return CallbackReply(toast="Не понял кнопку.")
+    plan = await app_repository.get_plan(session, plan_id)
+    if plan is None:
+        return _stale()
+    items = plan.get("shopping") or []
+    return CallbackReply(
+        edit=Reply(
+            format_shopping_header(items, shopping_page(items, page)),
+            shopping_keyboard(plan_id, items, page),
+        )
+    )
+
+
+def _page_of_item(items: list[dict[str, Any]], item_id: Any) -> int:
+    """На какой странице чек-листа лежит позиция — чтобы после отметки
+    пользователь остался там же, где нажимал."""
+    from .render import BUTTONS_PER_PAGE, _to_buy
+
+    buyable = [item for item in _to_buy(items) if item.get("id")]
+    for index, item in enumerate(buyable):
+        if str(item.get("id")) == str(item_id):
+            return index // BUTTONS_PER_PAGE + 1
+    return 1

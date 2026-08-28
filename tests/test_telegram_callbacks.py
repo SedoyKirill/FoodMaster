@@ -40,6 +40,28 @@ class CodecTests(unittest.TestCase):
         self.assertIsNone(parse_callback("мусор"))
         self.assertEqual(parse_callback("s|a|b"), ("s", ["a", "b"]))
 
+    def test_encode_uses_colon_separator(self) -> None:
+        # ТЗ §4.3: формат <verb>:<args>
+        self.assertEqual(encode_callback("d", "abc", 3), "d:abc:3")
+
+    def test_parse_accepts_legacy_pipe(self) -> None:
+        """Кнопки, отправленные до перехода на «:», остались в чатах людей."""
+        self.assertEqual(parse_callback("v|abc|def|7"), ("v", ["abc", "def", "7"]))
+        self.assertEqual(parse_callback("v:abc:def:7"), ("v", ["abc", "def", "7"]))
+
+    def test_verb_without_arguments_is_valid(self) -> None:
+        self.assertEqual(parse_callback("n"), ("n", []))
+
+    def test_encode_raises_when_too_long(self) -> None:
+        # раньше это был assert — под python -O он исчезал вместе с проверкой
+        with self.assertRaises(ValueError):
+            encode_callback("v", "я" * 40)
+
+    def test_all_verbs_from_spec_are_known(self) -> None:
+        from app.telegram.callbacks import VERBS
+
+        self.assertEqual(set(VERBS), set("srxvcdpkgwifonty"))
+
 
 class KeyboardTests(unittest.TestCase):
     def test_shopping_keyboard_marks_and_parses_back(self) -> None:
@@ -73,16 +95,17 @@ class KeyboardTests(unittest.TestCase):
         self.assertEqual(parse_callback(rows[0][0]["callback_data"])[0], "r")
         self.assertEqual(parse_callback(rows[0][1]["callback_data"])[0], "x")
 
-    def test_alternatives_keyboard_caps_and_cancels(self) -> None:
+    def test_alternatives_keyboard_shows_all_and_cancels(self) -> None:
         alternatives = [
             {"recipe_id": index, "title": f"Блюдо {index}", "source_page_start": 10 + index,
              "draft": index == 2}
             for index in range(1, 5)
         ]
         rows = alternatives_keyboard(PLAN, MEAL, alternatives)["inline_keyboard"]
-        self.assertEqual(len(rows), 4)  # 3 варианта + отмена
+        # раньше бот резал до трёх, хотя репозиторий отдаёт десять
+        self.assertEqual(len(rows), len(alternatives) + 1)
         self.assertIn("(черновик)", rows[1][0]["text"])
-        self.assertEqual(parse_callback(rows[3][0]["callback_data"])[0], "c")
+        self.assertEqual(parse_callback(rows[-1][0]["callback_data"])[0], "c")
 
 
 class FormatRecipeTests(unittest.TestCase):
