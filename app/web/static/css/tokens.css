@@ -1,0 +1,201 @@
+/* Дизайн-токены «Рациона».
+ *
+ * Всё, что задаёт вид приложения, живёт здесь: шрифт, шкалы, палитра.
+ * Правило: ни один цвет, отступ или размер шрифта не пишется в других файлах
+ * литералом — только через переменную отсюда.
+ *
+ * Тема: светлые значения объявлены на :root, тёмные переопределяются дважды —
+ * по системной настройке и по ручному переключателю. Порядок важен:
+ * `[data-theme="light"]` должен побеждать системную тёмную.
+ */
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("../fonts/InterVariable.woff2") format("woff2");
+}
+
+:root {
+  color-scheme: light;
+
+  /* --- шрифт ------------------------------------------------------------ */
+  --font-sans: "Inter", "Segoe UI", system-ui, -apple-system, Arial, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Mono", "Consolas", monospace;
+
+  /* --- шкала отступов --------------------------------------------------- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+
+  /* --- шкала типографики ------------------------------------------------ */
+  --text-xs: 12px;
+  --text-sm: 14px;
+  --text-base: 16px;
+  --text-md: 18px;
+  --text-lg: 22px;
+  --text-xl: 28px;
+  --text-2xl: 36px;
+
+  --leading-tight: 1.2;
+  --leading-normal: 1.5;
+  --leading-loose: 1.65;
+
+  /* --- радиусы: ровно два ----------------------------------------------- */
+  --radius-sm: 8px;
+  --radius-lg: 16px;
+  /* Не третья ступень шкалы, а примитив формы: аватар, точка, ползунок. */
+  --radius-full: 9999px;
+
+  /* --- тени -------------------------------------------------------------- */
+  --shadow-1: 0 1px 2px rgb(23 54 47 / 0.06), 0 2px 8px rgb(23 54 47 / 0.05);
+  --shadow-2: 0 8px 24px rgb(23 54 47 / 0.1);
+  --shadow-pop: 0 24px 64px rgb(19 40 33 / 0.28);
+
+  /* --- поверхности ------------------------------------------------------- */
+  --bg: #f5f1e8;
+  --surface: #fffdf8;
+  --surface-2: #f0ece1;
+  --surface-3: #e8f0ea;
+  --border: #ded9ce;
+  --border-strong: #c9c2b3;
+
+  /* --- текст (контраст на --surface указан в комментарии) ---------------- */
+  --text: #17362f;         /* 12.87:1 */
+  --text-muted: #5b625c;   /* 6.17:1  */
+  --text-accent: #2f705d;  /* 5.74:1  */
+
+  /* --- акцент: зелёный, состояния и ссылки ------------------------------- */
+  --accent: #2f705d;
+  --accent-hover: #245c4a;
+  --accent-soft: #dfeee6;
+  --on-accent: #ffffff;    /* 5.84:1 на --accent */
+
+  /* --- действие: оранжевый, только главная кнопка ------------------------ */
+  --action: #b0521f;
+  --action-hover: #8f4118;
+  --on-action: #ffffff;    /* 5.16:1; прежний #d76b38 давал 3.47:1 */
+
+  /* --- статусы ----------------------------------------------------------- */
+  --draft-bg: #fbeadb;
+  --draft-text: #8a4a1c;
+  --ok-bg: #dfeee6;
+  --ok-text: #245c4a;
+  --warn-bg: #fdf1e2;
+  --warn-text: #6b4a22;
+  --danger-bg: #fbe3e0;
+  --danger-text: #a32f26;
+
+  --focus: #2f705d;
+
+  /* --- боковая панель: тёмная в обеих темах, поэтому свои токены --------- */
+  --shell: #183c32;
+  --shell-text: #e9f1ec;
+  --shell-text-muted: #c5d8d0;
+  --shell-active: rgb(255 255 255 / 0.12);
+
+  --sidebar-width: 248px;
+  --content-max: 1180px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
+    --bg: #101f1a;
+    --surface: #17302a;
+    --surface-2: #1e3b33;
+    --surface-3: #254740;
+    --border: #2e5146;
+    --border-strong: #3d6154;
+
+    --text: #e9f1ec;        /* 12.23:1 */
+    --text-muted: #a8bdb3;  /* 7.10:1  */
+    --text-accent: #7ecfae; /* 7.65:1  */
+
+    --accent: #7ecfae;
+    --accent-hover: #9adcc0;
+    --accent-soft: #1b3a30;
+    --on-accent: #101f1a;
+
+    --action: #e07a45;
+    --action-hover: #ef8b55;
+    --on-action: #101f1a;
+
+    --draft-bg: #3a2a1c;
+    --draft-text: #f2b98a;
+    --ok-bg: #1b3a30;
+    --ok-text: #8fd9b8;
+    --warn-bg: #33261a;
+    --warn-text: #f0c89a;
+    --danger-bg: #3a1f1c;
+    --danger-text: #f4a49b;
+
+    --focus: #9fe0c2;
+
+    --shell: #0c1815;
+
+    --shadow-1: 0 1px 2px rgb(0 0 0 / 0.3), 0 2px 8px rgb(0 0 0 / 0.25);
+    --shadow-2: 0 8px 24px rgb(0 0 0 / 0.4);
+    --shadow-pop: 0 24px 64px rgb(0 0 0 / 0.55);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #101f1a;
+  --surface: #17302a;
+  --surface-2: #1e3b33;
+  --surface-3: #254740;
+  --border: #2e5146;
+  --border-strong: #3d6154;
+
+  --text: #e9f1ec;
+  --text-muted: #a8bdb3;
+  --text-accent: #7ecfae;
+
+  --accent: #7ecfae;
+  --accent-hover: #9adcc0;
+  --accent-soft: #1b3a30;
+  --on-accent: #101f1a;
+
+  --action: #e07a45;
+  --action-hover: #ef8b55;
+  --on-action: #101f1a;
+
+  --draft-bg: #3a2a1c;
+  --draft-text: #f2b98a;
+  --ok-bg: #1b3a30;
+  --ok-text: #8fd9b8;
+  --warn-bg: #33261a;
+  --warn-text: #f0c89a;
+  --danger-bg: #3a1f1c;
+  --danger-text: #f4a49b;
+
+  --focus: #9fe0c2;
+
+  --shell: #0c1815;
+
+  --shadow-1: 0 1px 2px rgb(0 0 0 / 0.3), 0 2px 8px rgb(0 0 0 / 0.25);
+  --shadow-2: 0 8px 24px rgb(0 0 0 / 0.4);
+  --shadow-pop: 0 24px 64px rgb(0 0 0 / 0.55);
+}
+
+/* Скелетоны мерцают бесконечно, а переключение экранов анимируется — обе
+ * анимации выключаются, когда пользователь просит меньше движения. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

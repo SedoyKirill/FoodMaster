@@ -1,0 +1,2 @@
+"""Store catalogue adapters."""
+

@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f5f1e8" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#101f1a" media="(prefers-color-scheme: dark)" />
+    <title>Рацион — еда без лишних покупок</title>
+    <meta name="description" content="Локальный планировщик меню, запасов и покупок в «Ленте»." />
+
+    <link rel="icon" href="/assets/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/assets/icon.svg" />
+    <link rel="preload" href="/assets/fonts/InterVariable.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="/assets/css/tokens.css" />
+    <link rel="stylesheet" href="/assets/css/base.css" />
+    <link rel="stylesheet" href="/assets/css/components.css" />
+    <link rel="stylesheet" href="/assets/css/views.css" />
+
+    <!-- Отдельным файлом, а не инлайном: CSP запрещает инлайновые скрипты. -->
+    <script src="/assets/js/theme-init.js"></script>
+    <script type="module" src="/assets/js/main.js"></script>
+  </head>
+
+  <body>
+    <a class="skip-link" href="#main">К содержимому</a>
+
+    <!-- ------------------------------- вход ------------------------------- -->
+    <section id="auth-view" class="auth-shell" hidden>
+      <div class="auth-story">
+        <p class="eyebrow">Еда без отходов</p>
+        <h1>Три дня меню.<br />Одна понятная закупка.</h1>
+        <p>
+          «Рацион» собирает меню из вашей библиотеки рецептов, сначала тратит то,
+          что уже лежит дома, и считает стоимость по свежему прайсу «Ленты».
+        </p>
+        <p class="footnote">
+          Всё хранится на этом компьютере. Никаких внешних сервисов.
+        </p>
+      </div>
+
+      <div class="auth-panel">
+        <form id="auth-form" class="auth-card" novalidate>
+          <div class="auth-tabs" role="tablist" aria-label="Вход или регистрация">
+            <button class="auth-tab" type="button" role="tab" data-mode="register" aria-selected="true" aria-controls="auth-panel">
+              Регистрация
+            </button>
+            <button class="auth-tab" type="button" role="tab" data-mode="login" aria-selected="false" aria-controls="auth-panel" tabindex="-1">
+              Вход
+            </button>
+          </div>
+
+          <div id="auth-panel" role="tabpanel">
+            <h2 id="auth-title">Создайте аккаунт</h2>
+            <p id="auth-subtitle" class="muted"></p>
+          </div>
+
+          <label class="field">
+            <span>Логин</span>
+            <input id="auth-login" name="login" type="text" autocomplete="username" minlength="3" required />
+            <span class="field-error" id="auth-login-error" role="alert"></span>
+          </label>
+
+          <label class="field">
+            <span>Пароль</span>
+            <input id="auth-password" name="password" type="password" autocomplete="new-password" minlength="8" required />
+            <span class="field-error" id="auth-password-error" role="alert"></span>
+          </label>
+
+          <ul id="auth-rules" class="password-rules" aria-live="polite">
+            <li id="auth-rule-length" data-met="false">не менее 8 символов</li>
+          </ul>
+
+          <label class="field" id="auth-household-field">
+            <span>Название семьи</span>
+            <input id="auth-household" type="text" value="Моя семья" maxlength="100" />
+          </label>
+
+          <button id="auth-submit" class="btn btn--action btn--wide" type="submit">Создать аккаунт</button>
+          <p class="field-error" id="auth-form-error" role="alert"></p>
+        </form>
+      </div>
+    </section>
+
+    <!-- ---------------------------- приложение ---------------------------- -->
+    <div id="app-view" class="app-shell" hidden>
+      <header class="mobile-header">
+        <button class="icon-btn" type="button" data-action="app:menu" data-icon="menu" aria-label="Открыть меню"></button>
+        <span class="brand"><span class="brand__mark">Р</span>Рацион</span>
+      </header>
+
+      <aside class="sidebar">
+        <div class="brand"><span class="brand__mark">Р</span><span>Рацион</span></div>
+
+        <nav class="nav" aria-label="Основное меню">
+          <ul>
+            <li><a class="nav__item" href="#/" data-icon="home">Сегодня</a></li>
+            <li><a class="nav__item" href="#/plan" data-icon="calendar">План питания</a></li>
+            <li><a class="nav__item" href="#/recipes" data-icon="book">Рецепты</a></li>
+            <li><a class="nav__item" href="#/inventory" data-icon="fridge">Запасы</a></li>
+            <li><a class="nav__item" href="#/products" data-icon="price">Продукты «Ленты»</a></li>
+            <li><a class="nav__item" href="#/settings" data-icon="settings">Настройки</a></li>
+          </ul>
+        </nav>
+
+        <div class="sidebar__foot">
+          <div class="user-chip">
+            <span class="avatar" id="user-avatar" aria-hidden="true"></span>
+            <span class="user-chip__text">
+              <span class="user-chip__login" id="user-login"></span>
+              <span class="user-chip__role" id="user-role"></span>
+            </span>
+          </div>
+          <button class="icon-btn" type="button" id="theme-toggle" data-action="app:theme" aria-label="Тема оформления"></button>
+          <button class="icon-btn" type="button" data-action="app:logout" data-icon="close" aria-label="Выйти"></button>
+        </div>
+      </aside>
+
+      <main id="main" class="content" tabindex="-1">
+        <!-- ---------------------------- Сегодня ---------------------------- -->
+        <section id="view-dashboard" class="view">
+          <div class="page-head">
+            <div class="page-head__text">
+              <h1 id="dashboard-greeting">Сегодня</h1>
+              <p class="lead">Что уже запланировано и что стоит съесть в первую очередь.</p>
+            </div>
+            <a class="btn btn--action" href="#/plan">Составить меню</a>
+          </div>
+          <div id="dashboard-stats" class="stat-row"></div>
+          <div id="dashboard-panels" class="dash-grid"></div>
+        </section>
+
+        <!-- --------------------------- План питания -------------------------- -->
+        <section id="view-plan" class="view">
+          <div class="page-head">
+            <div class="page-head__text">
+              <h1>План питания</h1>
+              <p class="lead">Меню на несколько дней и список покупок с ценами «Ленты».</p>
+            </div>
+          </div>
+
+          <form id="plan-form" class="panel">
+            <div class="form-grid">
+              <label class="field">
+                <span>Начать с</span>
+                <input id="plan-start" type="date" required />
+              </label>
+              <label class="field">
+                <span>Сколько дней</span>
+                <select id="plan-days">
+                  <option value="1">1 день</option>
+                  <option value="3" selected>3 дня</option>
+                  <option value="5">5 дней</option>
+                  <option value="7">7 дней</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Бюджет, ₽ <span class="field__optional">необязательно</span></span>
+                <input id="plan-budget" type="number" min="0" step="50" placeholder="без ограничения" />
+              </label>
+              <fieldset class="field form-grid--full fieldset">
+                <legend>Ценовая стратегия</legend>
+                <div class="chips chips--tiers">
+                  <label class="check-option">
+                    <input type="radio" name="price-tier" value="economy" />
+                    <span>Экономно</span>
+                  </label>
+                  <label class="check-option">
+                    <input type="radio" name="price-tier" value="balanced" checked />
+                    <span>Сбалансированно</span>
+                  </label>
+                  <label class="check-option">
+                    <input type="radio" name="price-tier" value="premium" />
+                    <span>Премиально</span>
+                  </label>
+                </div>
+              </fieldset>
+              <fieldset class="field form-grid--full fieldset" id="plan-cuisines-block" hidden>
+                <legend>Кухни <span class="field__optional">необязательно</span></legend>
+                <div id="plan-cuisines" class="chips" role="group" aria-label="Предпочитаемые кухни"></div>
+              </fieldset>
+            </div>
+            <button id="plan-generate" class="btn btn--action form-submit" type="submit">
+              Составить меню
+            </button>
+          </form>
+
+          <div class="plan-layout">
+            <aside id="plan-history" class="panel plan-history" aria-label="История планов" hidden>
+              <div class="panel__head"><h2>История</h2></div>
+              <ul id="plan-history-list"></ul>
+            </aside>
+            <div id="plan-output"></div>
+          </div>
+        </section>
+
+        <!-- ----------------------------- Рецепты ----------------------------- -->
+        <section id="view-recipes" class="view">
+          <div class="page-head">
+            <div class="page-head__text">
+              <h1>Рецепты</h1>
+              <p class="lead">Библиотека из ваших книг. Названия и ингредиенты распознаны автоматически.</p>
+            </div>
+          </div>
+
+          <div class="filters" role="search">
+            <label class="field field--search">
+              <span class="visually-hidden">Поиск по названию</span>
+              <span class="field__icon" data-icon="search" aria-hidden="true"></span>
+              <input id="recipe-search" type="search" placeholder="Например, плов" autocomplete="off" />
+            </label>
+
+            <div class="filters__group">
+              <span id="recipe-meal-label">Приём пищи</span>
+              <div id="recipe-meal-chips" class="chips" role="group" aria-labelledby="recipe-meal-label"></div>
+            </div>
+
+            <div class="filters__group" id="recipe-cuisine-block" hidden>
+              <span id="recipe-cuisine-label">Кухня</span>
+              <div id="recipe-cuisine-chips" class="chips" role="group" aria-labelledby="recipe-cuisine-label"></div>
+            </div>
+
+            <div class="filters__group" id="recipe-dish-block" hidden>
+              <span id="recipe-dish-label">Тип блюда</span>
+              <select id="recipe-dish">
+                <option value="">Любое</option>
+              </select>
+            </div>
+
+            <label class="switch">
+              <input id="recipe-ready" type="checkbox" />
+              <span>Только проверенные</span>
+            </label>
+          </div>
+
+          <p class="footnote">
+            Рецепты без разметки приёма пищи показываются во всех фильтрах — так их не потерять.
+          </p>
+          <p id="recipe-count" class="count" aria-live="polite"></p>
+
+          <div id="recipe-list" class="card-grid"></div>
+
+          <div class="list-foot">
+            <button id="recipe-more" class="btn" type="button" data-action="recipes:more" hidden></button>
+          </div>
+        </section>
+
+        <!-- ------------------------------ Запасы ------------------------------ -->
+        <section id="view-inventory" class="view">
+          <div class="page-head">
+            <div class="page-head__text">
+              <h1>Запасы</h1>
+              <p class="lead">Планировщик сначала израсходует то, что скоро испортится.</p>
+            </div>
+            <span id="inventory-count" class="count" aria-live="polite"></span>
+          </div>
+
+          <div class="inventory-layout">
+            <form id="inventory-form" class="panel">
+              <div class="panel__head"><h2>Добавить продукт</h2></div>
+              <div id="inventory-presets" class="presets"></div>
+
+              <div class="form-grid">
+                <label class="field form-grid--full">
+                  <span>Название</span>
+                  <input id="inventory-name" type="text" maxlength="120" required />
+                </label>
+                <label class="field">
+                  <span>Количество</span>
+                  <input id="inventory-quantity" type="number" min="0.01" step="0.01" value="1" required />
+                </label>
+                <label class="field">
+                  <span>Единица</span>
+                  <select id="inventory-unit">
+                    <option value="piece" selected>шт</option>
+                    <option value="g">г</option>
+                    <option value="kg">кг</option>
+                    <option value="ml">мл</option>
+                    <option value="l">л</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>Годен до <span class="field__optional">необязательно</span></span>
+                  <input id="inventory-expiry" type="date" />
+                </label>
+                <label class="field">
+                  <span>Где хранится</span>
+                  <select id="inventory-storage">
+                    <option value="fridge" selected>Холодильник</option>
+                    <option value="freezer">Морозилка</option>
+                    <option value="pantry">Шкаф</option>
+                  </select>
+                </label>
+                <label class="switch form-grid--full" id="inventory-expired-field" hidden>
+                  <input id="inventory-expired" type="checkbox" />
+                  <span>Да, продукт уже просрочен</span>
+                </label>
+              </div>
+
+              <p class="field-error" id="inventory-error" role="alert"></p>
+              <button class="btn btn--action btn--wide form-submit" type="submit">
+                Добавить
+              </button>
+            </form>
+
+            <div id="inventory-list" class="panel"></div>
+          </div>
+        </section>
+
+        <!-- ------------------------ Продукты «Ленты» ------------------------- -->
+        <section id="view-products" class="view">
+          <div class="page-head">
+            <div class="page-head__text">
+              <h1>Продукты «Ленты»</h1>
+              <p class="lead">Ассортимент гипермаркета №155 с ценами последнего ночного сбора.</p>
+            </div>
+          </div>
+
+          <div class="filters" role="search">
+            <label class="field field--search">
+              <span class="visually-hidden">Поиск по названию или бренду</span>
+              <span class="field__icon" data-icon="search" aria-hidden="true"></span>
+              <input id="product-search" type="search" placeholder="Например, молоко" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Категория</span>
+              <select id="product-category">
+                <option value="">Все категории</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Сортировка</span>
+              <select id="product-sort">
+                <option value="name">По алфавиту</option>
+                <option value="price_asc">Сначала дешёвые</option>
+                <option value="price_desc">Сначала дорогие</option>
+              </select>
+            </label>
+            <label class="switch">
+              <input id="product-sale" type="checkbox" />
+              <span>Только со скидкой</span>
+            </label>
+          </div>
+
+          <p id="product-count" class="count" aria-live="polite"></p>
+          <div id="product-list" class="card-grid"></div>
+          <div class="list-foot">
+            <button id="product-more" class="btn" type="button" data-action="products:more" hidden></button>
+          </div>
+        </section>
+
+        <!-- ---------------------------- Настройки ---------------------------- -->
+        <section id="view-settings" class="view">
+          <div class="page-head">
+            <div class="page-head__text">
+              <h1>Настройки</h1>
+              <p class="lead">Кого кормим, что есть на кухне и чего избегаем.</p>
+            </div>
+          </div>
+
+          <form id="settings-form" class="settings-stack">
+            <section class="panel">
+              <div class="panel__head"><h2>Семья</h2></div>
+              <label class="field">
+                <span>Название</span>
+                <input id="household-name" type="text" maxlength="100" required />
+              </label>
+            </section>
+
+            <section class="panel">
+              <div class="panel__head">
+                <h2>Кого кормим</h2>
+                <button class="btn btn--small" type="button" data-action="settings:add-person">
+                  Добавить человека
+                </button>
+              </div>
+              <div id="settings-people" class="settings-stack"></div>
+            </section>
+
+            <section class="panel">
+              <div class="panel__head"><h2>Техника на кухне</h2></div>
+              <div id="settings-appliances" class="check-grid"></div>
+              <p class="footnote">
+                Отметьте всё, что есть дома: рецепты, требующие другую технику,
+                в план не попадут. Если ничего не отмечено — фильтр выключен и
+                меню подбирается без ограничений по технике.
+              </p>
+            </section>
+
+            <section class="panel">
+              <div class="panel__head">
+                <h2>Ограничения в питании</h2>
+                <button class="btn btn--small" type="button" data-action="settings:add-rule">
+                  Добавить правило
+                </button>
+              </div>
+              <div id="settings-rules" class="settings-stack"></div>
+              <p class="footnote">
+                «Строгое» правило полностью исключает рецепт. Совпадение ищется по вхождению
+                слова в названия ингредиентов, поэтому редкие случаи стоит перепроверять.
+              </p>
+            </section>
+
+            <section class="panel">
+              <div class="panel__head"><h2>Оформление</h2></div>
+              <div id="settings-theme" class="theme-choice" role="radiogroup" aria-label="Тема оформления"></div>
+            </section>
+
+            <section class="panel">
+              <div class="panel__head"><h2>Телеграм</h2></div>
+              <p class="footnote">Бот подключается одноразовой командой; без токена он выключен.</p>
+              <button id="telegram-link" class="btn btn--small form-submit" type="button">
+                Получить команду
+              </button>
+              <code id="telegram-command" hidden></code>
+            </section>
+
+            <section class="panel">
+              <div class="panel__head"><h2>Данные</h2></div>
+              <div id="settings-data" class="settings-stack"></div>
+            </section>
+
+            <div class="sticky-save">
+              <button class="btn btn--action" type="submit">Сохранить настройки</button>
+              <span class="footnote">Люди правятся по отдельности — их идентификаторы не меняются.</span>
+            </div>
+          </form>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="recipe-dialog" class="dialog"></dialog>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

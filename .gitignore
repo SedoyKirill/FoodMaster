@@ -1,0 +1,25 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+data/*
+!data/.gitkeep
+
+# Локальные PDF-книги (сотни МБ) — в репозиторий не идут.
+Книги/
+книги/
+# Черновики и промежуточные выгрузки.
+tmp/
+# Сборка Python
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+# ОС и IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.claude/

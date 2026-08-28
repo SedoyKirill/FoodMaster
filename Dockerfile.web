@@ -1,0 +1,20 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+
+RUN pip install --no-cache-dir "setuptools>=77" \
+    asyncpg==0.31.0 argon2-cffi==25.1.0 fastapi==0.116.1 uvicorn==0.35.0 \
+    ortools==9.15.6755 httpx==0.28.1
+
+COPY app ./app
+
+RUN pip install --no-cache-dir --no-deps --no-build-isolation . \
+    && useradd --create-home --uid 10001 ration \
+    && chown -R ration:ration /app
+
+USER ration
+
+EXPOSE 8080
+CMD ["uvicorn", "app.web.main:app", "--host", "0.0.0.0", "--port", "8080"]

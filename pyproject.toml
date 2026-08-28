@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ration"
+version = "0.1.0"
+description = "Local meal planner and Lenta catalogue collector"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "asyncpg==0.31.0",
+    "argon2-cffi==25.1.0",
+    "fastapi==0.116.1",
+    "uvicorn==0.35.0",
+    # Планировщик меню TZ-M5R (CP-SAT); обещание TZ-v2 §10.
+    "ortools==9.15.6755",
+    # Telegram-бот (app.telegram): long polling Bot API.
+    "httpx==0.28.1",
+]
+
+[project.optional-dependencies]
+recipes = [
+    "pypdf==6.10.0",
+    "PyMuPDF==1.26.1",
+]
+dev = []
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.setuptools.package-data]
+"app.store.lenta" = ["schema.sql"]
+"app.recipes" = ["schema.sql"]
+# Перечисление обязательно: setuptools не понимает `**` в package-data,
+# а плоский `static/*` не подхватил бы css/, js/, js/views/ и fonts/.
+"app.web" = [
+    "schema.sql",
+    "static/*",
+    "static/css/*",
+    "static/js/*",
+    "static/js/views/*",
+    "static/fonts/*",
+]

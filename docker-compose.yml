@@ -1,0 +1,135 @@
+name: ration
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ration}
+      POSTGRES_USER: ${POSTGRES_USER:-ration}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ration}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  collector:
+    build: .
+    profiles: ["manual"]
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+    environment: &collector-env
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${DATABASE_URL:-postgresql://ration:ration@db:5432/ration}
+      LENTA_STORE_CODE: ${LENTA_STORE_CODE:-lenta-155}
+      LENTA_STORE_ID: ${LENTA_STORE_ID:-155}
+      LENTA_CITY: ${LENTA_CITY:-Иваново}
+      LENTA_STORE_ADDRESS: ${LENTA_STORE_ADDRESS:-Карла Маркса ул., 3}
+      LENTA_RUN_AT: ${LENTA_RUN_AT:-03:00}
+      LENTA_TIMEZONE: ${LENTA_TIMEZONE:-Europe/Moscow}
+      LENTA_PAGE_DELAY_SECONDS: ${LENTA_PAGE_DELAY_SECONDS:-0.25}
+      LENTA_MAX_PAGES: ${LENTA_MAX_PAGES:-100}
+      LENTA_PAGE_SIZE: ${LENTA_PAGE_SIZE:-40}
+      LENTA_DETAIL_LIMIT: ${LENTA_DETAIL_LIMIT:-500}
+      LENTA_API_BASE_URL: ${LENTA_API_BASE_URL:-https://api.baseomni.ru/v1}
+      LENTA_APP_VERSION: ${LENTA_APP_VERSION:-6.93.0}
+      LENTA_ANDROID_RELEASE: ${LENTA_ANDROID_RELEASE:-15}
+      LENTA_ANDROID_SDK: ${LENTA_ANDROID_SDK:-35}
+      LENTA_REQUEST_TIMEOUT_SECONDS: ${LENTA_REQUEST_TIMEOUT_SECONDS:-30}
+      LENTA_REQUEST_RETRIES: ${LENTA_REQUEST_RETRIES:-3}
+      LENTA_CATEGORIES: ${LENTA_CATEGORIES:-}
+      DATA_DIR: /app/data
+    volumes:
+      - ./data:/app/data
+    command: ["python", "-m", "app.store.lenta.cli"]
+
+  scheduler:
+    build: .
+    restart: unless-stopped
+    init: true
+    command: ["python", "-m", "app.store.lenta.scheduler"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      <<: *collector-env
+      LENTA_RUN_ON_START: ${LENTA_RUN_ON_START:-false}
+    volumes:
+      - ./data:/app/data
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    restart: unless-stopped
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://ration:ration@db:5432/ration}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # Правки CSS/JS видны по F5 без пересборки образа. Только чтение —
+      # контейнер работает под непривилегированным пользователем.
+      - ./app/web/static:/app/app/web/static:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    restart: unless-stopped
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${DATABASE_URL:-postgresql://ration:ration@db:5432/ration}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      LENTA_TIMEZONE: ${LENTA_TIMEZONE:-Europe/Moscow}
+    command: ["python", "-m", "app.telegram.bot"]
+
+  recipe-importer:
+    build:
+      context: .
+      dockerfile: Dockerfile.recipes
+    profiles: ["manual"]
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${DATABASE_URL:-postgresql://ration:ration@db:5432/ration}
+      BOOKS_DIR: /app/books
+      DATA_DIR: /app/data
+      RECIPE_OCR_ENABLED: ${RECIPE_OCR_ENABLED:-true}
+      RECIPE_OCR_DPI: ${RECIPE_OCR_DPI:-300}
+      RECIPE_OCR_LANGUAGES: ${RECIPE_OCR_LANGUAGES:-rus+eng}
+      RECIPE_MIN_NATIVE_CHARS: ${RECIPE_MIN_NATIVE_CHARS:-80}
+      RECIPE_WINDOW_PAGES: ${RECIPE_WINDOW_PAGES:-4}
+      RECIPE_WINDOW_STEP: ${RECIPE_WINDOW_STEP:-3}
+      RECIPE_LLM_SCHEMA_VERSION: ${RECIPE_LLM_SCHEMA_VERSION:-1}
+    volumes:
+      - ./книги:/app/books:ro
+      - ./data:/app/data
+    command: ["python", "-m", "app.recipes.cli", "extract-status"]
+
+volumes:
+  pgdata:
