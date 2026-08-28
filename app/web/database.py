@@ -1080,6 +1080,33 @@ class AppRepository:
         )
         return [row_dict(row) for row in rows]
 
+    async def add_to_plan(
+        self,
+        session: dict[str, Any],
+        plan_id: uuid.UUID,
+        meal_date: date,
+        meal_type: str,
+        recipe_id: int,
+    ) -> dict[str, Any] | None:
+        """Поставить конкретный рецепт в слот плана (TZ-M7 §5.7).
+
+        Обёртка над ``replace_meal``: та же проверка допустимости для слота и
+        та же пересборка списка покупок — разница только в том, что слот
+        задан датой и приёмом пищи, а не идентификатором блюда.
+        """
+        meal_id = await self.db().fetchval(
+            """
+            SELECT pm.id
+            FROM app_core.plan_meals pm
+            JOIN app_core.meal_plans p ON p.id = pm.plan_id AND p.household_id = $1
+            WHERE pm.plan_id = $2 AND pm.meal_date = $3 AND pm.meal_type = $4
+            """,
+            session["household_id"], plan_id, meal_date, meal_type,
+        )
+        if meal_id is None:
+            return None
+        return await self.replace_meal(session, plan_id, meal_id, int(recipe_id))
+
     async def create_plan(
         self,
         session: dict[str, Any],

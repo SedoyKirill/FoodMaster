@@ -22,7 +22,7 @@ from .callbacks import heavy_placeholder
 from .fsm import CANCEL_DATA, CANCEL_TEXT, DialogStore
 from .repository import BotRepository
 from .router import TOO_FAST_TEXT, Actor, Incoming, Router, parse_update
-from .scenes import SceneContext, auth, plan
+from .scenes import SceneContext, auth, plan, recipes
 from .service import (
     CallbackReply, Reply, callback_verb, handle_callback, handle_message,
     split_for_telegram,
@@ -34,7 +34,7 @@ log = logging.getLogger("ration.telegram")
 KEYBOARD = {
     "keyboard": [
         [{"text": "🍽 Сегодня"}, {"text": "📅 Меню"}],
-        [{"text": "🛒 Покупки"}],
+        [{"text": "🛒 Покупки"}, {"text": "📖 Рецепты"}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
@@ -55,6 +55,7 @@ BOT_COMMANDS = [
     ("plan", "Текущий план по дням"),
     ("new", "Составить новое меню"),
     ("shopping", "Список покупок"),
+    ("recipes", "Поиск по библиотеке рецептов"),
     ("web", "Войти в веб-приложение"),
     ("unlink", "Отвязать Telegram"),
     ("cancel", "Отменить текущий диалог"),
@@ -526,7 +527,11 @@ async def main() -> None:
     app_repository.pool = pool
     router = Router(
         dialogs=DialogStore(pool),
-        scenes={auth.SCENE: auth.handle_step, plan.SCENE: plan.handle_step},
+        scenes={
+            auth.SCENE: auth.handle_step,
+            plan.SCENE: plan.handle_step,
+            recipes.SCENE: recipes.handle_step,
+        },
     )
 
     # N1: мемоизация матчера живёт в экземпляре репозитория, а он у бота свой.

@@ -1,9 +1,9 @@
-"""Человеческие названия разделов каталога «Ленты».
+"""Человеческие названия кодов: разделы каталога, кухни, типы блюд.
 
-Слаги приходят из магазина («molochnye-produkty-yajjco-3») и в интерфейсе
-непригодны. Тот же список есть в ``static/js/format.js``: браузер не может
-импортировать питон, поэтому копии две — но расхождение ловит тест
-``test_telegram_shopping.CategoryLabelTests``.
+В базе всё лежит кодами — «molochnye-produkty-yajjco-3», «georgian», «stew», —
+и в интерфейсе они непригодны. Те же словари есть в ``static/js/format.js``:
+браузер не может импортировать питон, поэтому копии две, но расхождение ловят
+тесты ``test_telegram_shopping.CategoryLabelTests``.
 """
 
 from __future__ import annotations
@@ -34,6 +34,56 @@ CATEGORY_LABELS: dict[str, str] = {
 
 #: раздел, куда попадают позиции без сопоставления с каталогом
 UNMATCHED_LABEL = "Уточнить в магазине"
+
+
+CUISINES: dict[str, str] = {
+    "russian": "Русская",
+    "east_european": "Восточноевропейская",
+    "italian": "Итальянская",
+    "french": "Французская",
+    "georgian": "Грузинская",
+    "asian": "Азиатская",
+    "mediterranean": "Средиземноморская",
+    "middle_eastern": "Ближневосточная",
+    "mexican": "Мексиканская",
+    "indian": "Индийская",
+    "japanese": "Японская",
+    "american": "Американская",
+}
+
+DISH_TYPES: dict[str, str] = {
+    "soup": "Суп",
+    "salad": "Салат",
+    "appetizer": "Закуска",
+    "sandwich": "Сэндвич",
+    "steak": "Стейк",
+    "main_course": "Горячее",
+    "stew": "Рагу",
+    "cutlets": "Котлеты",
+    "casserole": "Запеканка",
+    "porridge": "Каша",
+    "pasta": "Паста",
+    "pizza": "Пицца",
+    "dumplings": "Пельмени и вареники",
+    "pancakes": "Блины и оладьи",
+    "bread": "Хлеб",
+    "pie": "Пирог",
+    "cake": "Торт и кексы",
+    "cookies": "Печенье",
+    "dessert": "Десерт",
+    "drink": "Напиток",
+    "sauce": "Соус",
+    "preserves": "Заготовки",
+    "side": "Гарнир",
+}
+
+
+def cuisine_label(code: str | None) -> str:
+    return CUISINES.get(str(code or ""), str(code or "")) or "—"
+
+
+def dish_type_label(code: str | None) -> str:
+    return DISH_TYPES.get(str(code or ""), str(code or "")) or "—"
 
 
 def category_label(slug: str | None) -> str:

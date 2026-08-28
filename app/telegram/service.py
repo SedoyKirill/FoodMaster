@@ -30,6 +30,7 @@ from .render import (
 from .repository import BotRepository, bot_session
 from .scenes import auth
 from .scenes import plan as plan_scene
+from .scenes import recipes as recipes_scene
 from .scenes import shopping as shopping_scene
 
 __all__ = [
@@ -115,6 +116,8 @@ async def handle_message(
             if latest is None:
                 return Reply("🛒 Списка покупок нет — сначала составьте меню.")
             return shopping_scene.overview_reply(latest)
+        if lowered in {"/recipes", "рецепты", "📖 рецепты"}:
+            return await recipes_scene.begin(dialogs, app_repository, user_id)
 
     if lowered in {"/week", "неделя", "план", "📅 неделя", "📅 меню", "меню"}:
         meals = await repository.latest_plan_meals(context["household_id"])
@@ -224,13 +227,46 @@ async def handle_callback(
             return CallbackReply(
                 edit=await plan_scene.history_reply(app_repository, session, page)
             )
+        # --- библиотека рецептов (§5.7) ---------------------------------------
+        if verb == "n" and parts[:1] == ["rc"]:
+            result = await recipes_scene.handle_navigation(
+                app_repository, dialogs, session, user_id, parts
+            )
+            if result is not None:
+                return result
+        # карточка из библиотеки адресуется числом, из плана — парой UUID
+        if verb == "r" and parts and parts[0].isdigit():
+            return await recipes_scene.open_card(
+                app_repository, session, int(parts[0]),
+                with_prices=len(parts) > 1 and parts[1] == "p",
+            )
+        if verb == "g" and parts and parts[0].isdigit():
+            value = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            return await recipes_scene.rate(
+                app_repository, session, int(parts[0]), value
+            )
+        if verb == "w" and len(parts) > 1 and parts[0].isdigit():
+            return await recipes_scene.review(
+                app_repository, session, int(parts[0]), parts[1]
+            )
+
         # --- покупки по разделам магазина (§5.6) ------------------------------
         if verb == "f":
             result = await shopping_scene.handle_filter(app_repository, session, parts)
             if result is not None:
                 return result
+            result = await recipes_scene.handle_filter(
+                app_repository, dialogs, user_id, parts
+            )
+            if result is not None:
+                return result
         if verb == "p":
             result = await shopping_scene.handle_page(app_repository, session, parts)
+            if result is not None:
+                return result
+            result = await recipes_scene.handle_page(
+                app_repository, dialogs, user_id, parts
+            )
             if result is not None:
                 return result
             return CallbackReply(toast="Не понял кнопку.")
