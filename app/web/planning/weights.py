@@ -45,8 +45,12 @@ class WeightProfile:
     waste: int = 300
     #: за рубль остатка упаковки, взвешенный на скорость порчи
     leftover_waste: int = 20
-    #: бонус за «приготовили один раз — съели дважды»
-    leftover: int = 150
+    #: Бонус за «приготовили один раз — съели дважды». Это цена того, что
+    #: обед не надо готовить, в тех же единицах, что и стоимость: 10 = 1 ₽.
+    #: Стартовые 150 (15 ₽) не срабатывали никогда — разница в цене между
+    #: ужином-источником и дешёвым обедом измеряется сотнями рублей
+    #: (калибровка 28.08.2026, §9.2).
+    leftover: int = 1500
     #: за каждые 15 минут сверх лимита семьи
     time: int = 100
     #: за неизвестное время приготовления
@@ -69,22 +73,22 @@ MODES: dict[str, WeightProfile] = {
     "economy": WeightProfile(
         name="economy", cost=30, budget=800, kcal=30, protein=10, taste=300,
         unknown=100, recency=200, variety=200, waste=500, leftover_waste=40,
-        leftover=250, time=50, time_unknown=50, season=150, cuisine=100,
+        leftover=1000, time=50, time_unknown=50, season=150, cuisine=100,
     ),
     "variety": WeightProfile(
         name="variety", cost=8, budget=400, kcal=40, protein=20, taste=500,
         unknown=0, recency=900, variety=900, waste=200, leftover_waste=10,
-        leftover=50, time=50, time_unknown=50, season=200, cuisine=150,
+        leftover=500, time=50, time_unknown=50, season=200, cuisine=150,
     ),
     "fitness": WeightProfile(
         name="fitness", cost=8, budget=400, kcal=120, protein=150, taste=400,
         unknown=150, recency=300, variety=300, waste=200, leftover_waste=10,
-        leftover=100, time=50, time_unknown=50, season=100, cuisine=100,
+        leftover=1000, time=50, time_unknown=50, season=100, cuisine=100,
     ),
     "quick": WeightProfile(
         name="quick", cost=10, budget=500, kcal=40, protein=20, taste=500,
         unknown=150, recency=300, variety=300, waste=300, leftover_waste=20,
-        leftover=400, time=600, time_unknown=300, season=50, cuisine=100,
+        leftover=3000, time=600, time_unknown=300, season=50, cuisine=100,
     ),
 }
 

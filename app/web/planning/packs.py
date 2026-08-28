@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
-from .candidates import stock_available
+from .candidates import canonical_overlap, stock_available
 
 #: Насколько быстро портится то, что осталось в пачке: 0 — переживёт следующий
 #: план, 1 — пропадёт. По категориям каталога Ленты (`store_product_categories`).
@@ -115,6 +115,36 @@ def _quantity_of(ingredient: dict[str, Any]) -> Decimal | None:
         return None
 
 
+def _allocate_stock(
+    stock: list[tuple[str, str | None, Decimal]],
+    labels: dict[int, str],
+    units: dict[int, str | None],
+) -> dict[int, int]:
+    """Делит домашние запасы между товарами, а не раздаёт каждому целиком.
+
+    ``stock_available`` смотрит запас, не списывая его: каждому кандидату
+    важно, сколько ему не придётся покупать. Для модели горизонта это
+    неверно — одна пачка лука дома не закрывает и лук в супе, и лук в рагу
+    дважды. Список покупок списывает лоты по одному разу (FEFO), и модель
+    расходилась с ним ровно на эту величину.
+    """
+    remaining = [[canonical, unit, amount] for canonical, unit, amount in stock]
+    allocated: dict[int, int] = {}
+    # Порядок — по каноническому имени, тот же, в котором собирается список
+    # покупок: при равных правах на лот выигрывает один и тот же продукт.
+    for product_id in sorted(labels, key=lambda item: (labels[item], item)):
+        canonical = labels[product_id]
+        unit = units.get(product_id)
+        total = Decimal("0")
+        for lot in remaining:
+            if lot[1] != unit or not canonical_overlap(lot[0], canonical):
+                continue
+            total += lot[2]
+            lot[2] = Decimal("0")
+        allocated[product_id] = int(total)
+    return allocated
+
+
 def build_pack_model(
     *,
     recipe_ids: list[int],
@@ -134,8 +164,6 @@ def build_pack_model(
 
     ``costs_by_recipe`` — стоимость кандидата, посчитанная скорингом; из неё
     вычитается всё, что модель берёт на себя, и остаётся «личная» цена.
-    Товар ищется по книжному количеству — тем же ключом, что и в скоринге,
-    иначе мемоизация матчера промахивается на каждом ингредиенте (N1).
     """
     model = PackModel()
     needs: dict[int, dict[int, int]] = {}
@@ -144,7 +172,7 @@ def build_pack_model(
     recipes_of_product: dict[int, set[int]] = {}
     products: dict[int, dict[str, Any]] = {}
     labels: dict[int, str] = {}
-    stock_of_product: dict[int, int] = {}
+    units_of_product: dict[int, str | None] = {}
     max_need_of_product: dict[int, int] = {}
 
     for recipe_id in recipe_ids:
@@ -162,11 +190,20 @@ def build_pack_model(
             if not name or quantity is None:
                 continue
             unit = ingredient.get("unit_code")
-            book_qty, book_unit = base_quantity(quantity, unit)
             needed_base, unit_base = base_quantity(quantity * scale, unit)
             if needed_base is None or needed_base <= 0:
                 continue
-            product = matcher.match(name, book_unit, price_tier, book_qty)
+            canonical = synonyms.canonical_name(name, normal)
+            have = stock_available(stock, canonical, unit_base) if canonical else Decimal("0")
+            remaining = max(Decimal("0"), needed_base - have)
+            # Товар ищется ровно так же, как его ищет список покупок: по
+            # каноническому имени и по тому количеству, которое придётся
+            # купить. Скоринг ищет по книжному названию, и на «луке» это
+            # давало разные товары — модель считала одну пачку, список другую
+            # (диагностика 28.08.2026: 16 расхождений на 30 сборок).
+            product = matcher.match(
+                canonical or name, unit_base, price_tier, remaining or needed_base
+            )
             if not product:
                 continue
             pack_base, pack_unit = base_quantity(
@@ -177,9 +214,7 @@ def build_pack_model(
                 # позиция остаётся «личной» стоимостью кандидата.
                 continue
             product_id = int(product["id"])
-            canonical = synonyms.canonical_name(name, normal)
-            have = stock_available(stock, canonical, unit_base) if canonical else Decimal("0")
-            remaining = max(Decimal("0"), needed_base - have)
+            units_of_product[product_id] = unit_base
             need_units = int(math.ceil(needed_base))
             needs.setdefault(recipe_id, {})
             needs[recipe_id][product_id] = needs[recipe_id].get(product_id, 0) + need_units
@@ -191,13 +226,11 @@ def build_pack_model(
             recipes_of_product.setdefault(product_id, set()).add(recipe_id)
             products[product_id] = product
             labels.setdefault(product_id, canonical or name)
-            stock_of_product[product_id] = max(
-                stock_of_product.get(product_id, 0), int(have)
-            )
             max_need_of_product[product_id] = max(
                 max_need_of_product.get(product_id, 0), needs[recipe_id][product_id]
             )
 
+    stock_of_product = _allocate_stock(stock, labels, units_of_product)
     shared = [
         product_id
         for product_id, users in recipes_of_product.items()

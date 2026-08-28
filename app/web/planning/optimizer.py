@@ -47,10 +47,12 @@ CUISINE_STREAK = 3
 #: доля слотов под непробованные блюда по уровню новизны (§4.5)
 NOVELTY_SHARES = {"low": 0.1, "medium": 0.3, "high": 0.6}
 #: Что переживает ночь в холодильнике и не портится от разогрева (§6.2).
-#: Салат и яичница в этот список не входят намеренно.
+#: Коды — из словаря разметки проекта (``scripts/load_cuisines.py``): всё, чего
+#: там нет, никогда не совпадёт и молча выключит остатки. Салат, бутерброд и
+#: десерт не входят намеренно — их разогревать нечего.
 LEFTOVER_FRIENDLY = frozenset({
-    "soup", "stew", "pilaf", "casserole", "pasta", "cutlets", "porridge",
-    "risotto", "curry", "goulash", "roast", "chili", "lasagna",
+    "soup", "stew", "main_course", "casserole", "pasta", "cutlets",
+    "porridge", "dumplings",
 })
 #: сколько пар «ужин → обед» допускается на горизонте
 LEFTOVER_DAYS_PER_PAIR = 3
@@ -175,6 +177,28 @@ def slot_coefficient(
         - int(weights.fit * fit)
     )
     return value
+
+
+def _leftover_coefficient(
+    score: CandidateScore, weights: WeightProfile, cost_share: float
+) -> int:
+    """Во что обходится обед, доставшийся от вчерашнего ужина (§6.2).
+
+    Слот занимает то же блюдо, поэтому и ценность у него та же: вкус, сезон,
+    соответствие приёму. Отличий два — готовить не нужно, а продуктов уходит
+    больше ровно на порции обеда. Раньше остаток не получал ничего, кроме
+    цены: блюдо на обед имело бонус за соответствие приёму, а вчерашний ужин
+    нет, и остатки не выбирались никогда — на живых данных ни одного за
+    неделю при любом режиме.
+    """
+    value = slot_coefficient(score, "lunch", weights)
+    # Цена лишней порции считается отдельно и ниже, поэтому цену самого
+    # назначения из коэффициента убираем.
+    value -= weights.cost * (score.cost_private_kop // 100)
+    if score.time_minutes is None:
+        value -= weights.time_unknown
+    extra_cost = int(weights.cost * (score.cost_private_kop // 100) * cost_share)
+    return value + extra_cost - weights.leftover
 
 
 def _slot_protein(
@@ -402,15 +426,12 @@ def _solve_cpsat(
                 ]
                 if same_day:
                     model.Add(variable + sum(same_day) <= 1)
-                # Остаток не бесплатный: ужин-источник готовится и на обед,
-                # то есть продуктов на него уходит больше. Без этого члена
-                # солвер закрывал бы остатками все обеды подряд.
-                extra_cost = int(
-                    weights.cost
-                    * (scores[recipe_id].cost_kop // 100)
-                    * leftover_cost_share
+                objective.append(
+                    _leftover_coefficient(
+                        scores[recipe_id], weights, leftover_cost_share
+                    )
+                    * variable
                 )
-                objective.append((extra_cost - weights.leftover) * variable)
         if left:
             model.Add(sum(left.values()) <= max(1, -(-days // LEFTOVER_DAYS_PER_PAIR)))
 

@@ -332,6 +332,14 @@ CREATE TABLE IF NOT EXISTS app_core.ingredient_synonyms (
     CHECK (kind IN ('form', 'group', 'protein_base'))
 );
 
+-- Домен 'protein_base' появился в M8: у существующих баз ограничение всё ещё
+-- старое, а CREATE TABLE IF NOT EXISTS его не трогает — нужен явный ALTER.
+ALTER TABLE app_core.ingredient_synonyms
+    DROP CONSTRAINT IF EXISTS ingredient_synonyms_kind_check;
+ALTER TABLE app_core.ingredient_synonyms
+    ADD CONSTRAINT ingredient_synonyms_kind_check
+    CHECK (kind IN ('form', 'group', 'protein_base'));
+
 INSERT INTO app_core.ingredient_synonyms (term, canonical, kind) VALUES
     ('молока', 'молоко', 'form'),
     ('молоку', 'молоко', 'form'),
