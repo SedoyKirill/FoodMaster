@@ -177,8 +177,8 @@ class CandidateScore:
         "recency_penalty", "season_bonus", "time_minutes",
         # TZ-M8 §4: вкус семьи вместо одной звезды на рецепт
         "affinity", "unknown",
-        # TZ-M8 §6.1: БЖУ на семью и белковая база блюда
-        "protein_g", "fat_g", "carb_g", "protein_base",
+        # TZ-M8 §6.1: БЖУ на семью, белковая база и кухня блюда
+        "protein_g", "fat_g", "carb_g", "protein_base", "cuisine",
     )
 
     def __init__(self, recipe_id: int) -> None:
@@ -212,6 +212,8 @@ class CandidateScore:
         self.carb_g: int | None = None
         #: белковая база блюда (features.PROTEIN_BASES)
         self.protein_base: str = "veg"
+        #: кухня блюда — для штрафа за три одинаковых ужина подряд (§6.2)
+        self.cuisine: str | None = None
 
 
 def _expiring_canonicals(
@@ -309,13 +311,18 @@ def score_candidates(
         # У рецепта может быть несколько кухонь (TZ-M8): бонус даёт любое
         # пересечение с выбором семьи; 'universal' бонуса не даёт — он лишь
         # не мешает блюду попасть в пул.
+        recipe_cuisines = [
+            str(code)
+            for code in json_list(recipe.get("cuisine_codes"))
+            or ([recipe["cuisine_code"]] if recipe.get("cuisine_code") else [])
+        ]
         score.cuisine_bonus = (
-            1
-            if cuisine_set
-            and {str(code) for code in json_list(recipe.get("cuisine_codes"))
-                 or ([recipe["cuisine_code"]] if recipe.get("cuisine_code") else [])}
-            & cuisine_set
-            else 0
+            1 if cuisine_set and set(recipe_cuisines) & cuisine_set else 0
+        )
+        # 'universal' — не кухня, а отсутствие принадлежности: считать три
+        # универсальных ужина подряд «однообразием кухни» неправильно.
+        score.cuisine = next(
+            (code for code in recipe_cuisines if code != "universal"), None
         )
         score.dislike_penalty = recipe_matches_terms(recipe, soft_terms, synonyms, normal)
         score.main_ingredient = main_ingredient(recipe, synonyms, normal)

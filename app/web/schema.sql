@@ -211,6 +211,12 @@ CREATE TABLE IF NOT EXISTS app_core.plan_meals (
 ALTER TABLE app_core.plan_meals
     ADD COLUMN IF NOT EXISTS warnings JSONB NOT NULL DEFAULT '[]'::jsonb;
 
+-- TZ-M8 §6.2: обед, который достался от вчерашнего ужина. Готовить его не
+-- нужно, покупок он не добавляет, а показать «остаток вчерашнего» надо.
+ALTER TABLE app_core.plan_meals
+    ADD COLUMN IF NOT EXISTS leftover_of UUID
+        REFERENCES app_core.plan_meals(id) ON DELETE SET NULL;
+
 -- TZ-M8 §5: «почему это блюдо» — коды причин с параметрами. Текст собирают
 -- интерфейс и бот, в базе лежат только факты выбора.
 ALTER TABLE app_core.plan_meals

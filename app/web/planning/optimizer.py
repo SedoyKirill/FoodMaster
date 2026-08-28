@@ -9,7 +9,7 @@ warnings, а не молча повторяет блюдо — дефект P2 �
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .candidates import CandidateScore
@@ -20,14 +20,37 @@ from .weights import WeightProfile, weights_for
 # подсказкой в интерфейсе, а числами (TZ-M8 §6.4). Здесь остаются только
 # параметры самого решателя.
 SOLVER_TIME_LIMIT_SECONDS = 10.0
+#: потолок времени решателя: две недели с упаковками должны укладываться (§6.5)
+SOLVER_TIME_LIMIT_MAX_SECONDS = 30.0
 SOLVER_WORKERS = 4
 MAX_CANDIDATES_PER_SLOT = 40
+#: на горизонте длиннее недели список кандидатов режется: переменных иначе
+#: втрое больше, а выбор от сорокового кандидата уже не меняется (§6.5)
+MAX_CANDIDATES_PER_SLOT_LONG = 30
+LONG_HORIZON_DAYS = 7
 MAX_USES_PER_HORIZON = 2
 # Сколько раз один тип блюда (блины, каша, суп) допускается в одном приёме
 # пищи за план: один раз на каждые три дня. Цена в целевой функции весит на
 # порядок больше разнообразия, поэтому самая дешёвая группа иначе забирает
 # все слоты — на завтрак получались три блина подряд.
 DISH_TYPE_DAYS_PER_USE = 3
+# Белковая база (мясо, птица, рыба…) ограничивается так же, как тип блюда:
+# «мы всю неделю едим курицу» — самая частая жалоба на автоменю.
+PROTEIN_BASE_DAYS_PER_USE = 3
+#: базы, которые ограничиваются жёстко (§6.2)
+HARD_LIMITED_BASES = ("meat", "poultry", "fish")
+#: сколько дней подряд одна кухня в ужинах терпима без штрафа (§6.2)
+CUISINE_STREAK = 3
+#: доля слотов под непробованные блюда по уровню новизны (§4.5)
+NOVELTY_SHARES = {"low": 0.1, "medium": 0.3, "high": 0.6}
+#: Что переживает ночь в холодильнике и не портится от разогрева (§6.2).
+#: Салат и яичница в этот список не входят намеренно.
+LEFTOVER_FRIENDLY = frozenset({
+    "soup", "stew", "pilaf", "casserole", "pasta", "cutlets", "porridge",
+    "risotto", "curry", "goulash", "roast", "chili", "lasagna",
+})
+#: сколько пар «ужин → обед» допускается на горизонте
+LEFTOVER_DAYS_PER_PAIR = 3
 
 Slot = tuple[int, str]  # (индекс дня, meal_type)
 
@@ -43,6 +66,59 @@ class SlotTarget:
 
     kcal: int = 0
     protein_g: int = 0
+
+
+@dataclass
+class Solution:
+    """Решение по горизонту: назначения и то, что к ним прилагается.
+
+    До M8 хватало пары «назначения, статус». С остатками «на два раза» слот
+    может быть занят не выбором, а вчерашним ужином, и планировщику нужно
+    знать, каким именно.
+    """
+
+    assignment: dict[Slot, int | None]
+    status: str
+    #: слот-наследник → слот-источник («обед среды — это ужин вторника»)
+    leftovers: dict[Slot, Slot] = field(default_factory=dict)
+    #: товар → число упаковок из модели упаковок (T7)
+    packs: dict[int, int] = field(default_factory=dict)
+
+
+def protein_base_cap(days: int, distinct_bases: int) -> int:
+    """Предел ужинов на одной белковой базе за горизонт (§6.2).
+
+    Как и с типом блюда: если баз в кандидатах мало, предел ослабляется —
+    пустой слот хуже третьего куриного ужина.
+    """
+    cap = max(1, days // PROTEIN_BASE_DAYS_PER_USE) + 1
+    if distinct_bases > 0:
+        cap = max(cap, -(-days // distinct_bases))
+    return cap
+
+
+def novelty_cap(novelty: str | None, slots: int, unavoidable: int = 0) -> int:
+    """Сколько слотов отдаётся блюдам, о которых у семьи нет мнения (§4.5).
+
+    ``unavoidable`` — слоты, где знакомых кандидатов нет вовсе: запрещать там
+    новое означало бы оставить слот пустым.
+    """
+    share = NOVELTY_SHARES.get(str(novelty or "medium"), NOVELTY_SHARES["medium"])
+    return max(-(-int(share * slots * 100) // 100), unavoidable)
+
+
+def candidates_per_slot(days: int) -> int:
+    """Сколько кандидатов слота попадает в модель (§6.5)."""
+    return (
+        MAX_CANDIDATES_PER_SLOT_LONG
+        if days > LONG_HORIZON_DAYS
+        else MAX_CANDIDATES_PER_SLOT
+    )
+
+
+def solver_time_limit(days: int) -> float:
+    """Лимит решателя растёт линейно с горизонтом и упирается в потолок."""
+    return min(SOLVER_TIME_LIMIT_SECONDS + 2 * days, SOLVER_TIME_LIMIT_MAX_SECONDS)
 
 
 def stable_tiebreak(recipe_id: int, plan_key: str) -> int:
@@ -215,7 +291,12 @@ def _solve_cpsat(
     weights: WeightProfile,
     time_limits: dict[Slot, int | None],
     time_limit_seconds: float,
-) -> tuple[dict[Slot, int | None], str] | None:
+    max_repeats: int,
+    allow_leftovers: bool,
+    novelty: str | None,
+    cuisine_mode: str,
+    leftover_cost_share: float,
+) -> Solution | None:
     try:
         from ortools.sat.python import cp_model
     except ImportError:
@@ -228,21 +309,62 @@ def _solve_cpsat(
     objective: list[Any] = []
 
     for day, meal in slots:
-        slot_vars = []
         for recipe_id in candidates_by_slot.get((day, meal), []):
             variable = model.NewBoolVar(f"x_{recipe_id}_{day}_{meal}")
             x[recipe_id, day, meal] = variable
-            slot_vars.append(variable)
             objective.append(
                 slot_coefficient(
                     scores[recipe_id], meal, weights, time_limits.get((day, meal))
                 )
                 * variable
             )
-        empty_var = model.NewBoolVar(f"empty_{day}_{meal}")
-        empty[day, meal] = empty_var
-        model.Add(sum(slot_vars) + empty_var == 1)
-        objective.append(weights.empty_slot * empty_var)
+        empty[day, meal] = model.NewBoolVar(f"empty_{day}_{meal}")
+        objective.append(weights.empty_slot * empty[day, meal])
+
+    # «Готовим один раз — едим дважды» (§6.2): ужин дня d закрывает обед дня
+    # d+1. Переменные заводятся до уравнений слотов — обед-наследник занимает
+    # слот вместо выбора, а не вдобавок к нему.
+    left: dict[tuple[int, int], Any] = {}
+    if allow_leftovers and "dinner" in meal_types and "lunch" in meal_types:
+        for day in range(days - 1):
+            for recipe_id in candidates_by_slot.get((day, "dinner"), []):
+                if scores[recipe_id].dish_type not in LEFTOVER_FRIENDLY:
+                    continue
+                variable = model.NewBoolVar(f"left_{recipe_id}_{day}")
+                left[recipe_id, day] = variable
+                model.Add(variable <= x[recipe_id, day, "dinner"])
+                # Одно и то же блюдо на обед из вчерашнего и на сегодня
+                # заново — это не «на два раза», а повтор.
+                same_day = [
+                    x[recipe_id, day + 1, meal]
+                    for meal in meal_types
+                    if (recipe_id, day + 1, meal) in x
+                ]
+                if same_day:
+                    model.Add(variable + sum(same_day) <= 1)
+                # Остаток не бесплатный: ужин-источник готовится и на обед,
+                # то есть продуктов на него уходит больше. Без этого члена
+                # солвер закрывал бы остатками все обеды подряд.
+                extra_cost = int(
+                    weights.cost
+                    * (scores[recipe_id].cost_kop // 100)
+                    * leftover_cost_share
+                )
+                objective.append((extra_cost - weights.leftover) * variable)
+        if left:
+            model.Add(sum(left.values()) <= max(1, -(-days // LEFTOVER_DAYS_PER_PAIR)))
+
+    for day, meal in slots:
+        slot_vars = [
+            x[recipe_id, day, meal]
+            for recipe_id in candidates_by_slot.get((day, meal), [])
+        ]
+        inherited = (
+            [variable for (_id, source_day), variable in left.items() if source_day == day - 1]
+            if meal == "lunch"
+            else []
+        )
+        model.Add(sum(slot_vars) + sum(inherited) + empty[day, meal] == 1)
 
     recipe_ids = sorted({recipe_id for recipe_id, _, _ in x})
     usage: dict[tuple[int, int], Any] = {}
@@ -263,7 +385,7 @@ def _solve_cpsat(
             usage[recipe_id, day] for day in range(days) if (recipe_id, day) in usage
         ]
         if horizon_vars:
-            model.Add(sum(horizon_vars) <= MAX_USES_PER_HORIZON)
+            model.Add(sum(horizon_vars) <= max_repeats)
         for day in range(days - 1):
             if (recipe_id, day) in usage and (recipe_id, day + 1) in usage:
                 model.Add(usage[recipe_id, day] + usage[recipe_id, day + 1] <= 1)
@@ -303,6 +425,73 @@ def _solve_cpsat(
                 repeat = model.NewBoolVar(f"rep_{abs(hash(main)) % 10**8}_{day}")
                 model.Add(day_flags[day] + day_flags[day + 1] - 1 <= repeat)
                 objective.append(weights.variety * repeat)
+
+    # Разнообразие белковой базы в ужинах (§6.2). Ограничение типа блюда
+    # этого не ловит: котлеты, гуляш и жаркое — три разных типа и одно мясо.
+    if "dinner" in meal_types:
+        base_days: dict[str, dict[int, list[Any]]] = {}
+        for (recipe_id, day, meal), variable in x.items():
+            if meal != "dinner":
+                continue
+            base_days.setdefault(scores[recipe_id].protein_base, {}).setdefault(
+                day, []
+            ).append(variable)
+        cap = protein_base_cap(days, len(base_days))
+        for base, by_day in base_days.items():
+            flags: dict[int, Any] = {}
+            for day, variables in by_day.items():
+                flag = model.NewBoolVar(f"base_{base}_{day}")
+                model.AddMaxEquality(flag, variables)
+                flags[day] = flag
+            if base in HARD_LIMITED_BASES and days >= 5 and len(flags) > cap:
+                model.Add(sum(flags.values()) <= cap)
+                continue
+            # Остальные базы — мягко: два овощных ужина подряд не беда.
+            for day in range(days - 1):
+                if day in flags and day + 1 in flags:
+                    repeat = model.NewBoolVar(f"base_rep_{base}_{day}")
+                    model.Add(flags[day] + flags[day + 1] - 1 <= repeat)
+                    objective.append(weights.variety * repeat)
+
+    # Кухня как предпочтение (§6.2): три одинаковых ужина подряд надоедают
+    # даже тому, кто выбрал итальянскую кухню. При жёстком фильтре (only)
+    # выбор и так узкий — штрафовать за него нечестно.
+    if cuisine_mode == "prefer" and "dinner" in meal_types and days >= CUISINE_STREAK:
+        cuisine_days: dict[str, dict[int, list[Any]]] = {}
+        for (recipe_id, day, meal), variable in x.items():
+            cuisine = scores[recipe_id].cuisine
+            if meal != "dinner" or not cuisine:
+                continue
+            cuisine_days.setdefault(cuisine, {}).setdefault(day, []).append(variable)
+        for cuisine, by_day in cuisine_days.items():
+            flags = {}
+            for day, variables in by_day.items():
+                flag = model.NewBoolVar(f"cuisine_{abs(hash(cuisine)) % 10**8}_{day}")
+                model.AddMaxEquality(flag, variables)
+                flags[day] = flag
+            for day in range(days - CUISINE_STREAK + 1):
+                streak = [flags[day + offset] for offset in range(CUISINE_STREAK) if day + offset in flags]
+                if len(streak) < CUISINE_STREAK:
+                    continue
+                repeat = model.NewBoolVar(f"cuisine_rep_{abs(hash(cuisine)) % 10**8}_{day}")
+                model.Add(sum(streak) - (CUISINE_STREAK - 1) <= repeat)
+                objective.append(weights.variety * repeat)
+
+    # Новизна (§4.5): и семье с историей нельзя застревать на пятнадцати
+    # блюдах, и новичку нельзя выдавать сплошь непробованное.
+    unknown_vars = [
+        variable
+        for (recipe_id, _day, _meal), variable in x.items()
+        if scores[recipe_id].unknown
+    ]
+    if unknown_vars:
+        unavoidable = sum(
+            1
+            for slot in slots
+            if candidates_by_slot.get(slot)
+            and all(scores[recipe_id].unknown for recipe_id in candidates_by_slot[slot])
+        )
+        model.Add(sum(unknown_vars) <= novelty_cap(novelty, len(slots), unavoidable))
 
     # Бюджет — мягкое ограничение (жёсткое легко даёт infeasible, TZ §2.3).
     if budget_kop is not None:
@@ -359,7 +548,16 @@ def _solve_cpsat(
                 chosen = recipe_id
                 break
         assignment[day, meal] = chosen
-    return assignment, "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE"
+    leftovers: dict[Slot, Slot] = {}
+    for (recipe_id, day), variable in left.items():
+        if solver.Value(variable):
+            assignment[day + 1, "lunch"] = recipe_id
+            leftovers[day + 1, "lunch"] = (day, "dinner")
+    return Solution(
+        assignment=assignment,
+        status="OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE",
+        leftovers=leftovers,
+    )
 
 
 def _solve_greedy(
@@ -371,15 +569,18 @@ def _solve_greedy(
     weights: WeightProfile,
     time_limits: dict[Slot, int | None],
     plan_key: str,
-) -> tuple[dict[Slot, int | None], str]:
+    max_repeats: int = MAX_USES_PER_HORIZON,
+) -> Solution:
     """Детерминированный fallback: те же жёсткие ограничения, локальный выбор.
 
     Кандидатов не хватило — слот остаётся пустым (никаких молчаливых
-    повторов, дефект P2)."""
+    повторов, дефект P2). Остатки «на два раза» и лимит новизны сюда не
+    переносятся: это выбор по горизонту, а жадный алгоритм видит один слот."""
     assignment: dict[Slot, int | None] = {}
     used_by_day: dict[int, set[int]] = {day: set() for day in range(days)}
     use_count: dict[int, int] = {}
     main_by_day: dict[int, set[str]] = {day: set() for day in range(days)}
+    base_by_day: dict[int, set[str]] = {day: set() for day in range(days)}
     dish_type_uses: dict[tuple[str, str], int] = {}
     dish_type_caps = {
         meal: dish_type_cap(
@@ -400,7 +601,7 @@ def _solve_greedy(
             for recipe_id in candidates_by_slot.get((day, meal), []):
                 if recipe_id in used_by_day[day]:
                     continue
-                if use_count.get(recipe_id, 0) >= MAX_USES_PER_HORIZON:
+                if use_count.get(recipe_id, 0) >= max_repeats:
                     continue
                 if day > 0 and recipe_id in used_by_day[day - 1]:
                     continue
@@ -418,6 +619,8 @@ def _solve_greedy(
                     or (day > 0 and main in main_by_day[day - 1])
                 ):
                     penalty += weights.variety
+                if meal == "dinner" and day > 0 and score.protein_base in base_by_day[day - 1]:
+                    penalty += weights.variety
                 candidate = (penalty, stable_tiebreak(recipe_id, f"{plan_key}:{day}:{meal}"), recipe_id)
                 if best is None or candidate < best:
                     best = candidate
@@ -431,11 +634,13 @@ def _solve_greedy(
             main = scores[recipe_id].main_ingredient
             if main:
                 main_by_day[day].add(main)
+            if meal == "dinner":
+                base_by_day[day].add(scores[recipe_id].protein_base)
             dish_type = scores[recipe_id].dish_type
             if dish_type:
                 key = (meal, dish_type)
                 dish_type_uses[key] = dish_type_uses.get(key, 0) + 1
-    return assignment, "greedy"
+    return Solution(assignment=assignment, status="greedy")
 
 
 def optimize(
@@ -450,14 +655,19 @@ def optimize(
     weights: WeightProfile | None = None,
     time_limits: dict[Slot, int | None] | None = None,
     plan_key: str = "",
-    time_limit_seconds: float = SOLVER_TIME_LIMIT_SECONDS,
-) -> tuple[dict[Slot, int | None], str]:
+    time_limit_seconds: float | None = None,
+    max_repeats: int = MAX_USES_PER_HORIZON,
+    allow_leftovers: bool = False,
+    novelty: str | None = None,
+    cuisine_mode: str = "only",
+    leftover_cost_share: float = 1.0,
+) -> Solution:
     """Назначение блюд по слотам: CP-SAT, при недоступности/неудаче — жадный."""
     profile = weights or weights_for(mode)
     targets = slot_targets or {}
     limits = time_limits or {}
     trimmed = {
-        slot: candidates[:MAX_CANDIDATES_PER_SLOT]
+        slot: candidates[:candidates_per_slot(days)]
         for slot, candidates in candidates_by_slot.items()
     }
     solved = _solve_cpsat(
@@ -469,7 +679,12 @@ def optimize(
         slot_targets=targets,
         weights=profile,
         time_limits=limits,
-        time_limit_seconds=time_limit_seconds,
+        time_limit_seconds=time_limit_seconds or solver_time_limit(days),
+        max_repeats=max_repeats,
+        allow_leftovers=allow_leftovers,
+        novelty=novelty,
+        cuisine_mode=cuisine_mode,
+        leftover_cost_share=leftover_cost_share,
     )
     if solved is not None:
         return solved
@@ -481,4 +696,5 @@ def optimize(
         weights=profile,
         time_limits=limits,
         plan_key=plan_key,
+        max_repeats=max_repeats,
     )

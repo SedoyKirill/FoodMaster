@@ -1295,22 +1295,28 @@ class AppRepository:
                 json.dumps(plan.get("warnings") or [], ensure_ascii=False),
                 mode,
             )
+            # Идентификаторы раздаются заранее: блюдо-наследник ссылается на
+            # ужин-источник, а планировщик знает только его позицию в плане.
+            meal_ids = [uuid.uuid4() for _ in plan["meals"]]
             for position, meal in enumerate(plan["meals"], 1):
+                source = meal.get("leftover_of")
                 await connection.execute(
                     """
                     INSERT INTO app_core.plan_meals (
                         id, plan_id, meal_date, meal_type, recipe_id, scale,
                         servings, estimated_kcal, position, warnings,
-                        estimated_protein, estimated_fat, estimated_carb, reasons
-                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14::jsonb)
+                        estimated_protein, estimated_fat, estimated_carb, reasons,
+                        leftover_of
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14::jsonb,$15)
                     """,
-                    uuid.uuid4(), plan_id, meal["meal_date"], meal["meal_type"],
+                    meal_ids[position - 1], plan_id, meal["meal_date"], meal["meal_type"],
                     meal["recipe_id"], meal["scale"], meal["servings"],
                     meal["estimated_kcal"], position,
                     json.dumps(meal.get("warnings") or [], ensure_ascii=False),
                     meal.get("estimated_protein"), meal.get("estimated_fat"),
                     meal.get("estimated_carb"),
                     json.dumps(meal.get("reasons") or [], ensure_ascii=False),
+                    meal_ids[source - 1] if source else None,
                 )
             for item in plan["shopping"]:
                 await connection.execute(
@@ -1850,6 +1856,7 @@ class AppRepository:
             SELECT pm.id, pm.meal_date, pm.meal_type, pm.recipe_id, pm.scale,
                    pm.servings, pm.estimated_kcal, pm.warnings, pm.reasons,
                    pm.estimated_protein, pm.estimated_fat, pm.estimated_carb,
+                   pm.leftover_of,
                    r.title, r.cuisine_code, r.review_status, r.source_page_start
             FROM app_core.plan_meals pm
             JOIN recipe_library.recipes r ON r.id=pm.recipe_id

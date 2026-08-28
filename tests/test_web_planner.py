@@ -24,6 +24,7 @@ from app.web.planner import (
     is_recipe_clean,
     warm_product_matcher,
 )
+from app.web.planning import optimizer as optimizer_mod  # noqa: E402
 from fakes import StubClock  # noqa: E402
 
 
@@ -739,6 +740,69 @@ class HistoryAndTimeTests(unittest.TestCase):
         self.assertEqual(len(plan["meals"]), 1)
 
 
+class LeftoverPlanTests(unittest.TestCase):
+    """Обед из вчерашнего ужина в готовом плане (TZ-M8 §6.2)."""
+
+    @staticmethod
+    def _recipe(recipe_id: int, title: str, meal: str, dish_type: str) -> dict:
+        item = recipe(recipe_id, title, meal)
+        item["dish_type"] = dish_type
+        return item
+
+    def _plan(self, **profile) -> dict:
+        recipes = [
+            self._recipe(index, f"Суп {index}", "dinner", "soup")
+            for index in range(1, 6)
+        ]
+        recipes += [
+            self._recipe(index, f"Салат {index}", "lunch", "salad")
+            for index in range(10, 15)
+        ]
+        return build_plan(
+            household_id="household",
+            starts_on=date(2026, 8, 31),
+            days=2,
+            cuisines=[],
+            people=[
+                {"name": "Взрослый", "person_type": "adult", "portion_factor": Decimal("1")}
+            ],
+            appliances=[],
+            rules=[],
+            inventory=[],
+            recipes=recipes,
+            products=[],
+            meals=["lunch", "dinner"],
+            plan_profile=profile,
+        )
+
+    def test_lunch_inherits_yesterday_dinner(self) -> None:
+        plan = self._plan(allow_leftovers=True)
+        dinner, heir = plan["meals"][1], plan["meals"][2]
+        self.assertEqual(heir["meal_type"], "lunch")
+        self.assertEqual(heir["title"], dinner["title"])
+        self.assertEqual(heir["leftover_of"], 2)
+        self.assertEqual(
+            heir["reasons"], [{"code": "leftover", "source_meal": 2}]
+        )
+        self.assertTrue(dinner["cooks_ahead"])
+
+    def test_source_dinner_is_cooked_for_both_tables(self) -> None:
+        plan = self._plan(allow_leftovers=True)
+        self.assertEqual(plan["meals"][1]["servings"], Decimal("2"))
+        self.assertEqual(plan["meals"][2]["servings"], Decimal("1"))
+
+    def test_leftover_is_not_bought_twice(self) -> None:
+        """Молоко на четыре приёма — только на три готовки."""
+        plan = self._plan(allow_leftovers=True)
+        milk = [item for item in plan["shopping"] if item["normalized_name"] == "молоко"]
+        self.assertEqual(len(milk), 1)
+        self.assertEqual(milk[0]["quantity"], Decimal("400.0"))
+
+    def test_family_that_did_not_ask_gets_no_leftovers(self) -> None:
+        plan = self._plan()
+        self.assertTrue(all(meal["leftover_of"] is None for meal in plan["meals"]))
+
+
 class MultiCuisineTests(unittest.TestCase):
     """У рецепта несколько кухонь, «universal» проходит любой фильтр (TZ-M8).
 
@@ -802,7 +866,7 @@ class MultiCuisineTests(unittest.TestCase):
 
         def spy_optimize(**kwargs):
             captured["slots"] = kwargs["candidates_by_slot"]
-            return {}, "greedy"
+            return optimizer_mod.Solution(assignment={}, status="greedy")
 
         with patch("app.web.planning.optimizer.optimize", side_effect=spy_optimize):
             self._plan(recipes, ["japanese"], mode=mode)
@@ -852,7 +916,7 @@ class FamilyCostTests(unittest.TestCase):
 
         def spy_optimize(**kwargs):
             captured["scores"] = kwargs["scores"]
-            return {}, "greedy"
+            return optimizer_mod.Solution(assignment={}, status="greedy")
 
         with patch("app.web.planning.optimizer.optimize", side_effect=spy_optimize):
             build_plan(

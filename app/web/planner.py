@@ -877,6 +877,19 @@ def _meal_nutrition(
     }
 
 
+def _leftover_cost_share(servings_by_meal: dict[str, Decimal]) -> float:
+    """Во сколько раз дороже ужин, который готовится и на завтрашний обед.
+
+    Не всегда вдвое: если один из взрослых обедает на работе, лишних порций
+    нужно меньше (§3.1). Ноль порций ужина — деление не нужно, доли нет.
+    """
+    dinner = servings_by_meal.get("dinner") or Decimal("0")
+    lunch = servings_by_meal.get("lunch") or Decimal("0")
+    if dinner <= 0:
+        return 1.0
+    return float(lunch / dinner)
+
+
 def _make_macros_hint(nutrition: dict[str, dict[str, Any]] | None):
     """КБЖУ ингредиента для скоринга: таблица Haiku → substring-справочник.
 
@@ -1185,7 +1198,7 @@ def build_plan(
         for day in range(days)
         for meal_type in meal_types
     }
-    assignment, solver_status = optimizer_mod.optimize(
+    solution = optimizer_mod.optimize(
         days=days,
         meal_types=meal_types,
         candidates_by_slot=candidates_by_slot,
@@ -1195,7 +1208,17 @@ def build_plan(
         weights=weights,
         time_limits=slot_time_limits,
         plan_key=plan_key,
+        max_repeats=int(profile.get("max_repeats_per_horizon") or optimizer_mod.MAX_USES_PER_HORIZON),
+        allow_leftovers=bool(profile.get("allow_leftovers", False)),
+        novelty=profile.get("novelty"),
+        cuisine_mode=cuisine_mode,
+        leftover_cost_share=_leftover_cost_share(servings_by_meal),
     )
+    assignment = solution.assignment
+    solver_status = solution.status
+    # Слот-источник знает, что готовит на два раза, ещё до сборки блюд:
+    # от этого зависят и порции, и список покупок.
+    leftover_sources = {source: target for target, source in solution.leftovers.items()}
 
     recipes_by_id = {int(recipe["id"]): recipe for recipe in pool}
     # Данные для «почему это блюдо» (TZ-M8 §5): считаются один раз на план,
@@ -1217,6 +1240,7 @@ def build_plan(
     plan_warnings: list[str] = []
     meals: list[dict[str, Any]] = []
     meal_ingredients: list[dict[str, Any]] = []
+    meal_position_by_slot: dict[tuple[int, str], int] = {}
     for day_index in range(days):
         meal_date = starts_on + timedelta(days=day_index)
         for meal_type in meal_types:
@@ -1230,6 +1254,13 @@ def build_plan(
             selected = recipes_by_id[recipe_id]
             score = scores[recipe_id]
             slot_servings = servings_by_meal.get(meal_type, desired_servings)
+            # «На два раза» (§6.2): ужин-источник готовится и на завтрашний
+            # обед, поэтому порций у него столько, сколько едоков за обоими
+            # столами — не механическое ×2, а те же правила eats_meals.
+            heir_slot = leftover_sources.get((day_index, meal_type))
+            if heir_slot is not None:
+                slot_servings += servings_by_meal.get(heir_slot[1], desired_servings)
+            source_slot = solution.leftovers.get((day_index, meal_type))
             scale, scale_unknown = scaling_mod.recipe_scale(selected, slot_servings)
             meal_warnings: list[str] = []
             if scale_unknown:
@@ -1238,7 +1269,9 @@ def build_plan(
                 meal_warnings.append("draft")
             if cuisine_set and not cuisine_matches(selected, cuisine_set):
                 meal_warnings.append("cuisine_fallback")
-            for ingredient in selected.get("ingredients", []):
+            # Обед из вчерашнего ужина уже куплен и приготовлен: его
+            # ингредиенты в список покупок не попадают второй раз.
+            for ingredient in ([] if source_slot else selected.get("ingredients", [])):
                 meal_ingredients.append(
                     {
                         "name": str(
@@ -1259,34 +1292,42 @@ def build_plan(
                 )
                 for ingredient in selected.get("ingredients", [])
             ]
-            reasons = explain_mod.explain(
-                score,
-                explain_mod.ExplainContext(
-                    meal_type=meal_type,
-                    weights=weights,
-                    median_cost_kop=median_cost_by_slot.get((day_index, meal_type)),
-                    expiring_names=tuple(
-                        name for name in ingredient_names if name in expiring_names
-                    )[:3],
-                    stock_names=tuple(
-                        name for name in ingredient_names
-                        if name in stock_names and name not in expiring_names
-                    )[:3],
-                    seasonal_names=tuple(
-                        name for name in ingredient_names
-                        if name in seasonal_names
-                        or any(word in seasonal_names for word in name.split())
-                    )[:3],
-                    days_since=plan_history.days_since(recipe_id),
-                    rating=(ratings or {}).get(recipe_id),
-                    known=bool(
-                        (ratings or {}).get(recipe_id)
-                        or plan_history.days_since(recipe_id) is not None
+            if source_slot is not None:
+                reasons = [{
+                    "code": "leftover",
+                    "source_meal": meal_position_by_slot.get(source_slot),
+                }]
+            else:
+                reasons = explain_mod.explain(
+                    score,
+                    explain_mod.ExplainContext(
+                        meal_type=meal_type,
+                        weights=weights,
+                        median_cost_kop=median_cost_by_slot.get((day_index, meal_type)),
+                        expiring_names=tuple(
+                            name for name in ingredient_names if name in expiring_names
+                        )[:3],
+                        stock_names=tuple(
+                            name for name in ingredient_names
+                            if name in stock_names and name not in expiring_names
+                        )[:3],
+                        seasonal_names=tuple(
+                            name for name in ingredient_names
+                            if name in seasonal_names
+                            or any(word in seasonal_names for word in name.split())
+                        )[:3],
+                        days_since=plan_history.days_since(recipe_id),
+                        rating=(ratings or {}).get(recipe_id),
+                        known=bool(
+                            (ratings or {}).get(recipe_id)
+                            or plan_history.days_since(recipe_id) is not None
+                        ),
+                        kcal_target=profile_mod.slot_kcal_target(
+                            people, meal_type, meal_date
+                        ),
+                        dish_type=score.dish_type,
                     ),
-                    kcal_target=profile_mod.slot_kcal_target(people, meal_type, meal_date),
-                    dish_type=score.dish_type,
-                ),
-            )
+                )
             meal_nutrition = _meal_nutrition(
                 selected.get("ingredients", []), scale, product_matcher, price_tier,
                 synonyms=synonyms_dict, normal=_normal, nutrition=nutrition,
@@ -1296,6 +1337,7 @@ def build_plan(
                 # N2: честная пометка неполноты — ккал посчитаны не по всем
                 # ингредиентам блюда.
                 meal_warnings.append(f"kcal_partial:{counted}/{countable}")
+            meal_position_by_slot[day_index, meal_type] = len(meals) + 1
             meals.append(
                 {
                     "meal_date": meal_date,
@@ -1311,6 +1353,12 @@ def build_plan(
                     "servings": slot_servings,
                     "warnings": meal_warnings,
                     "reasons": reasons,
+                    # Позиция блюда-источника в этом же плане: id появятся
+                    # только при сохранении (§6.2).
+                    "leftover_of": meal_position_by_slot.get(source_slot)
+                    if source_slot
+                    else None,
+                    "cooks_ahead": heir_slot is not None,
                     **meal_nutrition,
                 }
             )

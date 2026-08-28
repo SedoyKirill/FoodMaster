@@ -134,6 +134,21 @@ def repository_with_pool(pool: FakePool, **kwargs: Any):
     return repository
 
 
+def _with_meal_ids(meals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Блюда плана с id; ссылка «остаток от» — на id, как в базе (§6.2)."""
+    ids = [str(uuid.uuid4()) for _ in meals]
+    result = []
+    for position, meal in enumerate(meals):
+        source = meal.get("leftover_of")
+        result.append({
+            **meal,
+            "id": ids[position],
+            "status": None,
+            "leftover_of": ids[source - 1] if source else None,
+        })
+    return result
+
+
 class FakeRepository:
     """Хранилище в памяти для ``TestClient``. Реализует только то, что зовёт main.py."""
 
@@ -638,10 +653,9 @@ class FakeRepository:
             "status": "draft",
             "created_at": datetime.now(timezone.utc).isoformat(),
             # У блюда есть id: без него PATCH статуса и замена неадресуемы.
-            "meals": [
-                {**meal, "id": str(uuid.uuid4()), "status": None}
-                for meal in plan["meals"]
-            ],
+            # leftover_of приходит позицией в плане и, как в базе, становится
+            # ссылкой на id ужина-источника (TZ-M8 §6.2).
+            "meals": _with_meal_ids(plan["meals"]),
             "shopping": shopping,
             "warnings": [],
         }
