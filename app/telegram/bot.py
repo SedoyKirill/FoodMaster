@@ -16,6 +16,7 @@ import asyncpg
 import httpx
 
 from app.web.database import AppRepository
+from app.web.ratelimit import RateLimiter
 
 from .service import (
     BotRepository, CallbackReply, Reply, callback_verb, handle_callback,
@@ -40,6 +41,58 @@ ERROR_BACKOFF_SECONDS = 5
 TIMEZONE = ZoneInfo(os.getenv("LENTA_TIMEZONE", "Europe/Moscow"))
 #: тяжёлые глаголы уходят в фоновую задачу, чтобы не морозить конвейер
 HEAVY_VERBS = {"x", "v"}
+#: приёмка TZ-M7 §9.9 — «⏳» не живёт дольше минуты; запас на доставку правки
+HEAVY_TIMEOUT_SECONDS = 45.0
+
+#: TZ-M7 §4.1. Список растёт по мере появления сцен (T4–T9): рекламировать
+#: команды, которые ещё не работают, хуже, чем не показывать их вовсе.
+BOT_COMMANDS = [
+    ("start", "Начать и привязать аккаунт"),
+    ("today", "Меню на сегодня"),
+    ("week", "Текущий план"),
+    ("shopping", "Список покупок"),
+    ("help", "Что я умею"),
+]
+
+#: TZ-M7 §3.1 / А2: бот работает только в личных чатах
+GROUP_REFUSAL = "Я работаю только в личных сообщениях: напишите мне в личку."
+#: одна фраза на групповой чат в 10 минут, а не на каждое сообщение
+GROUP_NOTICE_WINDOW_SECONDS = 600.0
+
+
+class _DefaultMarkup:
+    """Метка «поставить главное меню»: ``None`` значит «без клавиатуры»."""
+
+    __slots__ = ()
+
+
+#: значение по умолчанию для ``reply_markup``: подставить ``KEYBOARD``
+MENU = _DefaultMarkup()
+
+
+class TelegramApiError(httpx.HTTPError):
+    """Ошибка Bot API с разобранным ``description`` (REPORT-2026-08-18 §4).
+
+    Наследуемся от ``httpx.HTTPError`` сознательно: существующие
+    ``except httpx.HTTPError`` в цикле опроса продолжают её ловить.
+    """
+
+    def __init__(self, method: str, status: int, description: str) -> None:
+        self.method = method
+        self.status = status
+        self.description = description
+        super().__init__(f"{method} → {status}: {description}")
+
+
+def _describe(response: httpx.Response) -> str:
+    """Причина отказа: ``description`` из тела, иначе обрезанный текст ответа."""
+    try:
+        body = response.json()
+    except ValueError:
+        return response.text[:300]
+    if isinstance(body, dict):
+        return str(body.get("description") or body)[:300]
+    return str(body)[:300]
 
 
 class TelegramClient:
@@ -48,6 +101,42 @@ class TelegramClient:
     def __init__(self, token: str, http: httpx.AsyncClient) -> None:
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.http = http
+
+    async def _call(
+        self,
+        method: str,
+        payload: dict,
+        *,
+        timeout: float = 30.0,
+        raise_on_error: bool = True,
+    ) -> dict | None:
+        """Единственный канал общения с Bot API.
+
+        При любом не-2xx пишет в лог причину из тела (``description``) — без
+        этого ошибки Telegram были нечитаемы (REPORT-2026-08-18 §4).
+        ``raise_on_error=False`` — для косметики (ack, typing), где падение
+        обработки хуже, чем потерянный вызов.
+        """
+        try:
+            response = await self.http.post(
+                f"{self.base_url}/{method}", json=payload, timeout=timeout
+            )
+        except httpx.HTTPError:
+            log.warning("Bot API %s не доставлен", method, exc_info=True)
+            if raise_on_error:
+                raise
+            return None
+        if response.status_code // 100 != 2:
+            description = _describe(response)
+            # «not modified» — двойной клик по той же кнопке, а не сбой
+            level = logging.DEBUG if "not modified" in description else logging.WARNING
+            log.log(level, "Bot API %s → %s: %s", method, response.status_code, description)
+            if raise_on_error:
+                raise TelegramApiError(method, response.status_code, description)
+            return None
+        body = response.json()
+        result = body.get("result")
+        return result if isinstance(result, dict) else {}
 
     async def get_updates(self, offset: int | None) -> list[dict]:
         params: dict = {
@@ -60,72 +149,103 @@ class TelegramClient:
             f"{self.base_url}/getUpdates", params=params,
             timeout=POLL_TIMEOUT_SECONDS + 10,
         )
-        response.raise_for_status()
+        if response.status_code // 100 != 2:
+            description = _describe(response)
+            log.warning("Bot API getUpdates → %s: %s", response.status_code, description)
+            raise TelegramApiError("getUpdates", response.status_code, description)
         payload = response.json()
         if not payload.get("ok"):
             raise RuntimeError(f"getUpdates: {payload}")
         return payload.get("result", [])
 
     async def send_message(
-        self, chat_id: int, text: str, reply_markup: dict | None = None
+        self,
+        chat_id: int,
+        text: str,
+        reply_markup: dict | None | _DefaultMarkup = MENU,
     ) -> int | None:
         """Отправка с разбиением; клавиатура — только на последнем куске.
 
-        Возвращает message_id последнего отправленного сообщения.
+        ``MENU`` (по умолчанию) — подставить постоянное меню, ``None`` — не
+        ставить клавиатуру вовсе (так уходит плейсхолдер «⏳», TZ-M7 §4.5),
+        словарь — поставить его. Возвращает message_id последнего сообщения.
         """
         chunks = split_for_telegram(text) or [""]
         message_id: int | None = None
         for index, chunk in enumerate(chunks):
             payload: dict = {"chat_id": chat_id, "text": chunk}
             if index == len(chunks) - 1:
-                payload["reply_markup"] = reply_markup if reply_markup is not None else KEYBOARD
-            response = await self.http.post(
-                f"{self.base_url}/sendMessage", json=payload, timeout=30
-            )
-            response.raise_for_status()
-            body = response.json()
-            message_id = (body.get("result") or {}).get("message_id")
+                markup = KEYBOARD if isinstance(reply_markup, _DefaultMarkup) else reply_markup
+                if markup is not None:
+                    payload["reply_markup"] = markup
+            result = await self._call("sendMessage", payload) or {}
+            message_id = result.get("message_id")
         return message_id
 
     async def edit_message_text(
         self, chat_id: int, message_id: int, text: str, reply_markup: dict | None = None
-    ) -> None:
-        payload: dict = {"chat_id": chat_id, "message_id": message_id, "text": text}
-        if reply_markup is not None:
+    ) -> int | None:
+        """Правка сообщения; длинный текст режется, при отказе уходит новым.
+
+        Возвращает message_id актуального сообщения (нового — если сработал
+        запасной путь), чтобы «⏳» не оставался висеть навсегда
+        (REPORT-2026-08-18 §4).
+        """
+        chunks = split_for_telegram(text) or [""]
+        payload: dict = {"chat_id": chat_id, "message_id": message_id, "text": chunks[0]}
+        # клавиатуру вешаем на последний кусок: если есть хвост, она уедет с ним
+        if reply_markup is not None and len(chunks) == 1:
             payload["reply_markup"] = reply_markup
-        response = await self.http.post(
-            f"{self.base_url}/editMessageText", json=payload, timeout=30
-        )
-        if response.status_code == 400 and "not modified" in response.text:
-            return  # двойной клик по той же галке — не ошибка
-        response.raise_for_status()
+        try:
+            await self._call("editMessageText", payload)
+        except TelegramApiError as error:
+            if error.status == 400 and "not modified" in error.description:
+                return message_id  # двойной клик по той же галке — не ошибка
+            log.warning("Правка не удалась, отправляю новым сообщением: %s", error)
+            return await self.send_message(chat_id, text, reply_markup)
+        tail = chunks[1:]
+        for index, chunk in enumerate(tail):
+            tail_markup = reply_markup if index == len(tail) - 1 else None
+            message_id = await self.send_message(chat_id, chunk, tail_markup) or message_id
+        return message_id
 
     async def answer_callback_query(
         self, callback_query_id: str, text: str = "", show_alert: bool = False
     ) -> None:
-        try:
-            await self.http.post(
-                f"{self.base_url}/answerCallbackQuery",
-                json={
-                    "callback_query_id": callback_query_id,
-                    "text": text[:200],
-                    "show_alert": show_alert,
-                },
-                timeout=15,
-            )
-        except httpx.HTTPError:
-            # ack не должен ронять обработку — спиннер погаснет по таймауту
-            log.warning("answerCallbackQuery не доставлен", exc_info=True)
+        # ack не должен ронять обработку — спиннер погаснет по таймауту
+        await self._call(
+            "answerCallbackQuery",
+            {
+                "callback_query_id": callback_query_id,
+                "text": text[:200],
+                "show_alert": show_alert,
+            },
+            timeout=15,
+            raise_on_error=False,
+        )
 
     async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
-        try:
-            await self.http.post(
-                f"{self.base_url}/sendChatAction",
-                json={"chat_id": chat_id, "action": action},
-                timeout=15,
-            )
-        except httpx.HTTPError:
-            pass  # косметика
+        await self._call(
+            "sendChatAction",
+            {"chat_id": chat_id, "action": action},
+            timeout=15,
+            raise_on_error=False,
+        )
+
+    async def set_my_commands(self, commands: list[tuple[str, str]]) -> None:
+        """Меню команд в личных чатах (TZ-M7 §4.1); сбой не мешает старту."""
+        await self._call(
+            "setMyCommands",
+            {
+                "commands": [
+                    {"command": command, "description": description}
+                    for command, description in commands
+                ],
+                "scope": {"type": "all_private_chats"},
+            },
+            timeout=15,
+            raise_on_error=False,
+        )
 
 
 async def apply_callback_reply(
@@ -136,7 +256,10 @@ async def apply_callback_reply(
             chat_id, message_id, result.edit.text, result.edit.keyboard
         )
     for reply in result.sends:
-        await client.send_message(chat_id, reply.text, reply.keyboard)
+        # None у Reply означает «инлайн-клавиатуры нет», а не «убрать меню»
+        await client.send_message(
+            chat_id, reply.text, reply.keyboard if reply.keyboard is not None else MENU
+        )
 
 
 class BotApp:
@@ -153,6 +276,11 @@ class BotApp:
         self.app_repository = app_repository
         self.tasks: set[asyncio.Task] = set()
         self.in_flight: set[tuple[int, str]] = set()
+        #: тяжёлая операция не должна оставлять «⏳» навсегда (TZ-M7 §9.9);
+        #: атрибут, а не константа, — тесты подставляют свой лимит
+        self.heavy_timeout = HEAVY_TIMEOUT_SECONDS
+        #: одна фраза на групповой чат за окно, а не ответ на каждое сообщение
+        self.group_notices = RateLimiter(1, GROUP_NOTICE_WINDOW_SECONDS)
 
     def _today(self):
         return datetime.now(TIMEZONE).date()
@@ -163,7 +291,14 @@ class BotApp:
         except Exception:
             log.exception("Ошибка обработки сообщения из чата %s", chat_id)
             reply = Reply("Что-то сломалось на моей стороне. Попробуйте ещё раз чуть позже.")
-        await self.client.send_message(chat_id, reply.text, reply.keyboard)
+        await self.client.send_message(
+            chat_id, reply.text, reply.keyboard if reply.keyboard is not None else MENU
+        )
+
+    async def refuse_group(self, chat_id: int) -> None:
+        """Групповой чат: одна фраза за окно, остальное молча игнорируем."""
+        if self.group_notices.hit(str(chat_id)) == 0:
+            await self.client.send_message(chat_id, GROUP_REFUSAL, None)
 
     async def handle_callback_query(self, callback: dict) -> None:
         callback_id = str(callback.get("id"))
@@ -175,6 +310,10 @@ class BotApp:
         if chat_id is None:
             # сообщение слишком старое — только погасить спиннер
             await self.client.answer_callback_query(callback_id)
+            return
+        if str(chat.get("type") or "private") != "private":
+            # TZ-M7 §3.1 / А2: в группе не работаем даже по нажатой кнопке
+            await self.client.answer_callback_query(callback_id, GROUP_REFUSAL, True)
             return
         chat_id = int(chat_id)
         verb = callback_verb(data)
@@ -223,14 +362,27 @@ class BotApp:
         self, chat_id: int, placeholder_id: int | None, data: str, flight_key: tuple
     ) -> None:
         try:
-            result = await handle_callback(
-                self.app_repository, self.bot_repository, chat_id, data, self._today()
+            result = await asyncio.wait_for(
+                handle_callback(
+                    self.app_repository, self.bot_repository, chat_id, data, self._today()
+                ),
+                self.heavy_timeout,
             )
             await apply_callback_reply(self.client, chat_id, placeholder_id, result)
             if result.edit is None and placeholder_id is not None:
                 await self.client.edit_message_text(
                     chat_id, placeholder_id, result.toast or "Готово."
                 )
+        except TimeoutError:
+            log.warning("Тяжёлая операция %r из чата %s не уложилась в срок", data, chat_id)
+            if placeholder_id is not None:
+                try:
+                    await self.client.edit_message_text(
+                        chat_id, placeholder_id,
+                        "Не успел за отведённое время. Попробуйте ещё раз.",
+                    )
+                except httpx.HTTPError:
+                    pass
         except Exception:
             log.exception("Ошибка фоновой задачи %r из чата %s", data, chat_id)
             if placeholder_id is not None:
@@ -256,6 +408,9 @@ class BotApp:
             text = message.get("text")
             if chat_id is None or not text:
                 continue
+            if str(chat.get("type") or "private") != "private":
+                await self.refuse_group(int(chat_id))
+                continue
             await self.handle_text(int(chat_id), str(text))
         return next_offset
 
@@ -279,6 +434,7 @@ async def main() -> None:
     offset: int | None = None
     async with httpx.AsyncClient() as http:
         client = TelegramClient(token, http)
+        await client.set_my_commands(BOT_COMMANDS)
         app = BotApp(client, bot_repository, app_repository)
         log.info("Бот запущен, ожидаю сообщения (long polling).")
         while True:

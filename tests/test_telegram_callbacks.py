@@ -335,12 +335,22 @@ class BotAppTests(unittest.TestCase):
         client = _FakeClient()
         return BotApp(client, _StubBotRepository(CONTEXT), app_repository), client
 
-    def _callback_update(self, data, update_id=1):
+    def _callback_update(self, data, update_id=1, chat_type="private"):
         return {
             "update_id": update_id,
             "callback_query": {
                 "id": f"cb-{update_id}", "data": data,
-                "message": {"message_id": 55, "chat": {"id": 42}},
+                "from": {"id": 42},
+                "message": {"message_id": 55, "chat": {"id": 42, "type": chat_type}},
+            },
+        }
+
+    def _text_update(self, text, update_id=1, chat_type="private", chat_id=42):
+        return {
+            "update_id": update_id,
+            "message": {
+                "message_id": 7, "text": text, "from": {"id": 42},
+                "chat": {"id": chat_id, "type": chat_type},
             },
         }
 
@@ -431,6 +441,58 @@ class BotAppTests(unittest.TestCase):
         offset = asyncio.run(bot.process_updates([update]))
         self.assertEqual(offset, 10)
         self.assertEqual(client.count("ack"), 1)
+
+    # --- только личные чаты (TZ-M7 §3.1 / А2) ---------------------------------
+
+    def test_group_message_gets_single_refusal(self) -> None:
+        from app.telegram.bot import GROUP_REFUSAL
+
+        bot, client = self._make_app(_StubAppRepository(plan=_plan_payload()))
+        asyncio.run(bot.process_updates([
+            self._text_update("🍽 Сегодня", 1, chat_type="supergroup", chat_id=-100),
+            self._text_update("🛒 Покупки", 2, chat_type="supergroup", chat_id=-100),
+        ]))
+        refusals = [call for call in client.calls if call[0] == "send" and call[1] == GROUP_REFUSAL]
+        self.assertEqual(len(refusals), 1)  # одна фраза на чат, а не на сообщение
+        self.assertEqual(client.count("send"), 1)  # меню группе не показывали
+
+    def test_group_callback_only_alerts(self) -> None:
+        from app.telegram.bot import GROUP_REFUSAL
+
+        app_repository = _StubAppRepository(plan=_plan_payload())
+        bot, client = self._make_app(app_repository)
+        data = encode_callback("s", pack_uuid(PLAN), pack_uuid(ITEM))
+        asyncio.run(bot.process_updates([
+            self._callback_update(data, 1, chat_type="group")
+        ]))
+        self.assertTrue(any(call[0] == "ack" and call[2] == GROUP_REFUSAL for call in client.calls))
+        self.assertEqual(app_repository.calls, [])  # к данным семьи не ходили
+
+    def test_private_message_still_works(self) -> None:
+        bot, client = self._make_app(_StubAppRepository(plan=_plan_payload()))
+        asyncio.run(bot.process_updates([self._text_update("/help", 1)]))
+        self.assertEqual(client.count("send"), 1)
+
+    # --- «⏳» не висит дольше срока (приёмка §9.9) -----------------------------
+
+    def test_heavy_timeout_replaces_placeholder(self) -> None:
+        class HangingRepo(_StubAppRepository):
+            async def replace_meal(self, session, plan_id, meal_id, recipe_id=None):
+                await asyncio.Event().wait()  # никогда не завершится
+
+        bot, client = self._make_app(HangingRepo(plan=_plan_payload()))
+        bot.heavy_timeout = 0.01
+        update = self._callback_update(encode_callback("x", pack_uuid(PLAN), pack_uuid(MEAL)))
+
+        async def scenario():
+            await bot.process_updates([update])
+            await asyncio.gather(*bot.tasks, return_exceptions=True)
+
+        asyncio.run(scenario())
+        self.assertTrue(
+            any(call[0] == "edit" and "Не успел" in call[2] for call in client.calls)
+        )
+        self.assertEqual(bot.in_flight, set())
 
 
 if __name__ == "__main__":
