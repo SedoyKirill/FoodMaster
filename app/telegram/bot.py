@@ -20,9 +20,9 @@ from app.web.ratelimit import RateLimiter
 
 from .callbacks import heavy_placeholder
 from .fsm import CANCEL_DATA, CANCEL_TEXT, DialogStore
-from .repository import BotRepository
+from .repository import BotRepository, bot_session
 from .router import TOO_FAST_TEXT, Actor, Incoming, Router, parse_update
-from .scenes import SceneContext, auth, plan, recipes
+from .scenes import SceneContext, auth, inventory, plan, products, recipes
 from .service import (
     CallbackReply, Reply, callback_verb, handle_callback, handle_message,
     split_for_telegram,
@@ -35,6 +35,7 @@ KEYBOARD = {
     "keyboard": [
         [{"text": "🍽 Сегодня"}, {"text": "📅 Меню"}],
         [{"text": "🛒 Покупки"}, {"text": "📖 Рецепты"}],
+        [{"text": "🧊 Запасы"}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
@@ -56,6 +57,8 @@ BOT_COMMANDS = [
     ("new", "Составить новое меню"),
     ("shopping", "Список покупок"),
     ("recipes", "Поиск по библиотеке рецептов"),
+    ("inventory", "Запасы дома"),
+    ("products", "Каталог «Ленты»"),
     ("web", "Войти в веб-приложение"),
     ("unlink", "Отвязать Telegram"),
     ("cancel", "Отменить текущий диалог"),
@@ -309,12 +312,16 @@ class BotApp:
                 reply = Reply(CANCEL_TEXT)
             elif route == "scene":
                 scene = self.router.scenes[state.scene]
+                # сцене может понадобиться псевдосессия к AppRepository —
+                # достаём контекст один раз и отдаём готовым
+                context = await self.bot_repository.context_for_user(actor.user_id)
                 reply = await scene(SceneContext(
                     actor=actor, text=text, state=state,
                     bot_repository=self.bot_repository,
                     app_repository=self.app_repository,
                     dialogs=self.router.dialogs,
                     today=self._today(),
+                    session=bot_session(context) if context else None,
                 ))
             else:
                 reply = await handle_message(
@@ -531,6 +538,8 @@ async def main() -> None:
             auth.SCENE: auth.handle_step,
             plan.SCENE: plan.handle_step,
             recipes.SCENE: recipes.handle_step,
+            inventory.SCENE: inventory.handle_step,
+            products.SCENE: products.handle_step,
         },
     )
 

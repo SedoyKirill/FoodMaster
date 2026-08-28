@@ -27,6 +27,8 @@ class SceneContext:
     app_repository: Any
     dialogs: DialogStore
     today: date
+    #: псевдосессия для AppRepository; None — сцена работает до входа в аккаунт
+    session: dict[str, Any] | None = None
 
 
 __all__ = ["SceneContext", "Reply", "DialogState"]

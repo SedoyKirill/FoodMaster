@@ -776,7 +776,7 @@ class AppRepository:
         rows = await self.db().fetch(
             f"""
             SELECT p.id, p.name, p.brand, p.pack_text, p.pack_quantity, p.pack_unit,
-                   p.kcal_100, p.protein_100, p.fat_100, p.carb_100,
+                   p.kcal_100, p.protein_100, p.fat_100, p.carb_100, p.url,
                    ph.regular_price_kop, ph.loyalty_price_kop, ph.promo_price_kop,
                    ph.discount_percent,
                    COALESCE(NULLIF(ph.promo_price_kop,0), NULLIF(ph.loyalty_price_kop,0), ph.regular_price_kop) AS effective_price_kop,

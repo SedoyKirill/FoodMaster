@@ -29,7 +29,9 @@ from .render import (
 )
 from .repository import BotRepository, bot_session
 from .scenes import auth
+from .scenes import inventory as inventory_scene
 from .scenes import plan as plan_scene
+from .scenes import products as products_scene
 from .scenes import recipes as recipes_scene
 from .scenes import shopping as shopping_scene
 
@@ -118,6 +120,12 @@ async def handle_message(
             return shopping_scene.overview_reply(latest)
         if lowered in {"/recipes", "рецепты", "📖 рецепты"}:
             return await recipes_scene.begin(dialogs, app_repository, user_id)
+        if lowered in {"/inventory", "запасы", "🧊 запасы"}:
+            return await inventory_scene.begin(
+                dialogs, app_repository, session, user_id, today
+            )
+        if lowered in {"/products", "продукты", "каталог"}:
+            return await products_scene.begin(dialogs, app_repository, user_id)
 
     if lowered in {"/week", "неделя", "план", "📅 неделя", "📅 меню", "меню"}:
         meals = await repository.latest_plan_meals(context["household_id"])
@@ -228,6 +236,12 @@ async def handle_callback(
                 edit=await plan_scene.history_reply(app_repository, session, page)
             )
         # --- библиотека рецептов (§5.7) ---------------------------------------
+        if verb == "n" and parts[:1] == ["pr"]:
+            result = await products_scene.handle_navigation(
+                app_repository, dialogs, user_id, parts
+            )
+            if result is not None:
+                return result
         if verb == "n" and parts[:1] == ["rc"]:
             result = await recipes_scene.handle_navigation(
                 app_repository, dialogs, session, user_id, parts
@@ -250,6 +264,20 @@ async def handle_callback(
                 app_repository, session, int(parts[0]), parts[1]
             )
 
+        # --- запасы (§5.8) ----------------------------------------------------
+        if verb == "i" and parts:
+            return await inventory_scene.delete(
+                app_repository, dialogs, session, user_id, parts[0], today
+            )
+        if verb == "y" and parts[:1] == ["inu"]:
+            return await inventory_scene.undo_delete(
+                app_repository, dialogs, session, user_id, today
+            )
+        if verb == "y" and parts[:1] == ["inx"]:
+            return await inventory_scene.confirm_expired(
+                app_repository, dialogs, session, user_id, today
+            )
+
         # --- покупки по разделам магазина (§5.6) ------------------------------
         if verb == "f":
             result = await shopping_scene.handle_filter(app_repository, session, parts)
@@ -260,11 +288,31 @@ async def handle_callback(
             )
             if result is not None:
                 return result
+            result = await inventory_scene.handle_filter(
+                app_repository, dialogs, session, user_id, parts, today
+            )
+            if result is not None:
+                return result
+            result = await products_scene.handle_filter(
+                app_repository, dialogs, user_id, parts
+            )
+            if result is not None:
+                return result
         if verb == "p":
             result = await shopping_scene.handle_page(app_repository, session, parts)
             if result is not None:
                 return result
             result = await recipes_scene.handle_page(
+                app_repository, dialogs, user_id, parts
+            )
+            if result is not None:
+                return result
+            result = await inventory_scene.handle_page(
+                app_repository, session, parts, today
+            )
+            if result is not None:
+                return result
+            result = await products_scene.handle_page(
                 app_repository, dialogs, user_id, parts
             )
             if result is not None:
