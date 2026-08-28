@@ -877,6 +877,62 @@ def _meal_nutrition(
     }
 
 
+#: человеческий текст к упрощениям модели упаковок (§6.5)
+PACK_WARNING_TEXTS = {
+    "pack_model_truncated": (
+        "pack_model_truncated: продуктов в плане слишком много — целыми "
+        "пачками посчитаны только самые дорогие из общих."
+    ),
+    "pack_model_skipped": (
+        "pack_model_skipped: расчёт целых упаковок не уложился в лимит "
+        "времени — стоимость блюд посчитана по пропорции пачки."
+    ),
+}
+
+
+def _shared_packs(
+    assignment: dict[tuple[int, str], int | None],
+    positions: dict[tuple[int, str], int],
+    pack_model: Any,
+    packs: dict[int, int],
+) -> dict[tuple[int, str], tuple[str, int]]:
+    """Слот → (продукт, номер блюда), с которым он делит одну пачку.
+
+    Считается только по товарам, которых куплено меньше, чем понадобилось бы
+    блюдам по отдельности: иначе «делим пачку» превратилось бы в «оба блюда
+    содержат соль».
+    """
+    users: dict[int, list[tuple[int, str]]] = {}
+    for slot, recipe_id in assignment.items():
+        if recipe_id is None:
+            continue
+        for product_id in pack_model.needs.get(recipe_id, {}):
+            users.setdefault(product_id, []).append(slot)
+    result: dict[tuple[int, str], tuple[str, int]] = {}
+    for product_id, slots in users.items():
+        product = pack_model.products.get(product_id)
+        if product is None or len(slots) < 2:
+            continue
+        bought = packs.get(product_id)
+        alone = sum(
+            math.ceil(pack_model.need(assignment[slot], product_id) / product.pack_base)
+            for slot in slots
+        )
+        if bought is None or bought >= alone:
+            continue
+        ordered = sorted(slots, key=lambda slot: positions.get(slot, 0))
+        for index, slot in enumerate(ordered):
+            if slot in result:
+                continue
+            partner = ordered[(index + 1) % len(ordered)]
+            result[slot] = (product.label, positions.get(partner, 0))
+    return result
+
+
+def _pack_warnings(codes: list[str]) -> list[str]:
+    return [PACK_WARNING_TEXTS[code] for code in codes if code in PACK_WARNING_TEXTS]
+
+
 def _leftover_cost_share(servings_by_meal: dict[str, Decimal]) -> float:
     """Во сколько раз дороже ужин, который готовится и на завтрашний обед.
 
@@ -957,6 +1013,7 @@ def build_plan(
     from .planning import taste as taste_mod
     from .planning import shopping as shopping_mod
     from .planning import features as features_mod
+    from .planning import packs as packs_mod
     from .planning import weights as weights_mod
     from .planning.candidates import (
         MIN_READY_CANDIDATES, Synonyms, hard_rule_terms, ingredient_matches_terms,
@@ -1198,6 +1255,29 @@ def build_plan(
         for day in range(days)
         for meal_type in meal_types
     }
+    # Целые пачки на весь горизонт (§6.3): продукт, который нужен двум
+    # блюдам, покупается один раз, и солвер об этом знает ещё до выбора.
+    candidate_ids = sorted({
+        recipe_id for slot_list in candidates_by_slot.values() for recipe_id in slot_list
+    })
+    pack_model = packs_mod.build_pack_model(
+        recipe_ids=candidate_ids,
+        recipes_by_id={int(recipe["id"]): recipe for recipe in pool},
+        costs_by_recipe={recipe_id: scores[recipe_id].cost_kop for recipe_id in candidate_ids},
+        slots=len(candidates_by_slot),
+        scale_of=_scale_of,
+        matcher=product_matcher,
+        price_tier=price_tier,
+        stock=candidates_mod._stock_lots(
+            inventory, synonyms_dict, _normal, _base_quantity
+        ),
+        synonyms=synonyms_dict,
+        normal=_normal,
+        base_quantity=_base_quantity,
+    )
+    for recipe_id, private_cost in pack_model.private_cost_kop.items():
+        scores[recipe_id].cost_private_kop = private_cost
+
     solution = optimizer_mod.optimize(
         days=days,
         meal_types=meal_types,
@@ -1213,6 +1293,7 @@ def build_plan(
         novelty=profile.get("novelty"),
         cuisine_mode=cuisine_mode,
         leftover_cost_share=_leftover_cost_share(servings_by_meal),
+        packs=pack_model,
     )
     assignment = solution.assignment
     solver_status = solution.status
@@ -1240,7 +1321,25 @@ def build_plan(
     plan_warnings: list[str] = []
     meals: list[dict[str, Any]] = []
     meal_ingredients: list[dict[str, Any]] = []
-    meal_position_by_slot: dict[tuple[int, str], int] = {}
+    # Номера блюд известны до сборки: причина «одна пачка с обедом в среду»
+    # может ссылаться на блюдо, которого в списке ещё нет.
+    meal_position_by_slot = {
+        slot: position
+        for position, slot in enumerate(
+            (
+                (day_index, meal_type)
+                for day_index in range(days)
+                for meal_type in meal_types
+                if assignment.get((day_index, meal_type)) is not None
+            ),
+            start=1,
+        )
+    }
+    # Кто с кем делит пачку (§6.3): продукт, нужный двум выбранным блюдам,
+    # покупается один раз — и это стоит сказать вслух.
+    shared_pack_by_slot = _shared_packs(
+        assignment, meal_position_by_slot, pack_model, solution.packs
+    )
     for day_index in range(days):
         meal_date = starts_on + timedelta(days=day_index)
         for meal_type in meal_types:
@@ -1326,6 +1425,7 @@ def build_plan(
                             people, meal_type, meal_date
                         ),
                         dish_type=score.dish_type,
+                        shared_pack=shared_pack_by_slot.get((day_index, meal_type)),
                     ),
                 )
             meal_nutrition = _meal_nutrition(
@@ -1337,7 +1437,6 @@ def build_plan(
                 # N2: честная пометка неполноты — ккал посчитаны не по всем
                 # ингредиентам блюда.
                 meal_warnings.append(f"kcal_partial:{counted}/{countable}")
-            meal_position_by_slot[day_index, meal_type] = len(meals) + 1
             meals.append(
                 {
                     "meal_date": meal_date,
@@ -1370,10 +1469,12 @@ def build_plan(
         inventory, synonyms_dict, _normal, _base_quantity
     )
     shopping, total_cost, matched_cost_items = shopping_mod.build_shopping(
-        aggregate, inventory_lots, product_matcher, price_tier, _base_quantity
+        aggregate, inventory_lots, product_matcher, price_tier, _base_quantity,
+        pack_hint=solution.packs,
     )
 
     plan_warnings.extend(slot_warnings)
+    plan_warnings.extend(_pack_warnings(solution.warnings))
     if solver_status == "greedy":
         # K3: жадный запасной алгоритм не учитывает бюджет и калории —
         # деградация не должна быть тихой.

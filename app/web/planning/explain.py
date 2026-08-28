@@ -58,6 +58,8 @@ class ExplainContext:
     known: bool = True
     kcal_target: int | None = None
     dish_type: str | None = None
+    #: (продукт, номер блюда), с которым делится одна пачка (§6.3)
+    shared_pack: tuple[str, int] | None = None
 
 
 def contributions(
@@ -118,6 +120,11 @@ def explain(score: CandidateScore, context: ExplainContext) -> list[dict[str, An
             reasons.append(Reason("cheap_today", {"delta_rub": int(delta_rub)}))
 
     # Доводы, которых в коэффициенте нет: они про удобство, а не про штрафы.
+    if context.shared_pack:
+        ingredient, other_meal = context.shared_pack
+        reasons.append(
+            Reason("shares_pack", {"ingredient": ingredient, "other_meal": other_meal})
+        )
     if context.stock_names:
         reasons.append(Reason("uses_stock", {"ingredients": list(context.stock_names)}))
     if score.time_minutes is not None and score.time_minutes <= QUICK_MINUTES:

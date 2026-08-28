@@ -179,11 +179,14 @@ class CandidateScore:
         "affinity", "unknown",
         # TZ-M8 §6.1: БЖУ на семью, белковая база и кухня блюда
         "protein_g", "fat_g", "carb_g", "protein_base", "cuisine",
+        # TZ-M8 §6.3: цена товаров, которые модель упаковок не считает сама
+        "_cost_private_kop",
     )
 
     def __init__(self, recipe_id: int) -> None:
         self.recipe_id = recipe_id
         self.cost_kop = 0
+        self._cost_private_kop: int | None = None
         self.cost_estimated = False
         self.kcal: int | None = None
         self.kcal_estimated = True
@@ -214,6 +217,19 @@ class CandidateScore:
         self.protein_base: str = "veg"
         #: кухня блюда — для штрафа за три одинаковых ужина подряд (§6.2)
         self.cuisine: str | None = None
+
+    @property
+    def cost_private_kop(self) -> int:
+        """Цена товаров, которые модель упаковок не берёт на себя (§6.3).
+
+        Пока модель не построена (замена блюда, тесты, жадный fallback) —
+        это вся стоимость блюда: делить её не на что.
+        """
+        return self.cost_kop if self._cost_private_kop is None else self._cost_private_kop
+
+    @cost_private_kop.setter
+    def cost_private_kop(self, value: int) -> None:
+        self._cost_private_kop = int(value)
 
 
 def _expiring_canonicals(

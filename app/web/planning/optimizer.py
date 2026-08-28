@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .candidates import CandidateScore
+from .packs import PackModel
 from .weights import WeightProfile, weights_for
 
 # Веса целевой функции переехали в weights.py: до M8 набор был один на всех,
@@ -81,8 +82,10 @@ class Solution:
     status: str
     #: слот-наследник → слот-источник («обед среды — это ужин вторника»)
     leftovers: dict[Slot, Slot] = field(default_factory=dict)
-    #: товар → число упаковок из модели упаковок (T7)
+    #: товар → число упаковок из модели упаковок (§6.3)
     packs: dict[int, int] = field(default_factory=dict)
+    #: что пришлось упростить: pack_model_truncated / pack_model_skipped
+    warnings: list[str] = field(default_factory=list)
 
 
 def protein_base_cap(days: int, distinct_bases: int) -> int:
@@ -155,7 +158,9 @@ def slot_coefficient(
     if time_limit and score.time_minutes:
         over_minutes = max(0, int(score.time_minutes) - int(time_limit))
     value = (
-        weights.cost * (score.cost_kop // 100)
+        # Цена «личных» товаров: общие считает модель упаковок целыми пачками
+        # (§6.3), иначе одна и та же сметана попала бы в целевую дважды.
+        weights.cost * (score.cost_private_kop // 100)
         + int(weights.dislike * score.dislike_penalty)
         - weights.waste * score.expiry_bonus
         - weights.cuisine * score.cuisine_bonus
@@ -280,6 +285,58 @@ def _add_protein_terms(
         objective.append(weights.protein * under)
 
 
+def _add_pack_terms(
+    *,
+    model: Any,
+    objective: list[Any],
+    x: dict[tuple[int, int, str], Any],
+    left: dict[tuple[int, int], Any],
+    packs: PackModel,
+    weights: WeightProfile,
+    leftover_cost_share: float,
+) -> dict[int, Any]:
+    """Целые пачки на весь горизонт и штраф за остаток (TZ-M8 §6.3).
+
+    Возвращает переменные «сколько пачек» — из них потом собирается подсказка
+    списку покупок.
+    """
+    pack_vars: dict[int, Any] = {}
+    for product_id, product in packs.products.items():
+        need_terms: list[Any] = []
+        for (recipe_id, day, meal), variable in x.items():
+            need = packs.need(recipe_id, product_id)
+            if need:
+                need_terms.append(need * variable)
+        # Ужин, который готовится и на завтрашний обед, требует продуктов
+        # больше — ровно на порции обеда (§6.2).
+        for (recipe_id, day), variable in left.items():
+            extra = int(packs.need(recipe_id, product_id) * leftover_cost_share)
+            if extra:
+                need_terms.append(extra * variable)
+        if not need_terms:
+            continue
+        count = model.NewIntVar(0, product.max_packs, f"packs_{product_id}")
+        pack_vars[product_id] = count
+        bought = count * product.pack_base + product.stock_base
+        model.Add(bought >= sum(need_terms))
+        objective.append(weights.cost * (product.price_kop // 100) * count)
+
+        # Остаток: сколько куплено сверх нужного. Нулевой остаток не всегда
+        # оптимален — крупа полежит, сливки пропадут (TZ-v2 §10).
+        waste_coefficient = round(
+            weights.leftover_waste * product.perish * product.price_kop
+            / (100 * product.pack_base)
+        )
+        if not waste_coefficient:
+            continue
+        rest = model.NewIntVar(
+            0, product.max_packs * product.pack_base + product.stock_base, f"rest_{product_id}"
+        )
+        model.Add(rest == bought - sum(need_terms))
+        objective.append(waste_coefficient * rest)
+    return pack_vars
+
+
 def _solve_cpsat(
     *,
     days: int,
@@ -296,6 +353,7 @@ def _solve_cpsat(
     novelty: str | None,
     cuisine_mode: str,
     leftover_cost_share: float,
+    packs: PackModel | None,
 ) -> Solution | None:
     try:
         from ortools.sat.python import cp_model
@@ -493,11 +551,29 @@ def _solve_cpsat(
         )
         model.Add(sum(unknown_vars) <= novelty_cap(novelty, len(slots), unavoidable))
 
+    pack_vars: dict[int, Any] = {}
+    if packs:
+        pack_vars = _add_pack_terms(
+            model=model,
+            objective=objective,
+            x=x,
+            left=left,
+            packs=packs,
+            weights=weights,
+            leftover_cost_share=leftover_cost_share,
+        )
+
     # Бюджет — мягкое ограничение (жёсткое легко даёт infeasible, TZ §2.3).
     if budget_kop is not None:
+        # Бюджет — по тем же деньгам, что и целевая функция: «личные» товары
+        # блюд плюс целые пачки общих. Раньше модель считала книжную цену, а
+        # список покупок — пачки на семью, и итог расходился с планом.
         total_cost = sum(
-            (scores[recipe_id].cost_kop // 100) * variable
+            (scores[recipe_id].cost_private_kop // 100) * variable
             for (recipe_id, _, _), variable in x.items()
+        ) + sum(
+            (packs.products[product_id].price_kop // 100) * variable
+            for product_id, variable in pack_vars.items()
         )
         over = model.NewIntVar(0, 10**7, "budget_over")
         model.Add(over >= total_cost - budget_kop // 100)
@@ -557,6 +633,11 @@ def _solve_cpsat(
         assignment=assignment,
         status="OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE",
         leftovers=leftovers,
+        packs={
+            product_id: int(solver.Value(variable))
+            for product_id, variable in pack_vars.items()
+        },
+        warnings=["pack_model_truncated"] if packs and packs.truncated else [],
     )
 
 
@@ -661,6 +742,7 @@ def optimize(
     novelty: str | None = None,
     cuisine_mode: str = "only",
     leftover_cost_share: float = 1.0,
+    packs: PackModel | None = None,
 ) -> Solution:
     """Назначение блюд по слотам: CP-SAT, при недоступности/неудаче — жадный."""
     profile = weights or weights_for(mode)
@@ -670,7 +752,7 @@ def optimize(
         slot: candidates[:candidates_per_slot(days)]
         for slot, candidates in candidates_by_slot.items()
     }
-    solved = _solve_cpsat(
+    common = dict(
         days=days,
         meal_types=meal_types,
         candidates_by_slot=trimmed,
@@ -686,8 +768,16 @@ def optimize(
         cuisine_mode=cuisine_mode,
         leftover_cost_share=leftover_cost_share,
     )
+    solved = _solve_cpsat(**common, packs=packs)
     if solved is not None:
         return solved
+    if packs:
+        # Модель с упаковками не уложилась в лимит — считаем как до M8 и
+        # честно говорим об этом в плане (§6.5).
+        solved = _solve_cpsat(**common, packs=None)
+        if solved is not None:
+            solved.warnings.append("pack_model_skipped")
+            return solved
     return _solve_greedy(
         days=days,
         meal_types=meal_types,
