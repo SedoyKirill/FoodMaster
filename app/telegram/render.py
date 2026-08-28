@@ -144,48 +144,6 @@ def to_buy(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def format_shopping_header(items: list[dict[str, Any]], page: "Page | None" = None) -> str:
-    buyable = to_buy(items)
-    if not items:
-        return "🛒 Списка покупок нет — сначала составьте план."
-    remaining = [item for item in buyable if item.get("purchased_at") is None]
-    if not remaining:
-        return "🛒 Всё куплено. Отличная работа!"
-    total_kop = sum(int(item.get("estimated_cost_kop") or 0) for item in remaining)
-    total = f" ≈{total_kop / 100:.0f} ₽" if total_kop else ""
-    lines = [
-        f"🛒 Осталось купить {len(remaining)} из {len(buyable)} позиций{total}.",
-        "Нажимайте на позиции, чтобы отметить купленное (повторное нажатие снимает отметку).",
-    ]
-    if page is not None and page.pages > 1:
-        lines.append(f"Страница {page.page} из {page.pages}.")
-    return "\n".join(lines)
-
-
-def format_shopping(items: list[dict[str, Any]]) -> str:
-    """Плоский текстовый список (используется, когда кнопки не нужны)."""
-    buyable = to_buy(items)
-    if not items:
-        return "🛒 Списка покупок нет — сначала составьте план."
-    remaining = [item for item in buyable if item.get("purchased_at") is None]
-    if not remaining:
-        return "🛒 Всё куплено. Отличная работа!"
-    lines = ["🛒 Осталось купить:"]
-    total_kop = 0
-    for item in remaining:
-        packs = item.get("pack_count")
-        pack_text = f" ({packs} уп.)" if packs else ""
-        cost = item.get("estimated_cost_kop")
-        cost_text = ""
-        if cost is not None:
-            total_kop += int(cost)
-            cost_text = f" — {int(cost) / 100:.0f} ₽"
-        lines.append(f"• {item['normalized_name']}: {quantity_text(item)}{pack_text}{cost_text}")
-    if total_kop:
-        lines.append(f"Итого ≈{total_kop / 100:.0f} ₽")
-    return "\n".join(lines)
-
-
 def format_recipe(detail: dict[str, Any], meal: dict[str, Any] | None = None) -> str:
     """Карточка рецепта: КБЖУ берём из блюда плана (уже в масштабе семьи)."""
     lines = [f"📖 {clean_dish_title(str(detail.get('title') or 'Рецепт'))}"]
@@ -363,48 +321,6 @@ def today_keyboard(plan_id: Any, meals: list[dict[str, Any]]) -> dict[str, Any] 
             {"text": f"🔁 {label}", "callback_data": encode_callback("x", plan, packed)},
         ])
     return build_keyboard(rows)
-
-
-def shopping_keyboard(
-    plan_id: Any, items: list[dict[str, Any]], page: int = 1
-) -> dict[str, Any] | None:
-    """Чек-лист страницами по 30 позиций (раньше был срез первых 90)."""
-    plan = pack_uuid(plan_id)
-    current = paginate(
-        [item for item in to_buy(items) if item.get("id")], page, BUTTONS_PER_PAGE
-    )
-    rows = []
-    for item in current.items:
-        mark = "✅" if item.get("purchased_at") else "☐"
-        cost = item.get("estimated_cost_kop")
-        cost_text = f" — {int(cost) / 100:.0f} ₽" if cost else ""
-        text = f"{mark} {item['normalized_name']} · {quantity_text(item)}{cost_text}"
-        rows.append([{
-            "text": button_text(text),
-            "callback_data": encode_callback("s", plan, pack_uuid(item["id"])),
-        }])
-    rows.append(pager_row("sh", current, plan))
-    return build_keyboard(rows)
-
-
-def shopping_page(items: list[dict[str, Any]], page: int = 1) -> Page:
-    """Та же страница, что показывает клавиатура, — для шапки сообщения."""
-    return paginate(
-        [item for item in to_buy(items) if item.get("id")], page, BUTTONS_PER_PAGE
-    )
-
-
-def page_of_item(items: list[dict[str, Any]], item_id: Any) -> int:
-    """На какой странице чек-листа лежит позиция.
-
-    После отметки «куплено» пользователь должен остаться там же, где нажимал,
-    а не быть выброшенным на первую страницу.
-    """
-    buyable = [item for item in to_buy(items) if item.get("id")]
-    for index, item in enumerate(buyable):
-        if str(item.get("id")) == str(item_id):
-            return index // BUTTONS_PER_PAGE + 1
-    return 1
 
 
 def alternatives_keyboard(

@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.telegram.callbacks import encode_callback, pack_uuid, parse_callback
 from app.telegram.scenes import shopping
-from app.telegram.service import handle_callback, handle_message
+from app.telegram.dispatch import handle_callback, handle_message
 from app.web.categories import CATEGORY_LABELS, category_label
 
 USER_ID = 7

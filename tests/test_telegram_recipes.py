@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from app.telegram.callbacks import encode_callback, pack_uuid, parse_callback
 from app.telegram.fsm import DialogState
 from app.telegram.scenes import SceneContext, recipes
-from app.telegram.service import handle_callback, handle_message
+from app.telegram.dispatch import handle_callback, handle_message
 from app.web.categories import CUISINES, DISH_TYPES
 
 USER_ID = 7

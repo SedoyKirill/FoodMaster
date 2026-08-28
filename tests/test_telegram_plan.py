@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from app.telegram.callbacks import encode_callback, heavy_placeholder, parse_callback
 from app.telegram.fsm import DialogState
 from app.telegram.scenes import SceneContext, plan
-from app.telegram.service import handle_callback, handle_message
+from app.telegram.dispatch import handle_callback, handle_message
 
 USER_ID = 7
 TODAY = date(2026, 8, 28)          # пятница

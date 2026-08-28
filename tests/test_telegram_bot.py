@@ -7,16 +7,14 @@ import sys
 import unittest
 import uuid
 from datetime import date
-from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fakes import FakePool
 
-from app.telegram.service import (
-    BotRepository, HELP_TEXT, NOT_LINKED_TEXT,
-    format_day, format_shopping, format_week, handle_message,
-)
+from app.telegram.dispatch import handle_message
+from app.telegram.render import HELP_TEXT, format_day, format_week
+from app.telegram.repository import BotRepository
 
 try:  # httpx нужен только транспорту; без него пропускаем его тесты
     import httpx
@@ -85,19 +83,23 @@ def _meal(**overrides):
 class HandleMessageTests(unittest.TestCase):
     def test_start_with_link_payload_calls_link(self) -> None:
         repository = _StubRepository(link_result="vanya")
-        reply = asyncio.run(handle_message(repository, 42, "/start link_abc123", TODAY))
+        reply = asyncio.run(handle_message(repository, 42, "/start link_abc123", TODAY, app_repository=None, dialogs=None))
         self.assertEqual(repository.link_calls, [(42, "abc123")])
         self.assertIn("vanya", reply.text)
 
     def test_start_with_bad_token_explains_how_to_relink(self) -> None:
         repository = _StubRepository(link_result=None)
-        reply = asyncio.run(handle_message(repository, 42, "/start link_expired", TODAY))
+        reply = asyncio.run(handle_message(repository, 42, "/start link_expired", TODAY, app_repository=None, dialogs=None))
         self.assertIn("просрочен", reply.text)
 
-    def test_unlinked_chat_gets_instructions(self) -> None:
+    def test_unlinked_user_is_offered_an_account(self) -> None:
+        """T4: непривязанному предлагаем завести аккаунт прямо здесь."""
         repository = _StubRepository(context=None)
-        reply = asyncio.run(handle_message(repository, 42, "Сегодня", TODAY))
-        self.assertEqual(reply.text, NOT_LINKED_TEXT)
+        reply = asyncio.run(handle_message(
+            repository, 42, "Сегодня", TODAY, app_repository=None, dialogs=None
+        ))
+        self.assertIn("Супостат", reply.text)
+        self.assertIsNotNone(reply.keyboard)
 
     def test_today_returns_menu_with_buttons(self) -> None:
         repository = _StubRepository(
@@ -110,7 +112,7 @@ class HandleMessageTests(unittest.TestCase):
                 ),
             ],
         )
-        reply = asyncio.run(handle_message(repository, 42, "🍽 Сегодня", TODAY))
+        reply = asyncio.run(handle_message(repository, 42, "🍽 Сегодня", TODAY, app_repository=None, dialogs=None))
         self.assertIn("Завтрак: Каша", reply.text)
         self.assertIn("Ужин: Суп", reply.text)
         self.assertIn("по 1 из 2 блюд", reply.text)  # честная неполнота ккал
@@ -119,8 +121,13 @@ class HandleMessageTests(unittest.TestCase):
         self.assertEqual(len(rows[0]), 2)
 
     def test_unknown_command_shows_help(self) -> None:
-        repository = _StubRepository(context={"household_id": "h-1"})
-        reply = asyncio.run(handle_message(repository, 42, "борщ??", TODAY))
+        repository = _StubRepository(context={
+            "household_id": "h-1", "user_id": "u-1", "role": "owner",
+            "login": "vanya", "household_name": "Моя семья",
+        })
+        reply = asyncio.run(handle_message(
+            repository, 42, "борщ??", TODAY, app_repository=None, dialogs=None
+        ))
         self.assertIn(HELP_TEXT, reply.text)
 
 
@@ -138,31 +145,6 @@ class FormattingTests(unittest.TestCase):
         self.assertIn("среда, 19 августа", text)
         self.assertIn("Обед: Плов", text)
 
-    def test_format_shopping_totals_and_skips_purchased(self) -> None:
-        items = [
-            {
-                "normalized_name": "молоко", "buy_quantity": Decimal("930"),
-                "unit_code": "ml", "pack_count": 1,
-                "estimated_cost_kop": 9900, "purchased_at": None, "to_taste": False,
-            },
-            {
-                "normalized_name": "мука", "buy_quantity": Decimal("1000"),
-                "unit_code": "g", "pack_count": 1,
-                "estimated_cost_kop": 5000, "purchased_at": "2026-08-18", "to_taste": False,
-            },
-        ]
-        text = format_shopping(items)
-        self.assertIn("молоко", text)
-        self.assertNotIn("мука", text)  # куплено — не показываем
-        self.assertIn("Итого ≈99 ₽", text)
-
-    def test_format_shopping_all_done(self) -> None:
-        items = [{
-            "normalized_name": "молоко", "buy_quantity": Decimal("930"),
-            "unit_code": "ml", "pack_count": 1,
-            "estimated_cost_kop": 9900, "purchased_at": "2026-08-18", "to_taste": False,
-        }]
-        self.assertIn("Всё куплено", format_shopping(items))
 
 
 # --- транспорт (TZ-M7 T1) ----------------------------------------------------

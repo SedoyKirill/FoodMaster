@@ -15,7 +15,7 @@ from fakes import FakePool, repository_with_pool
 from app.telegram.callbacks import encode_callback, pack_uuid, parse_callback
 from app.telegram.fsm import DialogState
 from app.telegram.scenes import SceneContext, settings
-from app.telegram.service import handle_callback, handle_message
+from app.telegram.dispatch import handle_callback, handle_message
 from app.web.categories import APPLIANCES, RULE_TYPES
 
 USER_ID = 7

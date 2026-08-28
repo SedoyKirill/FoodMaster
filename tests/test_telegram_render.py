@@ -1,8 +1,8 @@
 """Пагинация и лимиты Telegram (TZ-M7 T3, §4.4, приёмка §9.8).
 
 Главное обязательство: лимиты соблюдаются конструктивно — страницами, а не
-обрезанием хвоста. До этого чек-лист резался до 90 позиций, а варианты замены
-до трёх из десяти, и добраться до остального было нельзя.
+обрезанием хвоста. Экранные проверки живут в тестах своих сцен, здесь —
+сами примитивы: страницы, ряд навигации, сборка клавиатуры, резка текста.
 """
 
 import os
@@ -10,29 +10,19 @@ import sys
 import unittest
 import uuid
 from datetime import date, timedelta
-from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.telegram.callbacks import parse_callback
 from app.telegram.render import (
-    BUTTONS_PER_PAGE, MAX_BUTTONS, TELEGRAM_LIMIT, alternatives_keyboard,
-    build_keyboard, button_text, chunk_buttons, format_week, pager_row,
-    paginate, shopping_keyboard, shopping_page, split_for_telegram,
+    MAX_BUTTONS, TELEGRAM_LIMIT, alternatives_keyboard, build_keyboard,
+    button_text, chunk_buttons, format_week, pager_row, paginate,
+    split_for_telegram,
 )
 
 PLAN = uuid.uuid4()
 MEAL = uuid.uuid4()
 
-
-def _items(count):
-    return [{
-        "id": uuid.uuid4(), "plan_id": PLAN,
-        "normalized_name": f"продукт {index}",
-        "buy_quantity": Decimal("1"), "unit_code": "piece",
-        "pack_count": 1, "estimated_cost_kop": 12300,
-        "purchased_at": None, "to_taste": False,
-    } for index in range(count)]
 
 
 class PaginateTests(unittest.TestCase):
@@ -88,35 +78,6 @@ class KeyboardLimitTests(unittest.TestCase):
         rows = [[{"text": str(i), "callback_data": "n:noop"}] for i in range(MAX_BUTTONS + 1)]
         with self.assertRaises(ValueError):
             build_keyboard(rows)
-
-    def test_shopping_120_items_stays_under_limits(self) -> None:
-        """§9.8: 120 позиций — это страницы, а не срез первых 90."""
-        items = _items(120)
-        seen = set()
-        page = shopping_page(items)
-        self.assertEqual(page.pages, 4)
-        for number in range(1, page.pages + 1):
-            keyboard = shopping_keyboard(PLAN, items, number)
-            rows = keyboard["inline_keyboard"]
-            buttons = sum(len(row) for row in rows)
-            self.assertLessEqual(buttons, MAX_BUTTONS)
-            for row in rows:
-                for button in row:
-                    if parse_callback(button["callback_data"])[0] == "s":
-                        seen.add(button["text"])
-        # ни одна позиция не потерялась
-        self.assertEqual(len(seen), BUTTONS_PER_PAGE * 4)
-
-    def test_shopping_second_page_shows_next_items(self) -> None:
-        items = _items(60)
-        first = shopping_keyboard(PLAN, items, 1)["inline_keyboard"]
-        second = shopping_keyboard(PLAN, items, 2)["inline_keyboard"]
-        self.assertIn("продукт 0", first[0][0]["text"])
-        self.assertIn(f"продукт {BUTTONS_PER_PAGE}", second[0][0]["text"])
-
-    def test_short_list_has_no_pager(self) -> None:
-        rows = shopping_keyboard(PLAN, _items(5))["inline_keyboard"]
-        self.assertEqual(len(rows), 5)
 
     def test_all_ten_alternatives_are_shown(self) -> None:
         """§5.5: репозиторий отдаёт десять вариантов, а бот показывал три."""

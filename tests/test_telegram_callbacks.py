@@ -9,10 +9,13 @@ from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from app.telegram.service import (
-    CallbackReply, Reply, STALE_TEXT, alternatives_keyboard, encode_callback,
-    format_recipe, handle_callback, pack_uuid, parse_callback, shopping_keyboard,
-    split_for_telegram, today_keyboard, unpack_uuid,
+from app.telegram.callbacks import (
+    encode_callback, pack_uuid, parse_callback, unpack_uuid,
+)
+from app.telegram.dispatch import handle_callback
+from app.telegram.render import (
+    CallbackReply, Reply, STALE_TEXT, alternatives_keyboard, format_recipe,
+    split_for_telegram, today_keyboard,
 )
 
 TODAY = date(2026, 8, 18)
@@ -64,26 +67,6 @@ class CodecTests(unittest.TestCase):
 
 
 class KeyboardTests(unittest.TestCase):
-    def test_shopping_keyboard_marks_and_parses_back(self) -> None:
-        items = [
-            {"id": str(ITEM), "normalized_name": "молоко", "buy_quantity": "930",
-             "unit_code": "ml", "estimated_cost_kop": 9900, "purchased_at": None},
-            {"id": str(uuid.uuid4()), "normalized_name": "оченьдлинноеназваниепродукта" * 4,
-             "buy_quantity": "1", "unit_code": "piece", "estimated_cost_kop": None,
-             "purchased_at": "2026-08-18"},
-            {"id": str(uuid.uuid4()), "normalized_name": "не покупать",
-             "buy_quantity": "0", "unit_code": "g", "estimated_cost_kop": None,
-             "purchased_at": None},
-        ]
-        keyboard = shopping_keyboard(PLAN, items)
-        rows = keyboard["inline_keyboard"]
-        self.assertEqual(len(rows), 2)  # buy_quantity=0 не показывается
-        self.assertTrue(rows[0][0]["text"].startswith("☐"))
-        self.assertTrue(rows[1][0]["text"].startswith("✅"))  # купленное — можно снять
-        self.assertLessEqual(len(rows[1][0]["text"]), 60)
-        verb, parts = parse_callback(rows[0][0]["callback_data"])
-        self.assertEqual(verb, "s")
-        self.assertEqual(unpack_uuid(parts[1]), ITEM)
 
     def test_today_keyboard_row_per_meal(self) -> None:
         meals = [

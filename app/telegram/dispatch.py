@@ -1,13 +1,12 @@
-"""Легаси-обработчики бота и фасад совместимости (TZ-M7 §2).
+"""Диспетчеризация: команда или нажатая кнопка → нужная сцена (TZ-M7 §2).
 
-Модуль разъехался: кодек — в ``callbacks.py``, тексты и клавиатуры — в
-``render.py``, запросы — в ``repository.py``, разбор входящего — в
-``router.py``. Здесь остались плоский каскад ``handle_message`` /
-``handle_callback`` (в T4–T9 его заменят сцены) и реэкспорты, чтобы импорты
-не пришлось править одним заходом. После T9 модуль удаляется.
+Сюда приходит уже разобранный ввод (``router.parse_update``) и уходит
+декларативный ``Reply``/``CallbackReply``. Ни сети, ни SQL: на вход —
+репозитории (или стабы в тестах), на выход — что показать человеку.
 
-Никакого сетевого кода: на вход — репозитории (или стабы в тестах), на выход —
-декларативные Reply/CallbackReply для транспорта.
+Раньше на этом месте лежал ``service.py`` — плоский каскад из трёх команд и
+фасад совместимости на время переезда. К T9 каскад целиком разошёлся по
+сценам, поэтому фасад удалён, а модуль назван по своей единственной работе.
 """
 
 from __future__ import annotations
@@ -17,14 +16,10 @@ from typing import Any
 
 from app.web.planner import clean_dish_title
 
-from .callbacks import (
-    callback_verb, encode_callback, pack_uuid, parse_callback, unpack_uuid,
-)
+from .callbacks import encode_callback, parse_callback, unpack_uuid
 from .render import (
-    BUTTON_TEXT_LIMIT, CallbackReply, HELP_TEXT, MEAL_LABELS, NOT_LINKED_TEXT,
-    Reply, STALE_TEXT, TELEGRAM_LIMIT, alternatives_keyboard, build_keyboard, format_day,
-    format_recipe, format_shopping, format_shopping_header, format_week,
-    shopping_keyboard, shopping_page, split_for_telegram,
+    MEAL_LABELS, CallbackReply, HELP_TEXT, NOT_LINKED_TEXT, Reply, STALE_TEXT,
+    alternatives_keyboard, build_keyboard, format_day, format_recipe, format_week,
     today_keyboard,
 )
 from .repository import BotRepository, bot_session
@@ -36,16 +31,6 @@ from .scenes import recipes as recipes_scene
 from .scenes import settings as settings_scene
 from .scenes import shopping as shopping_scene
 
-__all__ = [
-    "BUTTON_TEXT_LIMIT", "BotRepository", "CallbackReply", "HELP_TEXT",
-    "MEAL_LABELS", "NOT_LINKED_TEXT", "Reply", "STALE_TEXT", "TELEGRAM_LIMIT",
-    "alternatives_keyboard", "bot_session", "callback_verb", "encode_callback",
-    "format_day", "format_recipe", "format_shopping", "format_shopping_header",
-    "format_week", "handle_callback", "handle_message", "pack_uuid",
-    "parse_callback", "shopping_keyboard", "split_for_telegram",
-    "today_keyboard", "unpack_uuid",
-]
-
 
 # --- обработка входящих сообщений --------------------------------------------
 
@@ -55,14 +40,12 @@ async def handle_message(
     text: str,
     today: date,
     *,
-    app_repository: Any = None,
-    dialogs: Any = None,
+    app_repository: Any,
+    dialogs: Any,
 ) -> Reply:
     """Ответ на текстовое сообщение. Не бросает — ошибки ловит транспорт.
 
     ``user_id`` — Telegram ``from.id``: личность, а не чат (TZ-M7 §3.1).
-    ``app_repository`` и ``dialogs`` нужны сценам аккаунта (§3.2–3.4); без них
-    работают только команды, которым хватает выборок бота.
     """
     text = (text or "").strip()
     lowered = text.lower()
@@ -78,25 +61,22 @@ async def handle_message(
                 )
             return Reply(f"Готово! Аккаунт «{login}» привязан.\n\n{HELP_TEXT}")
         context = await repository.context_for_user(user_id)
-        if context:
-            return Reply(HELP_TEXT)
         # §3.2: аккаунта нет — предлагаем завести его прямо здесь
-        return auth.welcome_reply() if dialogs is not None else Reply(
-            f"Привет!\n\n{NOT_LINKED_TEXT}"
-        )
+        return Reply(HELP_TEXT) if context else auth.welcome_reply()
 
     if lowered in {"/help", "помощь", "help"}:
         return Reply(HELP_TEXT)
 
     context = await repository.context_for_user(user_id)
     if context is None:
-        return auth.welcome_reply() if dialogs is not None else Reply(NOT_LINKED_TEXT)
+        return auth.welcome_reply()
 
-    if lowered in {"/web", "/unlink"} and app_repository is not None:
-        if lowered == "/web":
-            return await auth.web_login(app_repository, context)
-        has_password = await app_repository.has_password(context["user_id"])
-        return auth.unlink_confirmation(has_password)
+    if lowered == "/web":
+        return await auth.web_login(app_repository, context)
+    if lowered == "/unlink":
+        return auth.unlink_confirmation(
+            await app_repository.has_password(context["user_id"])
+        )
 
     if lowered in {"/today", "сегодня", "🍽 сегодня"}:
         meals = await repository.latest_plan_meals(context["household_id"])
@@ -106,39 +86,32 @@ async def handle_message(
             keyboard = today_keyboard(todays[0]["plan_id"], todays)
         return Reply(format_day(meals, today), keyboard)
 
-    if app_repository is not None and dialogs is not None:
-        session = bot_session(context)
-        if lowered in {"/new", "➕ составить меню"}:
-            return await plan_scene.begin(dialogs, user_id)
-        if lowered in {"/plan", "/menu", "меню", "📅 меню", "/week", "неделя", "📅 неделя"}:
-            return await _active_plan_reply(app_repository, session)
-        if lowered in {"/history", "история", "🗂 история"}:
-            return await plan_scene.history_reply(app_repository, session)
-        if lowered in {"/shopping", "покупки", "🛒 покупки"}:
-            latest = await app_repository.latest_plan(session)
-            if latest is None:
-                return Reply("🛒 Списка покупок нет — сначала составьте меню.")
-            return shopping_scene.overview_reply(latest)
-        if lowered in {"/recipes", "рецепты", "📖 рецепты"}:
-            return await recipes_scene.begin(dialogs, app_repository, user_id)
-        if lowered in {"/inventory", "запасы", "🧊 запасы"}:
-            return await inventory_scene.begin(
-                dialogs, app_repository, session, user_id, today
-            )
-        if lowered in {"/products", "продукты", "каталог"}:
-            return await products_scene.begin(dialogs, app_repository, user_id)
-        if lowered in {"/settings", "настройки", "⚙️ настройки"}:
-            return await settings_scene.begin(dialogs, session, user_id)
-
-    if lowered in {"/week", "неделя", "план", "📅 неделя", "📅 меню", "меню"}:
+    session = bot_session(context)
+    if lowered in {"/new", "➕ составить меню"}:
+        return await plan_scene.begin(dialogs, user_id)
+    if lowered in {"/plan", "/menu", "меню", "📅 меню"}:
+        return await _active_plan_reply(app_repository, session)
+    if lowered in {"/week", "неделя", "📅 неделя"}:
+        # весь план одним текстом — быстрый взгляд без листания по дням
         meals = await repository.latest_plan_meals(context["household_id"])
         return Reply(format_week(meals))
+    if lowered in {"/history", "история", "🗂 история"}:
+        return await plan_scene.history_reply(app_repository, session)
     if lowered in {"/shopping", "покупки", "🛒 покупки"}:
-        items = await repository.shopping_items(context["household_id"])
-        keyboard = None
-        if items and items[0].get("plan_id"):
-            keyboard = shopping_keyboard(items[0]["plan_id"], items)
-        return Reply(format_shopping_header(items, shopping_page(items)), keyboard)
+        latest = await app_repository.latest_plan(session)
+        if latest is None:
+            return Reply("🛒 Списка покупок нет — сначала составьте меню.")
+        return shopping_scene.overview_reply(latest)
+    if lowered in {"/recipes", "рецепты", "📖 рецепты"}:
+        return await recipes_scene.begin(dialogs, app_repository, user_id)
+    if lowered in {"/inventory", "запасы", "🧊 запасы"}:
+        return await inventory_scene.begin(
+            dialogs, app_repository, session, user_id, today
+        )
+    if lowered in {"/products", "продукты", "каталог"}:
+        return await products_scene.begin(dialogs, app_repository, user_id)
+    if lowered in {"/settings", "настройки", "⚙️ настройки"}:
+        return await settings_scene.begin(dialogs, session, user_id)
 
     return Reply(f"Не понял команду.\n\n{HELP_TEXT}")
 

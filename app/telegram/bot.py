@@ -1,7 +1,8 @@
 """Транспорт Telegram-бота: long polling Bot API без внешних фреймворков.
 
 Запуск: ``python -m app.telegram.bot`` (нужны TELEGRAM_BOT_TOKEN и DATABASE_URL).
-Логика ответов — в ``service.py``; здесь только сеть и диспетчеризация.
+Здесь только сеть и очередь апдейтов: что ответить, решает ``dispatch.py``,
+как это выглядит — ``render.py``.
 """
 
 from __future__ import annotations
@@ -18,15 +19,13 @@ import httpx
 from app.web.database import PLANNER_WARM_INTERVAL_SECONDS, AppRepository
 from app.web.ratelimit import RateLimiter
 
-from .callbacks import heavy_placeholder
+from .callbacks import callback_verb, heavy_placeholder
+from .dispatch import handle_callback, handle_message
 from .fsm import CANCEL_DATA, CANCEL_TEXT, DialogStore
+from .render import CallbackReply, Reply, split_for_telegram
 from .repository import BotRepository, bot_session
 from .router import TOO_FAST_TEXT, Actor, Incoming, Router, parse_update
 from .scenes import SceneContext, auth, inventory, plan, products, recipes, settings
-from .service import (
-    CallbackReply, Reply, callback_verb, handle_callback, handle_message,
-    split_for_telegram,
-)
 
 log = logging.getLogger("ration.telegram")
 

@@ -14,7 +14,7 @@ from fakes import FakePool
 
 from app.telegram.callbacks import encode_callback, parse_callback
 from app.telegram.scenes import auth
-from app.telegram.service import handle_callback, handle_message
+from app.telegram.dispatch import handle_callback, handle_message
 from app.web.database import ConflictError
 
 USER_ID = 7
@@ -100,7 +100,8 @@ class _AppRepo:
 class WelcomeTests(unittest.TestCase):
     def test_start_without_account_offers_registration(self) -> None:
         reply = run_async(handle_message(
-            _BotRepo(None), USER_ID, "/start", TODAY, dialogs=_Dialogs()
+            _BotRepo(None), USER_ID, "/start", TODAY,
+            app_repository=_AppRepo(), dialogs=_Dialogs(),
         ))
         verbs = [
             parse_callback(button["callback_data"])[1][0]
@@ -110,16 +111,11 @@ class WelcomeTests(unittest.TestCase):
 
     def test_start_with_account_shows_help(self) -> None:
         reply = run_async(handle_message(
-            _BotRepo(CONTEXT), USER_ID, "/start", TODAY, dialogs=_Dialogs()
+            _BotRepo(CONTEXT), USER_ID, "/start", TODAY,
+            app_repository=_AppRepo(), dialogs=_Dialogs(),
         ))
         self.assertIsNone(reply.keyboard)
         self.assertIn("Супостат", reply.text)
-
-    def test_without_dialog_store_falls_back_to_old_instruction(self) -> None:
-        """Старое поведение сохраняется, если сцены не подключены."""
-        reply = run_async(handle_message(_BotRepo(None), USER_ID, "/start", TODAY))
-        self.assertIn("Настройки", reply.text)
-        self.assertIsNone(reply.keyboard)
 
     def test_have_account_button_explains_linking(self) -> None:
         result = run_async(handle_callback(
