@@ -181,7 +181,7 @@ class MenuTests(unittest.TestCase):
 
     def test_begin_opens_scene(self) -> None:
         dialogs = _Dialogs()
-        run_async(settings.begin(dialogs, OWNER, USER_ID))
+        run_async(settings.begin(dialogs, _AppRepo(), OWNER, USER_ID))
         self.assertEqual(dialogs.state.scene, settings.SCENE)
 
 

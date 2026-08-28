@@ -30,6 +30,7 @@ from .scenes import products as products_scene
 from .scenes import recipes as recipes_scene
 from .scenes import settings as settings_scene
 from .scenes import shopping as shopping_scene
+from .scenes import taste as taste_scene
 
 
 # --- обработка входящих сообщений --------------------------------------------
@@ -111,7 +112,9 @@ async def handle_message(
     if lowered in {"/products", "продукты", "каталог"}:
         return await products_scene.begin(dialogs, app_repository, user_id)
     if lowered in {"/settings", "настройки", "⚙️ настройки"}:
-        return await settings_scene.begin(dialogs, session, user_id)
+        return await settings_scene.begin(dialogs, app_repository, session, user_id)
+    if lowered in {"/taste", "вкусы"}:
+        return await taste_scene.begin(app_repository, dialogs, session, user_id)
 
     return Reply(f"Не понял команду.\n\n{HELP_TEXT}")
 
@@ -239,6 +242,16 @@ async def handle_callback(
         if verb == "y" and parts[:1] == ["sr"]:
             return await settings_scene.delete_rule(
                 app_repository, session, parts[1] if len(parts) > 1 else ""
+            )
+        if verb == "n" and parts[:1] == ["ts"]:
+            result = await taste_scene.handle_navigation(
+                app_repository, dialogs, session, user_id, parts
+            )
+            if result is not None:
+                return result
+        if verb == "t":
+            return await taste_scene.answer(
+                app_repository, dialogs, session, user_id, parts
             )
         if verb == "n" and parts[:1] == ["pr"]:
             result = await products_scene.handle_navigation(

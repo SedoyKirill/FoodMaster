@@ -4,9 +4,10 @@
 прислать людей, технику и правила целиком, и два канала (браузер и бот) начали
 бы затирать изменения друг друга.
 
-Что сюда ещё не приехало: «🎯 Как планируем» и «😋 Вкусы» — это профиль
-планирования и модель вкуса из TZ-M8, их таблиц пока нет. Тема оформления —
-осознанное исключение: в Telegram ей нет аналога.
+Что сюда ещё не приехало: «🎯 Как планируем» — профиль планирования из
+TZ-M8. «😋 Вкусы» живут в ``scenes/taste.py`` и появляются в меню сами, когда
+модель вкуса доедет до репозитория. Тема оформления — осознанное исключение:
+в Telegram ей нет аналога.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from ..callbacks import encode_callback, pack_uuid, unpack_uuid
 from ..fsm import CANCEL_BUTTON, DialogState
 from ..render import CallbackReply, Reply, build_keyboard, button_text
 from . import SceneContext, auth
+from . import taste as taste_scene
 
 SCENE = "settings.edit"
 
@@ -41,7 +43,7 @@ def _can_edit(session: dict[str, Any]) -> bool:
 
 # --- главное меню --------------------------------------------------------------
 
-def menu_reply(session: dict[str, Any]) -> Reply:
+def menu_reply(session: dict[str, Any], taste_ready: bool = False) -> Reply:
     rows = [
         [{"text": "👨‍👩‍👧 Семья", "callback_data": encode_callback("n", "st", "family")},
          {"text": "🍳 Техника", "callback_data": encode_callback("n", "st", "appl")}],
@@ -50,6 +52,11 @@ def menu_reply(session: dict[str, Any]) -> Reply:
         [{"text": "🔔 Уведомления", "callback_data": encode_callback("n", "st", "notif")},
          {"text": "📊 Данные", "callback_data": encode_callback("n", "st", "data")}],
     ]
+    # пункта нет, пока модель вкуса не приехала: кнопка, которая отвечает
+    # «пока не умею», хуже отсутствующей кнопки (то же решение, что и в setMyCommands)
+    if taste_ready:
+        rows.append([{"text": "😋 Вкусы",
+                      "callback_data": encode_callback("n", "ts", "cards")}])
     text = MENU_TEXT.format(
         household=session.get("household_name") or "—",
         role=ROLE_LABELS.get(str(session.get("role")), session.get("role")),
@@ -59,9 +66,10 @@ def menu_reply(session: dict[str, Any]) -> Reply:
     return Reply(text, build_keyboard(rows))
 
 
-async def begin(dialogs: Any, session: dict[str, Any], user_id: int) -> Reply:
+async def begin(dialogs: Any, app_repository: Any, session: dict[str, Any],
+                user_id: int) -> Reply:
     await dialogs.save(user_id, DialogState(SCENE, "menu", {}))
-    return menu_reply(session)
+    return menu_reply(session, taste_scene.available(app_repository))
 
 
 def _back_row() -> list[dict[str, Any]]:
@@ -349,7 +357,9 @@ async def handle_navigation(app_repository: Any, dialogs: Any, session: dict[str
 
     if action == "menu":
         await dialogs.save(user_id, DialogState(SCENE, "menu", {}))
-        return CallbackReply(edit=menu_reply(session))
+        return CallbackReply(
+            edit=menu_reply(session, taste_scene.available(app_repository))
+        )
     if action == "family":
         return CallbackReply(edit=await family_reply(app_repository, session))
     if action == "appl":

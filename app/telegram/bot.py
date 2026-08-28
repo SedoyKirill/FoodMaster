@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import asyncpg
@@ -26,7 +27,9 @@ from .notifications import Notifier
 from .render import CallbackReply, Reply, split_for_telegram
 from .repository import BotRepository, bot_session
 from .router import TOO_FAST_TEXT, Actor, Incoming, Router, parse_update
-from .scenes import SceneContext, auth, inventory, plan, products, recipes, settings
+from .scenes import (
+    SceneContext, auth, inventory, plan, products, recipes, settings, taste,
+)
 
 log = logging.getLogger("ration.telegram")
 
@@ -50,6 +53,9 @@ HEAVY_TIMEOUT_SECONDS = 45.0
 
 #: TZ-M7 §4.1. Список растёт по мере появления сцен (T4–T9): рекламировать
 #: команды, которые ещё не работают, хуже, чем не показывать их вовсе.
+#: команды, которые показываем только когда за ними есть работающая функция
+CONDITIONAL_COMMANDS = {"taste": taste.available}
+
 BOT_COMMANDS = [
     ("start", "Начать и привязать аккаунт"),
     ("today", "Меню на сегодня"),
@@ -60,11 +66,25 @@ BOT_COMMANDS = [
     ("inventory", "Запасы дома"),
     ("products", "Каталог «Ленты»"),
     ("settings", "Настройки семьи"),
+    ("taste", "Вкусы семьи"),
     ("web", "Войти в веб-приложение"),
     ("unlink", "Отвязать Telegram"),
     ("cancel", "Отменить текущий диалог"),
     ("help", "Что я умею"),
 ]
+
+def commands_for(app_repository: Any) -> list[tuple[str, str]]:
+    """Меню команд Telegram: только то, что сейчас действительно работает.
+
+    Команда, отвечающая «пока не умею», хуже отсутствующей: человек её видит,
+    жмёт и получает отказ. Поэтому /taste появляется сам, когда до репозитория
+    доедет модель вкуса из TZ-M8.
+    """
+    return [
+        (name, title) for name, title in BOT_COMMANDS
+        if name not in CONDITIONAL_COMMANDS or CONDITIONAL_COMMANDS[name](app_repository)
+    ]
+
 
 #: TZ-M7 §3.1 / А2: бот работает только в личных чатах
 GROUP_REFUSAL = "Я работаю только в личных сообщениях: напишите мне в личку."
@@ -542,6 +562,7 @@ async def main() -> None:
             inventory.SCENE: inventory.handle_step,
             products.SCENE: products.handle_step,
             settings.SCENE: settings.handle_step,
+            taste.SCENE: taste.handle_step,
         },
     )
 
@@ -553,7 +574,7 @@ async def main() -> None:
     offset: int | None = None
     async with httpx.AsyncClient() as http:
         client = TelegramClient(token, http)
-        await client.set_my_commands(BOT_COMMANDS)
+        await client.set_my_commands(commands_for(app_repository))
         app = BotApp(client, bot_repository, app_repository, router=router)
 
         async def deliver(chat_id: int, reply: Reply) -> None:
