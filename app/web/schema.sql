@@ -58,6 +58,39 @@ CREATE TABLE IF NOT EXISTS app_core.people (
     CHECK (portion_factor > 0 AND portion_factor <= 3)
 );
 
+-- TZ-M8 §3.1: у каждого едока своя норма и свои приёмы дома. Мерки
+-- необязательны: без них норма берётся константой, а источник расчёта
+-- показывается пользователем (target_source).
+ALTER TABLE app_core.people
+    ADD COLUMN IF NOT EXISTS birth_date DATE,
+    ADD COLUMN IF NOT EXISTS sex TEXT,
+    ADD COLUMN IF NOT EXISTS height_cm NUMERIC,
+    ADD COLUMN IF NOT EXISTS weight_kg NUMERIC,
+    ADD COLUMN IF NOT EXISTS activity TEXT NOT NULL DEFAULT 'moderate',
+    ADD COLUMN IF NOT EXISTS goal TEXT NOT NULL DEFAULT 'maintain',
+    ADD COLUMN IF NOT EXISTS protein_share NUMERIC,
+    ADD COLUMN IF NOT EXISTS fat_share NUMERIC,
+    ADD COLUMN IF NOT EXISTS carb_share NUMERIC,
+    ADD COLUMN IF NOT EXISTS meal_shares JSONB,
+    ADD COLUMN IF NOT EXISTS eats_meals JSONB NOT NULL
+        DEFAULT '["breakfast","lunch","dinner"]'::jsonb;
+
+ALTER TABLE app_core.people DROP CONSTRAINT IF EXISTS people_sex_check;
+ALTER TABLE app_core.people
+    ADD CONSTRAINT people_sex_check CHECK (sex IS NULL OR sex IN ('female', 'male'));
+ALTER TABLE app_core.people DROP CONSTRAINT IF EXISTS people_activity_check;
+ALTER TABLE app_core.people
+    ADD CONSTRAINT people_activity_check CHECK (activity IN ('low', 'moderate', 'high'));
+ALTER TABLE app_core.people DROP CONSTRAINT IF EXISTS people_goal_check;
+ALTER TABLE app_core.people
+    ADD CONSTRAINT people_goal_check CHECK (goal IN ('maintain', 'lose', 'gain'));
+ALTER TABLE app_core.people DROP CONSTRAINT IF EXISTS people_measurements_check;
+ALTER TABLE app_core.people
+    ADD CONSTRAINT people_measurements_check CHECK (
+        (height_cm IS NULL OR height_cm BETWEEN 30 AND 250)
+        AND (weight_kg IS NULL OR weight_kg BETWEEN 2 AND 400)
+    );
+
 CREATE TABLE IF NOT EXISTS app_core.appliances (
     household_id UUID NOT NULL REFERENCES app_core.households(id) ON DELETE CASCADE,
     appliance_code TEXT NOT NULL,
@@ -73,8 +106,17 @@ CREATE TABLE IF NOT EXISTS app_core.dietary_rules (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CHECK (rule_type IN ('allergy', 'intolerance', 'exclude', 'dislike'))
 );
-CREATE UNIQUE INDEX IF NOT EXISTS ux_dietary_rules
-    ON app_core.dietary_rules (household_id, rule_type, lower(term));
+-- TZ-M8 §3.2: правило может принадлежать одному человеку (NULL — вся семья)
+-- и может требовать диету по тегам рецепта (vegetarian, lean, …).
+ALTER TABLE app_core.dietary_rules
+    ADD COLUMN IF NOT EXISTS person_id UUID REFERENCES app_core.people(id) ON DELETE CASCADE,
+    ADD COLUMN IF NOT EXISTS diet_tag TEXT;
+
+-- Одинаковый запрет для разных людей — разные правила, поэтому старый
+-- уникальный индекс (без person_id) заменяется.
+DROP INDEX IF EXISTS app_core.ux_dietary_rules;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_dietary_rules_person
+    ON app_core.dietary_rules (household_id, rule_type, lower(term), COALESCE(person_id, '00000000-0000-0000-0000-000000000000'::uuid));
 
 CREATE TABLE IF NOT EXISTS app_core.inventory_lots (
     id UUID PRIMARY KEY,
@@ -113,6 +155,45 @@ CREATE TABLE IF NOT EXISTS app_core.meal_plans (
 ALTER TABLE app_core.meal_plans
     ADD COLUMN IF NOT EXISTS price_tier TEXT NOT NULL DEFAULT 'balanced';
 
+-- TZ-M8 §6.4: режим, которым план собран. Нужен не для отчёта: замена блюда
+-- ранжируется теми же весами, что и сам план, а профиль семьи мог с тех пор
+-- поменяться («на этот раз экономно» не должно потом стать «сбалансированно»).
+ALTER TABLE app_core.meal_plans
+    ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'balanced';
+
+-- TZ-M8 §3.4: как эта семья планирует. Раньше кухни, бюджет и стратегия
+-- вводились заново при каждой генерации; теперь они хранятся, а поля формы
+-- переопределяют профиль только на текущий план.
+CREATE TABLE IF NOT EXISTS app_core.household_plan_profiles (
+    household_id UUID PRIMARY KEY REFERENCES app_core.households(id) ON DELETE CASCADE,
+    mode TEXT NOT NULL DEFAULT 'balanced',
+    default_days INTEGER NOT NULL DEFAULT 7,
+    weekly_budget_kop BIGINT,
+    cuisines JSONB NOT NULL DEFAULT '[]'::jsonb,
+    -- Решение владельца 28.08.2026: кухня остаётся жёстким фильтром по
+    -- умолчанию, мягкое предпочтение доступно как 'prefer'.
+    cuisine_mode TEXT NOT NULL DEFAULT 'only',
+    weekday_max_minutes INTEGER DEFAULT 45,
+    weekend_max_minutes INTEGER,
+    breakfast_max_minutes INTEGER DEFAULT 25,
+    meals JSONB NOT NULL DEFAULT '["breakfast","lunch","dinner"]'::jsonb,
+    allow_leftovers BOOLEAN NOT NULL DEFAULT TRUE,
+    novelty TEXT NOT NULL DEFAULT 'medium',
+    max_repeats_per_horizon INTEGER NOT NULL DEFAULT 2,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (mode IN ('economy', 'balanced', 'variety', 'fitness', 'quick')),
+    CHECK (cuisine_mode IN ('prefer', 'only')),
+    CHECK (novelty IN ('low', 'medium', 'high')),
+    CHECK (default_days BETWEEN 1 AND 14),
+    CHECK (max_repeats_per_horizon BETWEEN 1 AND 7),
+    CHECK (weekly_budget_kop IS NULL OR weekly_budget_kop >= 0)
+);
+
+-- TZ-M8 §3.4: горизонт до двух недель — ротация блюд на неделе не видна.
+ALTER TABLE app_core.meal_plans DROP CONSTRAINT IF EXISTS meal_plans_days_check;
+ALTER TABLE app_core.meal_plans
+    ADD CONSTRAINT meal_plans_days_check CHECK (days BETWEEN 1 AND 14);
+
 CREATE TABLE IF NOT EXISTS app_core.plan_meals (
     id UUID PRIMARY KEY,
     plan_id UUID NOT NULL REFERENCES app_core.meal_plans(id) ON DELETE CASCADE,
@@ -129,6 +210,17 @@ CREATE TABLE IF NOT EXISTS app_core.plan_meals (
 -- TZ-M5R §3: предупреждения слота (draft, scale_unknown, …).
 ALTER TABLE app_core.plan_meals
     ADD COLUMN IF NOT EXISTS warnings JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+-- TZ-M8 §6.2: обед, который достался от вчерашнего ужина. Готовить его не
+-- нужно, покупок он не добавляет, а показать «остаток вчерашнего» надо.
+ALTER TABLE app_core.plan_meals
+    ADD COLUMN IF NOT EXISTS leftover_of UUID
+        REFERENCES app_core.plan_meals(id) ON DELETE SET NULL;
+
+-- TZ-M8 §5: «почему это блюдо» — коды причин с параметрами. Текст собирают
+-- интерфейс и бот, в базе лежат только факты выбора.
+ALTER TABLE app_core.plan_meals
+    ADD COLUMN IF NOT EXISTS reasons JSONB NOT NULL DEFAULT '[]'::jsonb;
 
 CREATE TABLE IF NOT EXISTS app_core.plan_ingredients (
     id UUID PRIMARY KEY,
@@ -172,6 +264,55 @@ CREATE TABLE IF NOT EXISTS app_core.recipe_ratings (
     CHECK (rating BETWEEN 1 AND 5)
 );
 
+-- TZ-M8 §4: вкус семьи живёт на событиях, а не на одной звезде. Оценка,
+-- замена, «приготовили» и «пропустили» — всё это факты, которые затухают со
+-- временем и обобщаются на тип блюда, кухню и продукты.
+CREATE TABLE IF NOT EXISTS app_core.taste_events (
+    id BIGSERIAL PRIMARY KEY,
+    household_id UUID NOT NULL REFERENCES app_core.households(id) ON DELETE CASCADE,
+    person_id UUID REFERENCES app_core.people(id) ON DELETE SET NULL,
+    recipe_id BIGINT NOT NULL REFERENCES recipe_library.recipes(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    value NUMERIC NOT NULL DEFAULT 0,
+    channel TEXT NOT NULL DEFAULT 'web',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (kind IN ('rated', 'replaced_out', 'replaced_in', 'cooked', 'skipped',
+                    'planned', 'onboarding_like', 'onboarding_skip')),
+    CHECK (value BETWEEN -1 AND 1)
+);
+CREATE INDEX IF NOT EXISTS ix_taste_events_household
+    ON app_core.taste_events (household_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS app_core.taste_affinities (
+    household_id UUID NOT NULL REFERENCES app_core.households(id) ON DELETE CASCADE,
+    level TEXT NOT NULL,
+    key TEXT NOT NULL,
+    score NUMERIC NOT NULL,
+    events_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (household_id, level, key),
+    CHECK (level IN ('recipe', 'dish_type', 'cuisine', 'ingredient')),
+    CHECK (score BETWEEN -1 AND 1)
+);
+
+-- Отметка «приготовили»/«пропустили» под блюдом плана (§4.1). Отсутствие
+-- ответа событием не считается: молчание — не мнение.
+ALTER TABLE app_core.plan_meals
+    ADD COLUMN IF NOT EXISTS status TEXT;
+ALTER TABLE app_core.plan_meals DROP CONSTRAINT IF EXISTS plan_meals_status_check;
+ALTER TABLE app_core.plan_meals
+    ADD CONSTRAINT plan_meals_status_check
+    CHECK (status IS NULL OR status IN ('cooked', 'skipped'));
+
+-- Допущение А3: звёзды переезжают в события с датой последней правки.
+INSERT INTO app_core.taste_events (household_id, recipe_id, kind, value, channel, created_at)
+SELECT r.household_id, r.recipe_id, 'rated', (r.rating - 3) / 2.0, 'system', r.updated_at
+FROM app_core.recipe_ratings r
+WHERE NOT EXISTS (
+    SELECT 1 FROM app_core.taste_events e
+    WHERE e.household_id = r.household_id AND e.recipe_id = r.recipe_id AND e.kind = 'rated'
+);
+
 CREATE INDEX IF NOT EXISTS ix_plan_ingredients_plan
     ON app_core.plan_ingredients (plan_id);
 
@@ -179,13 +320,25 @@ CREATE INDEX IF NOT EXISTS ix_plan_ingredients_plan
 -- каноническому продукту (агрегация покупок И ограничения); kind='group' —
 -- продукт к аллергенной группе (только ограничения: «мука»→глютен не должна
 -- переименовывать муку в списке покупок).
+-- TZ-M8 §6.1: kind='protein_base' — продукт к белковой базе блюда
+-- (мясо/птица/рыба/яйца/молочное/бобовые/овощи) для разнообразия ужинов.
+-- Отдельный домен, а не 'group': аллергенные группы и белковые базы режут
+-- продукты по-разному, и «сыр» одновременно лактоза и молочная база.
 CREATE TABLE IF NOT EXISTS app_core.ingredient_synonyms (
     term TEXT NOT NULL,
     canonical TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT 'form',
     PRIMARY KEY (term, kind),
-    CHECK (kind IN ('form', 'group'))
+    CHECK (kind IN ('form', 'group', 'protein_base'))
 );
+
+-- Домен 'protein_base' появился в M8: у существующих баз ограничение всё ещё
+-- старое, а CREATE TABLE IF NOT EXISTS его не трогает — нужен явный ALTER.
+ALTER TABLE app_core.ingredient_synonyms
+    DROP CONSTRAINT IF EXISTS ingredient_synonyms_kind_check;
+ALTER TABLE app_core.ingredient_synonyms
+    ADD CONSTRAINT ingredient_synonyms_kind_check
+    CHECK (kind IN ('form', 'group', 'protein_base'));
 
 INSERT INTO app_core.ingredient_synonyms (term, canonical, kind) VALUES
     ('молока', 'молоко', 'form'),
@@ -278,7 +431,53 @@ INSERT INTO app_core.ingredient_synonyms (term, canonical, kind) VALUES
     ('мидии', 'морепродукты', 'group'),
     ('гребешки', 'морепродукты', 'group'),
     ('яйцо', 'яйцо', 'group'),
-    ('мед', 'мед', 'group')
+    ('мед', 'мед', 'group'),
+    -- TZ-M8 §6.1: белковая база блюда. Список короткий намеренно: базу даёт
+    -- самый тяжёлый ингредиент, а он у горячего блюда почти всегда отсюда.
+    ('говядина', 'meat', 'protein_base'),
+    ('свинина', 'meat', 'protein_base'),
+    ('баранина', 'meat', 'protein_base'),
+    ('телятина', 'meat', 'protein_base'),
+    ('фарш', 'meat', 'protein_base'),
+    ('мясо', 'meat', 'protein_base'),
+    ('бекон', 'meat', 'protein_base'),
+    ('ветчина', 'meat', 'protein_base'),
+    ('колбаса', 'meat', 'protein_base'),
+    ('сосиски', 'meat', 'protein_base'),
+    ('печень', 'meat', 'protein_base'),
+    ('курица', 'poultry', 'protein_base'),
+    ('куриный', 'poultry', 'protein_base'),
+    ('индейка', 'poultry', 'protein_base'),
+    ('утка', 'poultry', 'protein_base'),
+    ('филе', 'poultry', 'protein_base'),
+    ('рыба', 'fish', 'protein_base'),
+    ('лосось', 'fish', 'protein_base'),
+    ('семга', 'fish', 'protein_base'),
+    ('треска', 'fish', 'protein_base'),
+    ('тунец', 'fish', 'protein_base'),
+    ('скумбрия', 'fish', 'protein_base'),
+    ('сельдь', 'fish', 'protein_base'),
+    ('форель', 'fish', 'protein_base'),
+    ('минтай', 'fish', 'protein_base'),
+    ('горбуша', 'fish', 'protein_base'),
+    ('креветки', 'fish', 'protein_base'),
+    ('кальмар', 'fish', 'protein_base'),
+    ('мидии', 'fish', 'protein_base'),
+    ('яйцо', 'eggs', 'protein_base'),
+    ('яйца', 'eggs', 'protein_base'),
+    ('молоко', 'dairy', 'protein_base'),
+    ('творог', 'dairy', 'protein_base'),
+    ('сыр', 'dairy', 'protein_base'),
+    ('сметана', 'dairy', 'protein_base'),
+    ('сливки', 'dairy', 'protein_base'),
+    ('кефир', 'dairy', 'protein_base'),
+    ('йогурт', 'dairy', 'protein_base'),
+    ('фасоль', 'legumes', 'protein_base'),
+    ('горох', 'legumes', 'protein_base'),
+    ('нут', 'legumes', 'protein_base'),
+    ('чечевица', 'legumes', 'protein_base'),
+    ('соя', 'legumes', 'protein_base'),
+    ('тофу', 'legumes', 'protein_base')
 ON CONFLICT (term, kind) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS app_core.auth_identities (
@@ -310,6 +509,39 @@ CREATE TABLE IF NOT EXISTS app_core.audit_log (
     details JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- TZ-M8 §3.3: фильтр по технике больше не отключается при пустом списке,
+-- поэтому семьям, которые завелись до этого правила, выдаётся базовый набор.
+-- Отметка в audit_log пишется ровно тем, кому набор реально выдали, и делает
+-- миграцию однократной: если технику потом сознательно убрали, повторный
+-- прогон schema.sql её не вернёт.
+WITH targets AS (
+    SELECT h.id
+    FROM app_core.households h
+    WHERE NOT EXISTS (
+            SELECT 1 FROM app_core.appliances a WHERE a.household_id = h.id
+        )
+      AND NOT EXISTS (
+            SELECT 1 FROM app_core.audit_log l
+            WHERE l.household_id = h.id
+              AND l.action = 'settings.appliances_defaulted'
+        )
+), granted AS (
+    INSERT INTO app_core.appliances (household_id, appliance_code)
+    SELECT t.id, code
+    FROM targets t
+    CROSS JOIN (VALUES ('stove'), ('oven'), ('microwave'), ('fridge_freezer')) AS defaults(code)
+    ON CONFLICT DO NOTHING
+    RETURNING household_id
+)
+INSERT INTO app_core.audit_log (household_id, channel, action, entity_type, entity_id, details)
+SELECT DISTINCT household_id, 'system', 'settings.appliances_defaulted', 'household',
+       household_id::text,
+       jsonb_build_object(
+           'appliances',
+           jsonb_build_array('stove', 'oven', 'microwave', 'fridge_freezer')
+       )
+FROM granted;
 
 CREATE INDEX IF NOT EXISTS ix_people_household ON app_core.people (household_id, position);
 CREATE INDEX IF NOT EXISTS ix_inventory_household_expiry ON app_core.inventory_lots (household_id, expires_on);

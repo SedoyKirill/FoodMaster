@@ -157,6 +157,7 @@ def make_plan(**overrides: Any) -> dict[str, Any]:
         "total_cost_items": 32,
         "cuisine_preferences": "[]",
         "price_tier": "balanced",
+        "mode": "balanced",
         "created_at": "2026-08-17T09:00:00+03:00",
         "status": "draft",
         "meals": [],

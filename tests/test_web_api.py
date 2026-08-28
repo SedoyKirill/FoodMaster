@@ -10,16 +10,20 @@ import asyncio
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
     from fastapi.testclient import TestClient
 
+    from app.web import main
+    from app.web import planner as planner_mod
     from app.web.main import create_app
 except ImportError as exc:  # pragma: no cover - окружение без fastapi/httpx
     raise unittest.SkipTest(f"веб-стек недоступен: {exc}") from exc
 
+from app.web.planner import DEFAULT_APPLIANCES  # noqa: E402
 from fakes import FakeRepository, expires_in, make_client  # noqa: E402
 
 
@@ -294,11 +298,18 @@ class InventoryValidationTests(unittest.TestCase):
 
 
 class PlanGenerationTests(unittest.TestCase):
-    """B2/A2 — новый пользователь без техники обязан получить меню."""
+    """Новый пользователь обязан получить меню сразу после регистрации.
 
-    def test_b2_a2_new_user_can_generate_plan_without_appliances(self) -> None:
+    Раньше это обеспечивалось отключением фильтра техники (A2), теперь —
+    базовым набором техники у новой семьи (TZ-M8 §3.3).
+    """
+
+    def test_new_user_gets_default_appliances_and_can_generate_plan(self) -> None:
         client, repository = make_client(self)
-        self.assertEqual(repository.appliances[next(iter(repository.households))], [])
+        self.assertEqual(
+            sorted(repository.appliances[next(iter(repository.households))]),
+            sorted(DEFAULT_APPLIANCES),
+        )
         response = client.post("/api/plans/generate", json={"days": 3, "starts_on": "2026-08-17"})
         self.assertEqual(response.status_code, 201, response.text)
         self.assertEqual(len(response.json()["meals"]), 9)
@@ -501,6 +512,170 @@ class PlanHistoryTests(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
 
 
+class TasteApiTests(unittest.TestCase):
+    """События вкуса, онбординг и сводка (TZ-M8 §4)."""
+
+    def setUp(self) -> None:
+        self.client, self.repository = make_client(self)
+        created = self.client.post(
+            "/api/plans/generate", json={"days": 1, "starts_on": "2026-08-17"}
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        self.plan = self.client.get("/api/plans/latest").json()
+
+    def test_marking_a_meal_cooked_records_a_taste_event(self) -> None:
+        meal = self.plan["meals"][0]
+        response = self.client.patch(
+            f"/api/plans/{self.plan['id']}/meals/{meal['id']}", json={"status": "cooked"}
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "cooked")
+        kinds = [event["kind"] for event in self.repository.taste_events_rows]
+        self.assertIn("cooked", kinds)
+
+    def test_unknown_status_is_rejected(self) -> None:
+        meal = self.plan["meals"][0]
+        response = self.client.patch(
+            f"/api/plans/{self.plan['id']}/meals/{meal['id']}", json={"status": "съели"}
+        )
+        self.assertEqual(response.status_code, 422)
+
+    def test_status_of_a_stranger_meal_is_404(self) -> None:
+        import uuid as uuid_module
+
+        response = self.client.patch(
+            f"/api/plans/{self.plan['id']}/meals/{uuid_module.uuid4()}",
+            json={"status": "skipped"},
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_onboarding_is_offered_to_a_family_without_history(self) -> None:
+        body = self.client.get("/api/taste/onboarding").json()
+        self.assertTrue(body["needed"])
+        self.assertTrue(body["cards"])
+
+    def test_onboarding_answers_become_events(self) -> None:
+        cards = self.client.get("/api/taste/onboarding").json()["cards"]
+        answers = [
+            {"recipe_id": cards[0]["recipe_id"], "liked": True},
+            {"recipe_id": cards[1]["recipe_id"], "liked": False},
+            {"recipe_id": cards[2]["recipe_id"], "liked": None},  # пропуск
+        ]
+        response = self.client.post("/api/taste/onboarding", json={"answers": answers})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["saved"], 2)
+        kinds = [event["kind"] for event in self.repository.taste_events_rows]
+        self.assertIn("onboarding_like", kinds)
+        self.assertIn("onboarding_skip", kinds)
+
+    def test_summary_reports_what_the_family_likes(self) -> None:
+        cards = self.client.get("/api/taste/onboarding").json()["cards"]
+        liked = cards[0]["recipe_id"]
+        self.client.post(
+            "/api/taste/onboarding",
+            json={"answers": [{"recipe_id": liked, "liked": True}]},
+        )
+        summary = self.client.get("/api/taste/summary").json()
+        self.assertEqual(summary["favourite_recipes"][0]["recipe_id"], liked)
+
+    def test_viewer_cannot_answer_onboarding(self) -> None:
+        for household in self.repository.households.values():
+            household["role"] = "viewer"
+        response = self.client.post(
+            "/api/taste/onboarding", json={"answers": [{"recipe_id": 1, "liked": True}]}
+        )
+        self.assertEqual(response.status_code, 403)
+
+
+class PlanProfileApiTests(unittest.TestCase):
+    """Профиль планирования семьи (TZ-M8 §3.4)."""
+
+    def setUp(self) -> None:
+        self.client, self.repository = make_client(self)
+
+    def test_defaults_are_returned_before_first_save(self) -> None:
+        profile = self.client.get("/api/settings/plan-profile").json()
+        self.assertEqual(profile["mode"], "balanced")
+        self.assertEqual(profile["default_days"], 7)
+        # Решение владельца: кухня остаётся жёстким фильтром по умолчанию.
+        self.assertEqual(profile["cuisine_mode"], "only")
+
+    def test_saved_profile_prefills_generation(self) -> None:
+        """План без полей формы собирается по профилю: дни и приёмы оттуда."""
+        saved = self.client.put("/api/settings/plan-profile", json={
+            "mode": "quick", "default_days": 2, "meals": ["breakfast", "dinner"],
+            "cuisines": [], "cuisine_mode": "only",
+        })
+        self.assertEqual(saved.status_code, 200, saved.text)
+        response = self.client.post("/api/plans/generate", json={"starts_on": "2026-08-17"})
+        self.assertEqual(response.status_code, 201, response.text)
+        plan = response.json()
+        self.assertEqual(plan["days"], 2)
+        self.assertEqual(plan["mode"], "quick")
+        self.assertEqual(
+            sorted({meal["meal_type"] for meal in plan["meals"]}), ["breakfast", "dinner"]
+        )
+
+    def test_form_overrides_profile_without_saving_it(self) -> None:
+        self.client.put("/api/settings/plan-profile", json={"default_days": 5})
+        response = self.client.post(
+            "/api/plans/generate", json={"days": 1, "starts_on": "2026-08-17"}
+        )
+        self.assertEqual(response.json()["days"], 1)
+        self.assertEqual(
+            self.client.get("/api/settings/plan-profile").json()["default_days"], 5
+        )
+
+    def test_mode_from_the_form_reaches_the_planner(self) -> None:
+        """Режим — это веса целевой функции (§6.4), а не строчка в ответе.
+
+        Перехват стоит на самом планировщике, а не на обработчике: сборку
+        плана зовёт слой данных, и тот же путь проходит бот (TZ-M7 §2).
+        """
+        seen: dict[str, object] = {}
+        original = planner_mod.build_plan
+
+        def _capture(**kwargs):
+            seen.update(kwargs)
+            return original(**kwargs)
+
+        with mock.patch.object(planner_mod, "build_plan", _capture):
+            response = self.client.post(
+                "/api/plans/generate",
+                json={"days": 1, "starts_on": "2026-08-17", "mode": "economy"},
+            )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(seen["mode"], "economy")
+        # economy заодно переключает ценовую стратегию матчера товаров.
+        self.assertEqual(seen["price_tier"], "economy")
+
+    def test_weekly_budget_scales_to_horizon(self) -> None:
+        self.client.put("/api/settings/plan-profile", json={"weekly_budget_kop": 700000})
+        response = self.client.post(
+            "/api/plans/generate", json={"days": 1, "starts_on": "2026-08-17"}
+        )
+        self.assertEqual(response.json()["budget_kop"], 100000)
+
+    def test_two_week_horizon_is_accepted(self) -> None:
+        response = self.client.post(
+            "/api/plans/generate", json={"days": 14, "starts_on": "2026-08-17"}
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json()["days"], 14)
+
+    def test_horizon_over_two_weeks_is_rejected(self) -> None:
+        response = self.client.post(
+            "/api/plans/generate", json={"days": 15, "starts_on": "2026-08-17"}
+        )
+        self.assertEqual(response.status_code, 422)
+
+    def test_editor_cannot_save_plan_profile(self) -> None:
+        for household in self.repository.households.values():
+            household["role"] = "editor"
+        response = self.client.put("/api/settings/plan-profile", json={"mode": "economy"})
+        self.assertEqual(response.status_code, 403)
+
+
 class SettingsPeopleApiTests(unittest.TestCase):
     """A4 — люди не пересоздаются, редактируются по одному."""
 
@@ -528,6 +703,57 @@ class SettingsPeopleApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["target_kcal"], 2100)
+
+    def test_person_profile_fields_survive_save(self) -> None:
+        """TZ-M8 §3.1: мерки, цель и «ест дома» доходят до хранилища."""
+        person_id = self._people()[0]["id"]
+        payload = {
+            "household_name": "Моя семья",
+            "people": [{
+                "id": person_id, "name": "Иван", "sex": "male",
+                "birth_date": "1990-05-01", "height_cm": 180, "weight_kg": 80,
+                "activity": "high", "goal": "lose",
+                "eats_meals": ["breakfast", "dinner"],
+            }],
+        }
+        self.assertEqual(self.client.put("/api/settings", json=payload).status_code, 200)
+        saved = self._people()[0]
+        self.assertEqual(saved["sex"], "male")
+        self.assertEqual(saved["goal"], "lose")
+        self.assertEqual(saved["eats_meals"], ["breakfast", "dinner"])
+
+    def test_person_target_shows_how_it_was_calculated(self) -> None:
+        """Норма едока приходит с пометкой источника (manual/formula/default)."""
+        person_id = self._people()[0]["id"]
+        self.client.patch(f"/api/settings/people/{person_id}", json={"target_kcal": 2100})
+        response = self.client.get(f"/api/settings/people/{person_id}/target")
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["kcal"], 2100)
+        self.assertEqual(body["target_source"], "manual")
+        self.assertEqual(sum(body["by_meal"].values()), 2100)
+
+    def test_person_target_404_for_stranger(self) -> None:
+        import uuid as uuid_module
+
+        response = self.client.get(f"/api/settings/people/{uuid_module.uuid4()}/target")
+        self.assertEqual(response.status_code, 404)
+
+    def test_rule_can_belong_to_one_person(self) -> None:
+        """TZ-M8 §3.2: правило с person_id и diet_tag сохраняется как есть."""
+        person_id = self._people()[0]["id"]
+        payload = {
+            "household_name": "Моя семья",
+            "people": [{"id": person_id, "name": "Иван"}],
+            "dietary_rules": [{
+                "rule_type": "allergy", "term": "орехи", "is_hard": True,
+                "person_id": person_id, "diet_tag": "vegetarian",
+            }],
+        }
+        self.assertEqual(self.client.put("/api/settings", json=payload).status_code, 200)
+        rule = self.client.get("/api/me").json()["dietary_rules"][0]
+        self.assertEqual(str(rule["person_id"]), person_id)
+        self.assertEqual(rule["diet_tag"], "vegetarian")
 
     def test_a4_patch_person_forbidden_for_editor(self) -> None:
         person_id = self._people()[0]["id"]

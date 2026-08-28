@@ -6,9 +6,10 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
+from zoneinfo import ZoneInfo
 
 from fastapi import (
     APIRouter, Cookie, Depends, FastAPI, Header, HTTPException, Request, Response, status,
@@ -22,13 +23,18 @@ from .database import (
 )
 from .payloads import (
     EXPIRED_TEXT, STORAGE_AREAS, UNIT_CODES, UNKNOWN_STORAGE_TEXT,
-    UNKNOWN_UNIT_TEXT, AuthPayload, InventoryPayload,
-    PasswordPayload, PersonPatchPayload, PersonPayload, PlanPayload,
-    PurchasePayload, RatingPayload, ReplaceMealPayload, ReviewPayload,
-    RulePayload, SettingsPayload, TelegramLoginPayload,
+    UNKNOWN_UNIT_TEXT, AuthPayload, InventoryPayload, MealStatusPayload,
+    OnboardingPayload, PasswordPayload, PersonPatchPayload, PersonPayload,
+    PlanPayload, PlanProfilePayload, PurchasePayload, RatingPayload,
+    ReplaceMealPayload, ReviewPayload, RulePayload, SettingsPayload,
+    TelegramLoginPayload,
 )
 from .ratelimit import RateLimiter
 
+
+#: час ночного пересчёта вкуса — после сбора каталога Ленты (TZ-M8 §4.2)
+TASTE_REFRESH_HOUR = 4
+TIMEZONE = ZoneInfo(os.getenv("LENTA_TIMEZONE", "Europe/Moscow"))
 
 SESSION_COOKIE = "ration_session"
 CSRF_COOKIE = "ration_csrf"
@@ -360,7 +366,8 @@ async def delete_inventory(item_id: uuid.UUID, repo: Repo, session: Mutating) ->
 async def generate_plan(payload: PlanPayload, repo: Repo, session: Mutating) -> dict[str, Any]:
     budget_kop = int(payload.budget_rub * 100) if payload.budget_rub is not None else None
     try:
-        # Сборка живёт в слое данных: тот же вызов делает бот (TZ-M7 §2).
+        # Сборка живёт в слое данных: тот же вызов делает бот (TZ-M7 §2), а
+        # профиль семьи подставляет незаполненные поля формы (TZ-M8 §3.4).
         return await repo.create_plan(
             session,
             starts_on=payload.starts_on,
@@ -368,6 +375,9 @@ async def generate_plan(payload: PlanPayload, repo: Repo, session: Mutating) -> 
             budget_kop=budget_kop,
             cuisines=payload.cuisines,
             price_tier=payload.price_tier,
+            mode=payload.mode,
+            meals=payload.meals,
+            allow_leftovers=payload.allow_leftovers,
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -415,6 +425,51 @@ async def replace_plan_meal(
     return result
 
 
+@router.patch("/api/plans/{plan_id}/meals/{meal_id}")
+async def set_meal_status(
+    plan_id: uuid.UUID,
+    meal_id: uuid.UUID,
+    payload: MealStatusPayload,
+    repo: Repo,
+    session: Mutating,
+) -> dict[str, Any]:
+    """«Приготовили» / «Пропустили» — событие вкуса (TZ-M8 §4.1)."""
+    try:
+        updated = await repo.set_meal_status(session, plan_id, meal_id, payload.status)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not updated:
+        raise HTTPException(status_code=404, detail="План или приём пищи не найден")
+    return updated
+
+
+@router.get("/api/taste/onboarding")
+async def taste_onboarding(repo: Repo, session: Session) -> dict[str, Any]:
+    """Карточки «что вы любите» для семьи без истории (TZ-M8 §4.4)."""
+    return await repo.taste_onboarding(session)
+
+
+@router.post("/api/taste/onboarding")
+async def save_taste_onboarding(
+    payload: OnboardingPayload, repo: Repo, session: Mutating
+) -> dict[str, Any]:
+    try:
+        saved = await repo.save_taste_onboarding(
+            session, [answer.model_dump() for answer in payload.answers]
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return {"saved": saved}
+
+
+@router.get("/api/taste/summary")
+async def taste_summary(repo: Repo, session: Session) -> dict[str, Any]:
+    """Что семья любит и что не ест — экран «Вкусы семьи» и бот."""
+    return await repo.taste_summary(session)
+
+
 @router.delete("/api/plans/{plan_id}")
 async def delete_plan(plan_id: uuid.UUID, repo: Repo, session: Mutating) -> dict[str, Any]:
     try:
@@ -457,6 +512,31 @@ async def patch_person(
     if not updated:
         raise HTTPException(status_code=404, detail="Человек не найден")
     return updated
+
+
+@router.get("/api/settings/plan-profile")
+async def get_plan_profile(repo: Repo, session: Session) -> dict[str, Any]:
+    """Как эта семья планирует меню (TZ-M8 §3.4)."""
+    return await repo.plan_profile(session)
+
+
+@router.put("/api/settings/plan-profile")
+async def put_plan_profile(
+    payload: PlanProfilePayload, repo: Repo, session: Mutating
+) -> dict[str, Any]:
+    try:
+        return await repo.save_plan_profile(session, payload.model_dump())
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@router.get("/api/settings/people/{person_id}/target")
+async def person_target(person_id: uuid.UUID, repo: Repo, session: Session) -> dict[str, Any]:
+    """Норма едока и то, как она посчитана (TZ-M8 §3.1)."""
+    target = await repo.person_target(session, person_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Человек не найден")
+    return target
 
 
 @router.post("/api/telegram/link-token", status_code=201)
@@ -531,6 +611,29 @@ async def keep_planner_warm(warm_up: Any) -> None:
         await asyncio.sleep(PLANNER_WARM_INTERVAL_SECONDS)
 
 
+async def refresh_taste_nightly(refresh: Any, sleep: Any = asyncio.sleep) -> None:
+    """Ночной пересчёт аффинити по всем семьям (TZ-M8 §4.2).
+
+    Инкремент при каждом событии дал бы почти тот же результат дешевле, но
+    затухание со временем меняет оценки и без новых событий: раз в сутки
+    модель приводится в соответствие с календарём. Час выбран после ночного
+    сбора каталога, чтобы тяжёлые задачи не встречались.
+    """
+    while True:
+        now = datetime.now(TIMEZONE)
+        target = now.replace(hour=TASTE_REFRESH_HOUR, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await sleep(max(1.0, (target - now).total_seconds()))
+        try:
+            updated = await refresh()
+            print(f"taste refresh: {updated} affinities", flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - пересчёт не критичен
+            print(f"taste refresh failed: {error!r}", flush=True)
+
+
 def create_app(repository: Any | None = None) -> FastAPI:
     """Собирает приложение. ``repository=None`` — рабочий режим с Postgres.
 
@@ -546,12 +649,20 @@ def create_app(repository: Any | None = None) -> FastAPI:
         if owns_repository:
             await repo.connect()
         warm_up = getattr(repo, "warm_planner_caches", None)
-        warm_task = asyncio.create_task(keep_planner_warm(warm_up)) if warm_up else None
+        refresh_taste = getattr(repo, "refresh_all_taste_affinities", None)
+        tasks = [
+            asyncio.create_task(coroutine)
+            for coroutine in (
+                keep_planner_warm(warm_up) if warm_up else None,
+                refresh_taste_nightly(refresh_taste) if refresh_taste else None,
+            )
+            if coroutine is not None
+        ]
         yield
-        if warm_task is not None:
-            warm_task.cancel()
+        for task in tasks:
+            task.cancel()
             with suppress(asyncio.CancelledError):
-                await warm_task
+                await task
         if owns_repository:
             await repo.close()
 

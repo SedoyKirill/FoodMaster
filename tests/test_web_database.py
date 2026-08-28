@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import secrets
 import sys
@@ -98,6 +99,67 @@ class AffectedRowsTests(unittest.TestCase):
         import asyncio
 
         return asyncio.run(coro)
+
+
+class RegistrationDefaultsTests(unittest.TestCase):
+    """TZ-M8 §3.3: новая семья заводится с базовым набором техники.
+
+    Фильтр по технике больше не отключается при пустом списке, поэтому без
+    этого набора первый же план у нового пользователя был бы пуст.
+    """
+
+    def test_register_grants_default_appliances(self) -> None:
+        pool = FakePool()
+        repository = repository_with_pool(pool)
+        with mock.patch.object(
+            db_module.AppRepository, "create_session",
+            new=mock.AsyncMock(return_value=("session", "csrf")),
+        ):
+            asyncio.run(repository.register("hozyain", "parol-parol", "Моя семья"))
+        _sql, args = pool.first_matching("INSERT INTO app_core.appliances")
+        codes = sorted(code for _household, code in args[0])
+        self.assertEqual(codes, sorted(db_module.DEFAULT_APPLIANCES))
+
+
+class PlanProfileRepositoryTests(unittest.TestCase):
+    """Профиль планирования: UPSERT одной записью, дефолты без записи."""
+
+    def test_missing_profile_falls_back_to_defaults(self) -> None:
+        pool = FakePool()
+        profile = asyncio.run(repository_with_pool(pool).plan_profile(SESSION))
+        self.assertEqual(profile, db_module.DEFAULT_PLAN_PROFILE)
+
+    def test_stored_profile_overrides_defaults(self) -> None:
+        pool = FakePool().on(
+            "fetchrow", "FROM app_core.household_plan_profiles",
+            {
+                "mode": "economy", "default_days": 14, "weekly_budget_kop": 500000,
+                "cuisines": '["italian"]', "cuisine_mode": "prefer",
+                "weekday_max_minutes": 30, "weekend_max_minutes": None,
+                "breakfast_max_minutes": 20, "meals": '["lunch","dinner"]',
+                "allow_leftovers": False, "novelty": "high",
+                "max_repeats_per_horizon": 3,
+            },
+        )
+        profile = asyncio.run(repository_with_pool(pool).plan_profile(SESSION))
+        self.assertEqual(profile["mode"], "economy")
+        self.assertEqual(profile["cuisines"], ["italian"])
+        self.assertEqual(profile["meals"], ["lunch", "dinner"])
+        self.assertIsNone(profile["weekend_max_minutes"])
+
+    def test_save_uses_single_upsert(self) -> None:
+        pool = FakePool()
+        asyncio.run(
+            repository_with_pool(pool).save_plan_profile(SESSION, {"mode": "variety"})
+        )
+        sql, args = pool.first_matching("INSERT INTO app_core.household_plan_profiles")
+        self.assertIn("ON CONFLICT (household_id) DO UPDATE", sql)
+        self.assertEqual(args[1], "variety")
+
+    def test_viewer_cannot_save_profile(self) -> None:
+        repository = repository_with_pool(FakePool())
+        with self.assertRaises(PermissionError):
+            asyncio.run(repository.save_plan_profile(session(role="viewer"), {}))
 
 
 class LatestPlanTests(unittest.TestCase):
@@ -325,7 +387,8 @@ class CuisinePoolTests(unittest.TestCase):
         repository = repository_with_pool(pool)
         run_async(repository.planner_recipe_pool(["asian"]))
         sql, args = pool.first_matching("FROM recipe_library.recipes r")
-        self.assertIn("cuisine_code = ANY", sql)
+        # У рецепта несколько кухонь (TZ-M8): окно добирает по пересечению.
+        self.assertIn("jsonb_exists_any(r.cuisine_codes", sql)
         self.assertIn(["asian"], args)
 
     def test_planner_data_passes_cuisines_to_the_pool(self) -> None:
@@ -362,7 +425,8 @@ class MealReplacementTests(unittest.TestCase):
     def _alternatives(self) -> list[dict]:
         pool = FakePool()
         pool.on("fetchrow", "FROM app_core.meal_plans", {
-            "id": self.PLAN_ID, "price_tier": "balanced", "cuisine_preferences": "[]",
+            "id": self.PLAN_ID, "price_tier": "balanced", "mode": "balanced",
+            "cuisine_preferences": "[]",
         })
         pool.on("fetch", "FROM app_core.plan_meals", [{
             "id": self.MEAL_ID, "meal_date": date(2026, 8, 20), "meal_type": "lunch",

@@ -781,3 +781,115 @@
   cursor: default;
   opacity: 0.3;
 }
+
+/* --- TZ-M8: причины выбора, отметки готовки, вкусы семьи ------------------ */
+
+/* «Почему это блюдо» (§5): три строки под названием. Список, а не абзац —
+   причины независимы, и читать их надо по одной. */
+.slot__reasons {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 2px 0 0;
+  padding: 0;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.slot__reasons li::before {
+  content: "— ";
+}
+
+/* «Приготовили / пропустили» стоит рядом с «Заменить», но отделено: это
+   отметка о прошлом, а не действие над планом. */
+.slot__status {
+  display: inline-flex;
+  gap: var(--space-2);
+  align-items: center;
+  margin-inline-start: auto;
+}
+
+.swap-option__why {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  text-align: right;
+}
+
+.person-card__meals,
+.person-card__target {
+  grid-column: 1 / -1;
+}
+
+.person-card__target {
+  margin: 0;
+}
+
+.taste-cards {
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: var(--space-3);
+  margin: var(--space-3) 0;
+  padding: 0;
+}
+
+.taste-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.taste-card__title {
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.taste-card__choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-block-start: auto;
+}
+
+/* Выбранный ответ подсвечивается рамкой: три кнопки в ряд, и без отметки
+   непонятно, что уже нажато. */
+.taste-card__choices .btn[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.taste-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.taste-groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--space-4);
+}
+
+.taste-group h3 {
+  font-size: var(--text-sm);
+  margin: 0 0 var(--space-2);
+}
+
+.taste-list {
+  list-style: none;
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+}
+
+.taste-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+}

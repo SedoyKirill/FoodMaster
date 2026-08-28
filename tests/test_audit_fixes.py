@@ -16,6 +16,7 @@ from fakes import FakePool, repository_with_pool
 from fixtures import make_ingredient, make_person, make_recipe
 
 from app.web.planner import _meal_nutrition, build_plan
+from app.web.planning import optimizer as optimizer_mod
 from app.web.planning.candidates import Synonyms, score_candidates
 
 
@@ -59,7 +60,7 @@ class K1MedianImputationTests(unittest.TestCase):
             meal_types=["dinner"], cuisines=[], rules=[], inventory=[],
             starts_on=date(2026, 8, 18), synonyms=Synonyms(), normal=_normal,
             tokens=_tokens,
-            cost_hint=lambda ing: (
+            cost_hint=lambda ing, needed, unit: (
                 10_000 if str(ing.get("normalized_name", "")).startswith("продукт") else None
             ),
             meal_score=lambda recipe, meal_type: 0,
@@ -90,7 +91,7 @@ class K2SolverKcalScaleTests(unittest.TestCase):
 
         def spy_optimize(**kwargs):
             captured["scores"] = kwargs["scores"]
-            return {}, "greedy"
+            return optimizer_mod.Solution(assignment={}, status="greedy")
 
         with patch("app.web.planning.optimizer.optimize", side_effect=spy_optimize):
             build_plan(

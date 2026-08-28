@@ -14,9 +14,13 @@ from typing import Any
 import asyncpg
 
 from .payloads import PRICE_TIERS, UNKNOWN_TIER_TEXT
+from .planning.weights import price_tier_for
+from .planning.context import HISTORY_WINDOW_DAYS
+from .planning.profile import MEAL_TYPES, daily_target
+from .planning.taste import TasteModel, build_metas, event_value
 from .planner import (
-    ProductMatcher, ProductMatcherCache, _base_quantity, build_plan, clean_dish_title,
-    warm_product_matcher,
+    DEFAULT_APPLIANCES, ProductMatcher, ProductMatcherCache, _base_quantity,
+    build_plan, clean_dish_title, warm_product_matcher,
 )
 from .security import hash_password, new_token, token_hash, validate_login, verify_password
 
@@ -32,6 +36,12 @@ PLANNER_RECIPE_LIMIT = 500
 PLANNER_CUISINE_LIMIT = 300
 # Сколько альтернатив показывает «Заменить» (десять с прокруткой, TZ-фидбэк).
 MEAL_ALTERNATIVES_LIMIT = 10
+#: сколько событий вкуса читается для модели — года истории с запасом хватает
+TASTE_EVENTS_LIMIT = 5000
+#: сколько частых пар «кухня + тип блюда» показывает онбординг
+ONBOARDING_PAIRS = 10
+#: до скольких событий семья считается новой и ей предлагается онбординг
+ONBOARDING_MIN_EVENTS = 10
 PRODUCT_MATCHER_TTL_SECONDS = 600.0
 # N1: раз в 5 минут планировщик «разминается» в фоне — держит горячими кэш
 # Postgres и мемоизацию матчера. Иначе первая после простоя сборка меню
@@ -103,6 +113,19 @@ def _as_uuid(value: Any) -> uuid.UUID | None:
         return None
 
 
+#: поля человека, которые в БД лежат как JSONB
+PERSON_JSON_FIELDS = frozenset({"meal_shares", "eats_meals"})
+#: словари «код → допустимые значения» для полей профиля (TZ-M8 §3.1)
+PERSON_ENUMS = {
+    "sex": ({"female", "male"}, None),
+    "activity": ({"low", "moderate", "high"}, "moderate"),
+    "goal": ({"maintain", "lose", "gain"}, "maintain"),
+}
+PERSON_NUMERIC_FIELDS = frozenset(
+    {"height_cm", "weight_kg", "protein_share", "fat_share", "carb_share"}
+)
+
+
 def _coerce_person_field(field: str, value: Any) -> Any:
     if field == "name":
         return str(value or "")[:80]
@@ -110,7 +133,59 @@ def _coerce_person_field(field: str, value: Any) -> Any:
         return "child" if value == "child" else "adult"
     if field == "portion_factor":
         return Decimal(str(value))
+    if field in PERSON_ENUMS:
+        allowed, fallback = PERSON_ENUMS[field]
+        return str(value) if value in allowed else fallback
+    if field in PERSON_NUMERIC_FIELDS:
+        return None if value in (None, "") else Decimal(str(value))
+    if field == "birth_date":
+        if isinstance(value, date) or value is None:
+            return value
+        try:
+            return date.fromisoformat(str(value))
+        except ValueError:
+            return None
+    if field in PERSON_JSON_FIELDS:
+        return json.dumps(value, ensure_ascii=False) if value is not None else None
     return value
+
+
+def _person_profile_values(person: dict[str, Any]) -> tuple[Any, ...]:
+    """Поля профиля едока в порядке колонок ``app_core.people`` (TZ-M8 §3.1)."""
+    values = [
+        _coerce_person_field(field, person.get(field))
+        for field in (
+            "birth_date", "sex", "height_cm", "weight_kg", "activity", "goal",
+            "protein_share", "fat_share", "carb_share", "meal_shares", "eats_meals",
+        )
+    ]
+    if values[-1] is None:  # eats_meals NOT NULL: не указано — ест дома всё
+        values[-1] = json.dumps(list(MEAL_TYPES), ensure_ascii=False)
+    return tuple(values)
+
+
+#: Значения профиля планирования по умолчанию (TZ-M8 §3.4). Держатся рядом с
+#: репозиторием, чтобы семья без сохранённого профиля и семья со свежей
+#: записью планировались одинаково.
+DEFAULT_PLAN_PROFILE: dict[str, Any] = {
+    "mode": "balanced",
+    "default_days": 7,
+    "weekly_budget_kop": None,
+    "cuisines": [],
+    # Кухня — жёсткий фильтр (решение владельца 28.08.2026); 'prefer' мягче.
+    "cuisine_mode": "only",
+    "weekday_max_minutes": 45,
+    "weekend_max_minutes": None,
+    "breakfast_max_minutes": 25,
+    "meals": ["breakfast", "lunch", "dinner"],
+    "allow_leftovers": True,
+    "novelty": "medium",
+    "max_repeats_per_horizon": 2,
+}
+#: поля профиля, у которых NULL — осмысленное значение («без лимита»)
+PLAN_PROFILE_NULLABLE = frozenset(
+    {"weekly_budget_kop", "weekday_max_minutes", "weekend_max_minutes", "breakfast_max_minutes"}
+)
 
 
 class AppRepository:
@@ -226,6 +301,13 @@ class AppRepository:
                         str(telegram_user_id),
                         user_id,
                     )
+                # TZ-M8 §3.3: фильтр по технике работает всегда, поэтому семья
+                # заводится с набором, который есть почти у всех, — иначе
+                # первый же план оказался бы без единого блюда.
+                await connection.executemany(
+                    "INSERT INTO app_core.appliances (household_id, appliance_code) VALUES ($1, $2)",
+                    [(household_id, code) for code in DEFAULT_APPLIANCES],
+                )
                 await self._audit(
                     connection, household_id, user_id, "user.registered", "user", user_id,
                     channel=channel,
@@ -327,7 +409,9 @@ class AppRepository:
         household_id = session["household_id"]
         people = await self.db().fetch(
             """
-            SELECT id, name, person_type, target_kcal, portion_factor
+            SELECT id, name, person_type, target_kcal, portion_factor,
+                   birth_date, sex, height_cm, weight_kg, activity, goal,
+                   protein_share, fat_share, carb_share, meal_shares, eats_meals
             FROM app_core.people WHERE household_id=$1 ORDER BY position, created_at
             """,
             household_id,
@@ -338,7 +422,7 @@ class AppRepository:
         )
         rules = await self.db().fetch(
             """
-            SELECT id, rule_type, term, is_hard
+            SELECT id, rule_type, term, is_hard, person_id, diet_tag
             FROM app_core.dietary_rules WHERE household_id=$1 ORDER BY rule_type, term
             """,
             household_id,
@@ -404,26 +488,34 @@ class AppRepository:
                 portion_factor = Decimal(str(
                     person.get("portion_factor") or ("0.65" if person_type == "child" else "1")
                 ))
+                extra = _person_profile_values(person)
                 if person_id in existing:
                     await connection.execute(
                         """
                         UPDATE app_core.people
-                        SET name=$3, person_type=$4, target_kcal=$5, portion_factor=$6, position=$7
+                        SET name=$3, person_type=$4, target_kcal=$5, portion_factor=$6,
+                            position=$7, birth_date=$8, sex=$9, height_cm=$10,
+                            weight_kg=$11, activity=$12, goal=$13, protein_share=$14,
+                            fat_share=$15, carb_share=$16, meal_shares=$17::jsonb,
+                            eats_meals=$18::jsonb
                         WHERE id=$1 AND household_id=$2
                         """,
                         person_id, household_id, name, person_type,
-                        person.get("target_kcal"), portion_factor, position,
+                        person.get("target_kcal"), portion_factor, position, *extra,
                     )
                 else:
                     person_id = uuid.uuid4()
                     await connection.execute(
                         """
                         INSERT INTO app_core.people (
-                            id, household_id, name, person_type, target_kcal, portion_factor, position
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                            id, household_id, name, person_type, target_kcal,
+                            portion_factor, position, birth_date, sex, height_cm,
+                            weight_kg, activity, goal, protein_share, fat_share,
+                            carb_share, meal_shares, eats_meals
+                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18::jsonb)
                         """,
                         person_id, household_id, name, person_type,
-                        person.get("target_kcal"), portion_factor, position,
+                        person.get("target_kcal"), portion_factor, position, *extra,
                     )
                 keep.append(person_id)
             await connection.execute(
@@ -436,25 +528,40 @@ class AppRepository:
                 [(household_id, code) for code in sorted(set(appliances))],
             )
             await connection.execute("DELETE FROM app_core.dietary_rules WHERE household_id=$1", household_id)
+            kept_people = set(keep)
             for rule in rules:
                 term = str(rule.get("term") or "").strip().casefold()
                 if not term:
                     continue
+                # Правило нового человека приходит без сохранённого id: пока он
+                # не сохранён, правило считается семейным — терять аллергию
+                # из-за порядка сохранения нельзя (TZ-M8 §3.2).
+                person_ref = _as_uuid(rule.get("person_id"))
+                if person_ref not in kept_people:
+                    person_ref = None
+                diet_tag = str(rule.get("diet_tag") or "").strip().casefold() or None
                 await connection.execute(
                     """
-                    INSERT INTO app_core.dietary_rules (id, household_id, rule_type, term, is_hard)
-                    VALUES ($1, $2, $3, $4, $5)
+                    INSERT INTO app_core.dietary_rules (
+                        id, household_id, rule_type, term, is_hard, person_id, diet_tag
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
                     """,
                     uuid.uuid4(),
                     household_id,
                     rule.get("rule_type") if rule.get("rule_type") in {"allergy", "intolerance", "exclude", "dislike"} else "exclude",
                     term[:100],
                     bool(rule.get("is_hard", True)),
+                    person_ref,
+                    diet_tag[:40] if diet_tag else None,
                 )
             await self._audit(connection, household_id, session["user_id"], "settings.updated", "household", household_id)
 
     #: колонки, которые можно менять через PATCH — имя колонки никогда не приходит извне
-    PERSON_PATCH_COLUMNS = ("name", "person_type", "target_kcal", "portion_factor")
+    PERSON_PATCH_COLUMNS = (
+        "name", "person_type", "target_kcal", "portion_factor", "birth_date",
+        "sex", "height_cm", "weight_kg", "activity", "goal", "protein_share",
+        "fat_share", "carb_share", "meal_shares", "eats_meals",
+    )
 
     async def update_person(
         self, session: dict[str, Any], person_id: uuid.UUID, changes: dict[str, Any]
@@ -468,14 +575,17 @@ class AppRepository:
             if field not in changes:
                 continue
             args.append(_coerce_person_field(field, changes[field]))
-            assignments.append(f"{field} = ${len(args)}")
+            cast = "::jsonb" if field in PERSON_JSON_FIELDS else ""
+            assignments.append(f"{field} = ${len(args)}{cast}")
         if not assignments:
             raise ValueError("Нечего изменять")
         row = await self.db().fetchrow(
             f"""
             UPDATE app_core.people SET {', '.join(assignments)}
             WHERE id=$1 AND household_id=$2
-            RETURNING id, name, person_type, target_kcal, portion_factor, position
+            RETURNING id, name, person_type, target_kcal, portion_factor, position,
+                      birth_date, sex, height_cm, weight_kg, activity, goal,
+                      protein_share, fat_share, carb_share, meal_shares, eats_meals
             """,
             *args,
         )
@@ -607,6 +717,103 @@ class AppRepository:
         await self.audit(session, "settings.rule_removed", "dietary_rule", rule_id)
         return True
 
+    async def person_target(
+        self, session: dict[str, Any], person_id: uuid.UUID, on_date: date | None = None
+    ) -> dict[str, Any] | None:
+        """Норма едока с пометкой, как она получена (TZ-M8 §3.1).
+
+        Пользователь должен видеть, посчитана норма по мерках, взята из его
+        ручной цели или подставлена константой — иначе «2000 ккал» выглядят
+        как медицинское заключение.
+        """
+        row = await self.db().fetchrow(
+            """
+            SELECT id, name, person_type, target_kcal, portion_factor, birth_date,
+                   sex, height_cm, weight_kg, activity, goal, protein_share,
+                   fat_share, carb_share, meal_shares, eats_meals
+            FROM app_core.people WHERE id=$1 AND household_id=$2
+            """,
+            person_id, session["household_id"],
+        )
+        if not row:
+            return None
+        person = row_dict(row)
+        target = daily_target(person, on_date or date.today())
+        return {
+            "person_id": str(person["id"]),
+            "name": person["name"],
+            "kcal": target.kcal,
+            "protein_g": target.protein_g,
+            "fat_g": target.fat_g,
+            "carb_g": target.carb_g,
+            "by_meal": target.by_meal,
+            "target_source": target.source,
+        }
+
+    #: колонки профиля планирования (TZ-M8 §3.4); имена в SQL не приходят извне
+    PLAN_PROFILE_COLUMNS = (
+        "mode", "default_days", "weekly_budget_kop", "cuisines", "cuisine_mode",
+        "weekday_max_minutes", "weekend_max_minutes", "breakfast_max_minutes",
+        "meals", "allow_leftovers", "novelty", "max_repeats_per_horizon",
+    )
+    PLAN_PROFILE_JSON_COLUMNS = frozenset({"cuisines", "meals"})
+
+    async def plan_profile(self, session: dict[str, Any]) -> dict[str, Any]:
+        """Профиль планирования семьи; без записи — значения по умолчанию."""
+        row = await self.db().fetchrow(
+            f"""
+            SELECT {', '.join(self.PLAN_PROFILE_COLUMNS)}
+            FROM app_core.household_plan_profiles WHERE household_id=$1
+            """,
+            session["household_id"],
+        )
+        profile = dict(DEFAULT_PLAN_PROFILE)
+        if row:
+            stored = row_dict(row)
+            for column in self.PLAN_PROFILE_COLUMNS:
+                value = stored.get(column)
+                if column in self.PLAN_PROFILE_JSON_COLUMNS:
+                    value = _json_column(value)
+                if value is not None or column in PLAN_PROFILE_NULLABLE:
+                    profile[column] = value
+        return profile
+
+    async def save_plan_profile(
+        self, session: dict[str, Any], changes: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Сохраняет профиль целиком (UPSERT): форма присылает все поля."""
+        if session["role"] not in {"owner", "admin"}:
+            raise PermissionError("Недостаточно прав для изменения настроек")
+        profile = {**DEFAULT_PLAN_PROFILE, **{
+            key: value for key, value in changes.items()
+            if key in self.PLAN_PROFILE_COLUMNS
+        }}
+        values = [
+            json.dumps(profile[column], ensure_ascii=False)
+            if column in self.PLAN_PROFILE_JSON_COLUMNS
+            else profile[column]
+            for column in self.PLAN_PROFILE_COLUMNS
+        ]
+        placeholders = ", ".join(
+            f"${index + 2}" + ("::jsonb" if column in self.PLAN_PROFILE_JSON_COLUMNS else "")
+            for index, column in enumerate(self.PLAN_PROFILE_COLUMNS)
+        )
+        assignments = ", ".join(
+            f"{column}=EXCLUDED.{column}" for column in self.PLAN_PROFILE_COLUMNS
+        )
+        await self.db().execute(
+            f"""
+            INSERT INTO app_core.household_plan_profiles (
+                household_id, {', '.join(self.PLAN_PROFILE_COLUMNS)}
+            ) VALUES ($1, {placeholders})
+            ON CONFLICT (household_id) DO UPDATE
+            SET {assignments}, updated_at=CURRENT_TIMESTAMP
+            """,
+            session["household_id"], *values,
+        )
+        await self.audit(session, "settings.plan_profile_updated", "household", session["household_id"])
+        return profile
+
     async def dashboard(self, session: dict[str, Any]) -> dict[str, Any]:
         household_id = session["household_id"]
         row = await self.db().fetchrow(
@@ -657,7 +864,8 @@ class AppRepository:
             """
             SELECT r.id, r.title, r.source_page_start, r.source_page_end,
                    r.source_servings_min, r.source_servings_max, r.source_yield_text,
-                   r.cuisine_code, r.dish_type, r.meal_types, r.diet_tags, r.appliances,
+                   r.cuisine_code, r.cuisine_codes, r.dish_type, r.meal_types,
+                   r.diet_tags, r.appliances,
                    r.review_status, r.ingredient_count, r.step_count,
                    r.time_total_minutes, r.extraction_confidence,
                    ARRAY(
@@ -671,7 +879,7 @@ class AppRepository:
             FROM recipe_library.recipes r
             WHERE r.review_status <> 'rejected'
               AND ($1 = '' OR r.title ILIKE '%' || $1 || '%')
-              AND ($2 = '' OR r.cuisine_code=$2)
+              AND ($2 = '' OR jsonb_exists(r.cuisine_codes, $2))
               AND ($3 = '' OR r.meal_types ? $3 OR r.meal_types='[]'::jsonb)
               AND ($4 = FALSE OR r.review_status = 'ready')
               AND ($7 = '' OR r.dish_type=$7)
@@ -714,9 +922,11 @@ class AppRepository:
         """
         cuisines = await self.db().fetch(
             """
-            SELECT DISTINCT cuisine_code FROM recipe_library.recipes
-            WHERE review_status <> 'rejected' AND cuisine_code IS NOT NULL
-            ORDER BY cuisine_code
+            SELECT DISTINCT code AS cuisine_code
+            FROM recipe_library.recipes r,
+                 LATERAL jsonb_array_elements_text(r.cuisine_codes) AS code
+            WHERE r.review_status <> 'rejected'
+            ORDER BY code
             """
         )
         meal_types = await self.db().fetch(
@@ -776,7 +986,7 @@ class AppRepository:
             """
             SELECT r.id, r.title, r.source_page_start, r.source_page_end,
                    r.source_servings_min, r.source_servings_max, r.source_yield_text,
-                   r.cuisine_code, r.meal_types, r.diet_tags, r.appliances,
+                   r.cuisine_code, r.cuisine_codes, r.meal_types, r.diet_tags, r.appliances,
                    r.review_status, r.review_reasons, r.ingredient_count, r.step_count,
                    r.time_total_minutes, r.extraction_confidence
             FROM recipe_library.recipes r
@@ -878,8 +1088,44 @@ class AppRepository:
                 """,
                 session["household_id"], recipe_id, int(rating), session["user_id"],
             )
+        if rating is None:
+            # Снятие оценки убирает и её след: «передумали» — не мнение.
+            await self.db().execute(
+                """
+                DELETE FROM app_core.taste_events
+                WHERE household_id=$1 AND recipe_id=$2 AND kind='rated'
+                """,
+                session["household_id"], recipe_id,
+            )
+        else:
+            await self.record_taste_event(
+                session, recipe_id, "rated", rating=int(rating)
+            )
         await self.audit(session, "recipe.rated", "recipe", recipe_id, {"rating": rating})
         return {"recipe_id": recipe_id, "my_rating": rating}
+
+    async def record_taste_event(
+        self,
+        session: dict[str, Any],
+        recipe_id: int,
+        kind: str,
+        *,
+        rating: int | None = None,
+        person_id: uuid.UUID | None = None,
+        channel: str = "web",
+        connection: Any = None,
+    ) -> None:
+        """Факт из жизни семьи, который учит планировщик (TZ-M8 §4.1)."""
+        executor = connection or self.db()
+        await executor.execute(
+            """
+            INSERT INTO app_core.taste_events (
+                household_id, person_id, recipe_id, kind, value, channel
+            ) VALUES ($1,$2,$3,$4,$5,$6)
+            """,
+            session["household_id"], person_id, int(recipe_id), kind,
+            event_value(kind, rating), channel,
+        )
 
     async def list_products(
         self,
@@ -1063,8 +1309,9 @@ class AppRepository:
             """
             WITH picked AS (
                 SELECT r.id, r.title, r.source_page_start, r.source_servings_min,
-                       r.cuisine_code, r.meal_types, r.appliances, r.review_status,
-                       r.extraction_confidence, r.dish_type
+                       r.cuisine_code, r.cuisine_codes, r.meal_types, r.appliances,
+                       r.review_status, r.extraction_confidence, r.dish_type,
+                       r.diet_tags, r.time_total_minutes
                 FROM recipe_library.recipes r
                 WHERE r.review_status IN ('ready', 'needs_review')
                   AND r.ingredient_count >= 3
@@ -1075,13 +1322,14 @@ class AppRepository:
             )
             , cuisine_picked AS (
                 SELECT r.id, r.title, r.source_page_start, r.source_servings_min,
-                       r.cuisine_code, r.meal_types, r.appliances, r.review_status,
-                       r.extraction_confidence, r.dish_type
+                       r.cuisine_code, r.cuisine_codes, r.meal_types, r.appliances,
+                       r.review_status, r.extraction_confidence, r.dish_type,
+                       r.diet_tags, r.time_total_minutes
                 FROM recipe_library.recipes r
                 WHERE r.review_status IN ('ready', 'needs_review')
                   AND r.ingredient_count >= 3
                   AND r.step_count >= 1
-                  AND r.cuisine_code = ANY($2::text[])
+                  AND jsonb_exists_any(r.cuisine_codes, $2::text[])
                   AND r.id NOT IN (SELECT id FROM picked)
                 ORDER BY (r.review_status = 'ready') DESC,
                          r.extraction_confidence DESC NULLS LAST, r.id
@@ -1151,19 +1399,53 @@ class AppRepository:
         matcher.warmed = True
         return warmed
 
+    async def plan_history(
+        self, session: dict[str, Any], starts_on: date
+    ) -> list[dict[str, Any]]:
+        """Блюда семьи за окно ротации — из всех планов, не только последнего.
+
+        Без этого «новое меню» повторяло вчерашний ужин: планировщик просто не
+        знал, что семья уже ела (дефект P1).
+        """
+        rows = await self.db().fetch(
+            """
+            SELECT pm.recipe_id, pm.meal_date, r.dish_type
+            FROM app_core.plan_meals pm
+            JOIN app_core.meal_plans mp ON mp.id = pm.plan_id
+            JOIN recipe_library.recipes r ON r.id = pm.recipe_id
+            WHERE mp.household_id = $1
+              AND pm.meal_date >= $2::date - $3::int
+              AND pm.meal_date < $2::date
+            """,
+            session["household_id"], starts_on, HISTORY_WINDOW_DAYS,
+        )
+        return [row_dict(row) for row in rows]
+
     async def planner_data(
-        self, session: dict[str, Any], cuisines: list[str] | None = None
+        self,
+        session: dict[str, Any],
+        cuisines: list[str] | None = None,
+        starts_on: date | None = None,
     ) -> dict[str, Any]:
         household_id = session["household_id"]
         people = [row_dict(row) for row in await self.db().fetch(
-            "SELECT name, person_type, target_kcal, portion_factor FROM app_core.people WHERE household_id=$1 ORDER BY position",
+            """
+            SELECT id, name, person_type, target_kcal, portion_factor,
+                   birth_date, sex, height_cm, weight_kg, activity, goal,
+                   protein_share, fat_share, carb_share, meal_shares, eats_meals
+            FROM app_core.people WHERE household_id=$1 ORDER BY position
+            """,
             household_id,
         )]
         appliances = [row["appliance_code"] for row in await self.db().fetch(
             "SELECT appliance_code FROM app_core.appliances WHERE household_id=$1", household_id
         )]
         rules = [row_dict(row) for row in await self.db().fetch(
-            "SELECT rule_type, term, is_hard FROM app_core.dietary_rules WHERE household_id=$1", household_id
+            """
+            SELECT rule_type, term, is_hard, person_id, diet_tag
+            FROM app_core.dietary_rules WHERE household_id=$1
+            """,
+            household_id,
         )]
         inventory = [dict(row) for row in await self.db().fetch(
             "SELECT name, quantity, unit_code, expires_on FROM app_core.inventory_lots WHERE household_id=$1 AND quantity>0",
@@ -1195,6 +1477,9 @@ class AppRepository:
                     household_id,
                 )
             },
+            "history": await self.plan_history(session, starts_on or date.today()),
+            "plan_profile": await self.plan_profile(session),
+            "taste_events": await self.taste_events(session),
         }
 
     async def ingredient_synonyms(self) -> list[dict[str, Any]]:
@@ -1235,23 +1520,46 @@ class AppRepository:
         session: dict[str, Any],
         *,
         starts_on: date,
-        days: int,
+        days: int | None = None,
         budget_kop: int | None = None,
         cuisines: list[str] | None = None,
-        price_tier: str = "balanced",
+        price_tier: str | None = None,
+        mode: str | None = None,
+        meals: list[str] | None = None,
+        allow_leftovers: bool | None = None,
     ) -> dict[str, Any]:
         """Собрать и сохранить план: сырьё → решатель → БД → готовый payload.
 
         Живёт в слое данных, а не в HTTP-обработчике, потому что то же самое
         делает бот (TZ-M7 §2: веб и бот вызывают один слой). ``ValueError`` —
         нечего ставить в слоты, ``PermissionError`` — роль только смотрит.
+
+        Незаполненные поля берутся из профиля семьи (TZ-M8 §3.4) — и в вебе, и
+        в чате. Переданное явно действует только на этот план и обратно в
+        профиль не пишется: «на этот раз без обедов» не должно менять
+        настройки семьи.
         """
         if session.get("role") == "viewer":
             raise PermissionError("Режим просмотра не позволяет создавать планы")
+        # Явно переданную стратегию проверяем до любых запросов: отказ по
+        # заведомо неверному вводу не должен стоить чтения профиля.
+        if price_tier is not None and price_tier not in PRICE_TIERS:
+            raise ValueError(UNKNOWN_TIER_TEXT)
+        profile = await self.plan_profile(session)
+        days = days or int(profile["default_days"])
+        cuisines = list(cuisines if cuisines is not None else profile["cuisines"])
+        meals = list(meals if meals is not None else profile["meals"])
+        mode = mode or str(profile["mode"])
+        price_tier = price_tier or price_tier_for(mode)
         if price_tier not in PRICE_TIERS:
             raise ValueError(UNKNOWN_TIER_TEXT)
-        cuisines = list(cuisines or [])
-        data = await self.planner_data(session, cuisines)
+        if budget_kop is None and profile.get("weekly_budget_kop"):
+            # Недельный бюджет семьи растягивается на горизонт плана.
+            budget_kop = int(int(profile["weekly_budget_kop"]) * days / 7)
+        if allow_leftovers is not None:
+            profile = {**profile, "allow_leftovers": allow_leftovers}
+        data = await self.planner_data(session, cuisines, starts_on)
+        data["plan_profile"] = profile
         # K7: скоринг 500 рецептов и CP-SAT занимают до десятков секунд —
         # в отдельном потоке, иначе замирает весь event loop (и /health).
         plan = await asyncio.to_thread(
@@ -1262,17 +1570,21 @@ class AppRepository:
                 days=days,
                 cuisines=cuisines,
                 price_tier=price_tier,
+                mode=mode,
                 budget_kop=budget_kop,
+                meals=meals,
+                cuisine_mode=str(profile["cuisine_mode"]),
                 **data,
             )
         )
         plan_id = await self.save_plan(
-            session, starts_on, days, budget_kop, cuisines, price_tier, plan
+            session, starts_on, days, budget_kop, cuisines, price_tier, plan, mode
         )
         plan["id"] = plan_id
         plan["starts_on"] = starts_on
         plan["days"] = days
         plan["budget_kop"] = budget_kop
+        plan["mode"] = mode
         return plan
 
     async def save_plan(
@@ -1284,6 +1596,7 @@ class AppRepository:
         cuisines: list[str],
         price_tier: str,
         plan: dict[str, Any],
+        mode: str = "balanced",
     ) -> str:
         plan_id = uuid.uuid4()
         async with self.db().acquire() as connection, connection.transaction():
@@ -1292,30 +1605,38 @@ class AppRepository:
                 INSERT INTO app_core.meal_plans (
                     id, household_id, starts_on, days, budget_kop, estimated_cost_kop,
                     matched_cost_items, total_cost_items, cuisine_preferences,
-                    price_tier, created_by, solver_status, plan_warnings
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13::jsonb)
+                    price_tier, created_by, solver_status, plan_warnings, mode
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13::jsonb,$14)
                 """,
                 plan_id, session["household_id"], starts_on, days, budget_kop,
                 plan["estimated_cost_kop"], plan["matched_cost_items"], plan["total_cost_items"],
                 json.dumps(cuisines, ensure_ascii=False), price_tier, session["user_id"],
                 plan.get("solver_status"),
                 json.dumps(plan.get("warnings") or [], ensure_ascii=False),
+                mode,
             )
+            # Идентификаторы раздаются заранее: блюдо-наследник ссылается на
+            # ужин-источник, а планировщик знает только его позицию в плане.
+            meal_ids = [uuid.uuid4() for _ in plan["meals"]]
             for position, meal in enumerate(plan["meals"], 1):
+                source = meal.get("leftover_of")
                 await connection.execute(
                     """
                     INSERT INTO app_core.plan_meals (
                         id, plan_id, meal_date, meal_type, recipe_id, scale,
                         servings, estimated_kcal, position, warnings,
-                        estimated_protein, estimated_fat, estimated_carb
-                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13)
+                        estimated_protein, estimated_fat, estimated_carb, reasons,
+                        leftover_of
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14::jsonb,$15)
                     """,
-                    uuid.uuid4(), plan_id, meal["meal_date"], meal["meal_type"],
+                    meal_ids[position - 1], plan_id, meal["meal_date"], meal["meal_type"],
                     meal["recipe_id"], meal["scale"], meal["servings"],
                     meal["estimated_kcal"], position,
                     json.dumps(meal.get("warnings") or [], ensure_ascii=False),
                     meal.get("estimated_protein"), meal.get("estimated_fat"),
                     meal.get("estimated_carb"),
+                    json.dumps(meal.get("reasons") or [], ensure_ascii=False),
+                    meal_ids[source - 1] if source else None,
                 )
             for item in plan["shopping"]:
                 await connection.execute(
@@ -1330,6 +1651,12 @@ class AppRepository:
                     item["unit_code"], item["covered_from_inventory"], item["buy_quantity"],
                     item["matched_product_id"], item["pack_count"], item["estimated_cost_kop"],
                     bool(item.get("to_taste")),
+                )
+            # «Показано» — не мнение, но без него не отличить «не пробовали»
+            # от «пробовали и промолчали» (§4.1).
+            for meal in plan["meals"]:
+                await self.record_taste_event(
+                    session, int(meal["recipe_id"]), "planned", connection=connection
                 )
             await self._audit(connection, session["household_id"], session["user_id"], "meal_plan.generated", "meal_plan", plan_id, {"days": days})
         return str(plan_id)
@@ -1434,7 +1761,8 @@ class AppRepository:
         if session["role"] == "viewer":
             raise PermissionError("Режим просмотра не позволяет менять план")
         header = await self.db().fetchrow(
-            "SELECT id, price_tier, cuisine_preferences FROM app_core.meal_plans WHERE id=$1 AND household_id=$2",
+            "SELECT id, price_tier, mode, cuisine_preferences FROM app_core.meal_plans "
+            "WHERE id=$1 AND household_id=$2",
             plan_id, session["household_id"],
         )
         if not header:
@@ -1447,7 +1775,7 @@ class AppRepository:
         if target is None:
             return None
         cuisines = [str(item) for item in _json_column(header["cuisine_preferences"])]
-        data = await self.planner_data(session, cuisines)
+        data = await self.planner_data(session, cuisines, target["meal_date"])
         # K7: полный скоринг пула — тяжёлая синхронная работа, в поток.
         alternatives = await asyncio.to_thread(
             functools.partial(
@@ -1462,41 +1790,54 @@ class AppRepository:
                 ],
                 cuisines=cuisines,
                 price_tier=header["price_tier"],
+                mode=header["mode"],
                 limit=MEAL_ALTERNATIVES_LIMIT if new_recipe_id is None else 1000,
                 # выбранное вручную блюдо проверяем по жёстким ограничениям,
                 # а не по ранжированию слота (TZ-M7 §5.7)
                 keep_ids=() if new_recipe_id is None else (int(new_recipe_id),),
+                with_details=True,
                 **{
                     key: data[key]
                     for key in (
                         "people", "appliances", "rules", "inventory", "recipes",
                         "products", "product_matcher", "synonyms", "ratings",
-                        "nutrition",
+                        "nutrition", "history", "plan_profile",
                     )
                     if key in data
                 },
             )
         )
         if new_recipe_id is None:
+            # TZ-M8 §6.6: у каждой карточки своя группа, причина и дельты —
+            # «дешевле на 80 ₽» полезнее, чем просто список названий.
             return {
                 "alternatives": [
                     {
-                        "recipe_id": int(recipe["id"]),
-                        "title": clean_dish_title(recipe["title"]),
-                        "source_page_start": recipe.get("source_page_start"),
-                        "review_status": recipe.get("review_status"),
-                        "draft": recipe.get("review_status") != "ready",
+                        "recipe_id": int(card["recipe"]["id"]),
+                        "title": clean_dish_title(card["recipe"]["title"]),
+                        "source_page_start": card["recipe"].get("source_page_start"),
+                        "review_status": card["recipe"].get("review_status"),
+                        "draft": card["recipe"].get("review_status") != "ready",
+                        "group": card["group"],
+                        "reason": card["reason"],
+                        "delta_kcal": card["delta_kcal"],
+                        "delta_cost_kop": card["delta_cost_kop"],
                     }
-                    for recipe in alternatives[:MEAL_ALTERNATIVES_LIMIT]
+                    for card in alternatives[:MEAL_ALTERNATIVES_LIMIT]
                 ]
             }
 
-        selected = next(
-            (recipe for recipe in alternatives if int(recipe["id"]) == int(new_recipe_id)),
+        chosen = next(
+            (
+                card
+                for card in alternatives
+                if int(card["recipe"]["id"]) == int(new_recipe_id)
+            ),
             None,
         )
-        if selected is None:
+        if chosen is None:
             raise ValueError("Этот рецепт нельзя поставить в выбранный слот")
+        selected = chosen["recipe"]
         entry = meal_entry_for(
             selected,
             target["meal_date"],
@@ -1507,13 +1848,16 @@ class AppRepository:
             synonyms=data.get("synonyms"),
             nutrition_table=data.get("nutrition"),
         )
+        # Причина замены сохраняется вместе с блюдом: план не должен терять
+        # объяснение после ручной правки (TZ-M8 §5).
+        entry["reasons"] = [chosen["reason"]]
         async with self.db().acquire() as connection, connection.transaction():
             await connection.execute(
                 """
                 UPDATE app_core.plan_meals
                 SET recipe_id=$3, scale=$4, servings=$5, estimated_kcal=$6,
                     warnings=$7::jsonb, estimated_protein=$8, estimated_fat=$9,
-                    estimated_carb=$10
+                    estimated_carb=$10, reasons=$11::jsonb
                 WHERE id=$1 AND plan_id=$2
                 """,
                 meal_id, plan_id, entry["recipe_id"], entry["scale"],
@@ -1521,6 +1865,15 @@ class AppRepository:
                 json.dumps(entry["warnings"], ensure_ascii=False),
                 entry.get("estimated_protein"), entry.get("estimated_fat"),
                 entry.get("estimated_carb"),
+                json.dumps(entry.get("reasons") or [], ensure_ascii=False),
+            )
+            # Замена — сильный сигнал вкуса: одно блюдо ушло, другое пришло
+            # (§4.1). Раньше это оставалось только в audit_log.
+            await self.record_taste_event(
+                session, int(target["recipe_id"]), "replaced_out", connection=connection
+            )
+            await self.record_taste_event(
+                session, int(entry["recipe_id"]), "replaced_in", connection=connection
             )
             await self._audit(
                 connection, session["household_id"], session["user_id"],
@@ -1529,6 +1882,206 @@ class AppRepository:
             )
         await self._rebuild_plan_shopping(session, plan_id)
         return await self.get_plan(session, plan_id)
+
+    async def set_meal_status(
+        self, session: dict[str, Any], plan_id: uuid.UUID, meal_id: uuid.UUID, status: str
+    ) -> dict[str, Any] | None:
+        """«Приготовили» или «пропустили» — самый честный сигнал вкуса (§4.1)."""
+        if session["role"] == "viewer":
+            raise PermissionError("Режим просмотра не позволяет менять план")
+        if status not in {"cooked", "skipped"}:
+            raise ValueError("Статус блюда — cooked или skipped")
+        row = await self.db().fetchrow(
+            """
+            UPDATE app_core.plan_meals pm
+            SET status = $4
+            FROM app_core.meal_plans mp
+            WHERE pm.id=$1 AND pm.plan_id=$2
+              AND mp.id = pm.plan_id AND mp.household_id=$3
+            RETURNING pm.id, pm.recipe_id, pm.status
+            """,
+            meal_id, plan_id, session["household_id"], status,
+        )
+        if not row:
+            return None
+        await self.record_taste_event(session, int(row["recipe_id"]), status)
+        return row_dict(row)
+
+    async def taste_events(
+        self, session: dict[str, Any], limit: int = TASTE_EVENTS_LIMIT
+    ) -> list[dict[str, Any]]:
+        """События вкуса семьи, свежие первыми."""
+        rows = await self.db().fetch(
+            """
+            SELECT recipe_id, person_id, kind, value, created_at
+            FROM app_core.taste_events
+            WHERE household_id=$1
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            session["household_id"], limit,
+        )
+        return [row_dict(row) for row in rows]
+
+    async def _taste_model(self, session: dict[str, Any]) -> tuple[Any, dict[int, Any]]:
+        """Модель вкуса и метаданные рецептов, о которых есть события."""
+        events = await self.taste_events(session)
+        recipe_ids = sorted({int(event["recipe_id"]) for event in events})
+        rows = await self.db().fetch(
+            """
+            SELECT r.id, r.dish_type, r.cuisine_code, r.cuisine_codes,
+                   COALESCE(ing.items, '[]'::jsonb) AS ingredients
+            FROM recipe_library.recipes r
+            LEFT JOIN LATERAL (
+                SELECT jsonb_agg(jsonb_build_object(
+                    'normalized_name', i.normalized_name,
+                    'quantity_min', i.quantity_min,
+                    'quantity_max', i.quantity_max
+                ) ORDER BY i.position) AS items
+                FROM recipe_library.recipe_ingredients i
+                WHERE i.recipe_id = r.id
+            ) ing ON TRUE
+            WHERE r.id = ANY($1::bigint[])
+            """,
+            recipe_ids,
+        )
+        recipes = []
+        for row in rows:
+            recipe = dict(row)
+            if isinstance(recipe["ingredients"], str):
+                recipe["ingredients"] = json.loads(recipe["ingredients"])
+            recipes.append(recipe)
+        metas = build_metas(recipes)
+        return TasteModel.fit(events, metas, date.today()), metas
+
+    async def taste_summary(self, session: dict[str, Any]) -> dict[str, Any]:
+        """Топ любимого и нелюбимого — экран «Вкусы семьи» и бот (§7)."""
+        model, metas = await self._taste_model(session)
+        summary = model.summary(metas)
+        titles = {}
+        recipe_ids = [
+            item["recipe_id"]
+            for group in ("favourite_recipes", "disliked_recipes")
+            for item in summary[group]
+        ]
+        if recipe_ids:
+            titles = {
+                int(row["id"]): clean_dish_title(row["title"])
+                for row in await self.db().fetch(
+                    "SELECT id, title FROM recipe_library.recipes WHERE id = ANY($1::bigint[])",
+                    recipe_ids,
+                )
+            }
+        for group in ("favourite_recipes", "disliked_recipes"):
+            for item in summary[group]:
+                item["title"] = titles.get(item["recipe_id"])
+        return summary
+
+    async def refresh_taste_affinities(self, session: dict[str, Any]) -> int:
+        """Пересчёт аффинити семьи; вызывается ночным джобом и после событий."""
+        model, _metas = await self._taste_model(session)
+        rows = model.rows()
+        async with self.db().acquire() as connection, connection.transaction():
+            await connection.execute(
+                "DELETE FROM app_core.taste_affinities WHERE household_id=$1",
+                session["household_id"],
+            )
+            if rows:
+                await connection.executemany(
+                    """
+                    INSERT INTO app_core.taste_affinities (
+                        household_id, level, key, score, events_count
+                    ) VALUES ($1,$2,$3,$4,$5)
+                    """,
+                    [
+                        (
+                            session["household_id"], row["level"], row["key"],
+                            Decimal(str(round(row["score"], 6))), row["events_count"],
+                        )
+                        for row in rows
+                    ],
+                )
+        return len(rows)
+
+    async def refresh_all_taste_affinities(self) -> int:
+        """Ночной пересчёт по всем семьям (§4.2)."""
+        households = await self.db().fetch("SELECT id FROM app_core.households")
+        total = 0
+        for row in households:
+            total += await self.refresh_taste_affinities({"household_id": row["id"]})
+        return total
+
+    async def taste_onboarding(self, session: dict[str, Any]) -> dict[str, Any]:
+        """Карточки холодного старта: по два блюда на частую пару кухня+тип."""
+        events = await self.db().fetchval(
+            "SELECT count(*) FROM app_core.taste_events WHERE household_id=$1",
+            session["household_id"],
+        )
+        rows = await self.db().fetch(
+            """
+            WITH pairs AS (
+                SELECT r.cuisine_code, r.dish_type, count(*) AS total
+                FROM recipe_library.recipes r
+                WHERE r.review_status = 'ready'
+                  AND r.cuisine_code IS NOT NULL AND r.dish_type IS NOT NULL
+                GROUP BY r.cuisine_code, r.dish_type
+                ORDER BY total DESC
+                LIMIT $2
+            )
+            SELECT picked.id, picked.title, picked.cuisine_code, picked.dish_type,
+                   picked.source_page_start
+            FROM pairs
+            CROSS JOIN LATERAL (
+                SELECT r.id, r.title, r.cuisine_code, r.dish_type, r.source_page_start
+                FROM recipe_library.recipes r
+                WHERE r.review_status = 'ready'
+                  AND r.cuisine_code = pairs.cuisine_code
+                  AND r.dish_type = pairs.dish_type
+                  AND NOT EXISTS (
+                      SELECT 1 FROM app_core.taste_events e
+                      WHERE e.household_id = $1 AND e.recipe_id = r.id
+                  )
+                ORDER BY md5(r.id::text || $1::text)
+                LIMIT 2
+            ) AS picked
+            """,
+            session["household_id"], ONBOARDING_PAIRS,
+        )
+        return {
+            "events_count": int(events or 0),
+            "needed": int(events or 0) < ONBOARDING_MIN_EVENTS,
+            "cards": [
+                {
+                    "recipe_id": int(row["id"]),
+                    "title": clean_dish_title(row["title"]),
+                    "cuisine_code": row["cuisine_code"],
+                    "dish_type": row["dish_type"],
+                    "source_page_start": row["source_page_start"],
+                }
+                for row in rows
+            ],
+        }
+
+    async def save_taste_onboarding(
+        self, session: dict[str, Any], answers: list[dict[str, Any]]
+    ) -> int:
+        """Ответы онбординга: 👍 и 👎; пропуск событием не считается."""
+        if session["role"] == "viewer":
+            raise PermissionError("Режим просмотра не позволяет менять настройки")
+        saved = 0
+        async with self.db().acquire() as connection, connection.transaction():
+            for answer in answers:
+                liked = answer.get("liked")
+                if liked is None:
+                    continue
+                await self.record_taste_event(
+                    session,
+                    int(answer["recipe_id"]),
+                    "onboarding_like" if liked else "onboarding_skip",
+                    connection=connection,
+                )
+                saved += 1
+        return saved
 
     async def _rebuild_plan_shopping(
         self, session: dict[str, Any], plan_id: uuid.UUID
@@ -1624,8 +2177,9 @@ class AppRepository:
         meals = await self.db().fetch(
             """
             SELECT pm.id, pm.meal_date, pm.meal_type, pm.recipe_id, pm.scale,
-                   pm.servings, pm.estimated_kcal, pm.warnings,
+                   pm.servings, pm.estimated_kcal, pm.warnings, pm.reasons,
                    pm.estimated_protein, pm.estimated_fat, pm.estimated_carb,
+                   pm.leftover_of, pm.status,
                    r.title, r.cuisine_code, r.review_status, r.source_page_start
             FROM app_core.plan_meals pm
             JOIN recipe_library.recipes r ON r.id=pm.recipe_id
@@ -1667,6 +2221,7 @@ class AppRepository:
         for meal in result["meals"]:
             meal["title"] = clean_dish_title(meal["title"])
             meal["warnings"] = _json_column(meal.get("warnings"))
+            meal["reasons"] = _json_column(meal.get("reasons")) or []
         result["shopping"] = [row_dict(row) for row in shopping]
         result["warnings"] = stored_warnings or [
             # Фолбэк для планов, сохранённых до появления plan_warnings.

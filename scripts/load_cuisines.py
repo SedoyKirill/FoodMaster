@@ -16,6 +16,9 @@ CUISINES = {
     "russian", "east_european", "italian", "french", "georgian",
     "mediterranean", "middle_eastern", "asian", "japanese", "indian",
     "mexican", "american",
+    # TZ-M8: блюдо без национальной принадлежности (универсальная выпечка,
+    # смузи, заготовки). Проходит любой жёсткий фильтр по кухне.
+    "universal",
 }
 DISHES = {
     "soup", "salad", "appetizer", "sandwich", "steak", "main_course", "stew",
@@ -26,10 +29,27 @@ DISHES = {
 LLM_CONFIDENCE = "0.8"
 
 
+def _codes(item: dict) -> list[str]:
+    """Кухни записи: волна мультиразметки шлёт список, первая волна — строку."""
+    raw = item.get("cuisines")
+    if raw is None:
+        raw = [item["cuisine"]] if item.get("cuisine") else []
+    return [str(code) for code in raw]
+
+
+def _valid_cuisines(item: dict) -> bool:
+    codes = _codes(item)
+    return len(codes) <= 3 and all(code in CUISINES for code in codes)
+
+
 async def main() -> None:
     conn = await asyncpg.connect(os.environ["DATABASE_URL"])
     updated = skipped_files = 0
-    for path in sorted(glob.glob("data/recipes/cuisines/extracted/batch-*.json")):
+    patterns = (
+        "data/recipes/cuisines/multi/extracted/batch-*.json",
+        "data/recipes/cuisines/extracted/batch-*.json",
+    )
+    for path in sorted(sum((glob.glob(pattern) for pattern in patterns), [])):
         try:
             data = json.loads(open(path, encoding="utf-8-sig").read())
             items = data["items"]
@@ -41,7 +61,7 @@ async def main() -> None:
         bad = [
             item for item in items
             if not isinstance(item.get("id"), int)
-            or (item.get("cuisine") is not None and item["cuisine"] not in CUISINES)
+            or not _valid_cuisines(item)
             or (item.get("dish") is not None and item["dish"] not in DISHES)
         ]
         if bad:
@@ -50,20 +70,29 @@ async def main() -> None:
             continue
         async with conn.transaction():
             for item in items:
+                codes = _codes(item)
+                # cuisine_code остаётся главным кодом (витрина, старые запросы),
+                # cuisine_codes — полный набор; пусто значит «универсальное».
+                main_code = next((code for code in codes if code != "universal"), None)
                 result = await conn.execute(
                     """
                     UPDATE recipe_library.recipes
                     SET cuisine_code=$2::text,
                         cuisine_confidence=CASE WHEN $2::text IS NULL THEN NULL ELSE $3::numeric END,
-                        dish_type=$4::text
+                        dish_type=$4::text,
+                        cuisine_codes=CASE
+                            WHEN jsonb_array_length($5::jsonb) > 0 THEN $5::jsonb
+                            ELSE '["universal"]'::jsonb
+                        END
                     WHERE id=$1
                     """,
-                    item["id"], item.get("cuisine"), LLM_CONFIDENCE, item.get("dish"),
+                    item["id"], main_code, LLM_CONFIDENCE, item.get("dish"),
+                    json.dumps(codes, ensure_ascii=False),
                 )
                 updated += result.endswith(" 1")
     counts = await conn.fetchrow(
         """
-        SELECT count(*) FILTER (WHERE cuisine_code IS NOT NULL) AS with_cuisine,
+        SELECT count(*) FILTER (WHERE cuisine_codes <> '[]'::jsonb) AS with_cuisine,
                count(*) FILTER (WHERE dish_type IS NOT NULL) AS with_dish,
                count(*) AS total
         FROM recipe_library.recipes WHERE review_status <> 'rejected'

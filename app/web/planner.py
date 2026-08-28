@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import hashlib
 import json
 import math
 import re
@@ -20,12 +19,6 @@ MEAL_KEYWORDS = {
     "breakfast": ("завтрак", "каша", "омлет", "сырник", "блин", "панкейк", "олад", "вафл", "тост"),
     "lunch": ("суп", "салат", "борщ", "щи", "обед", "рагу"),
     "dinner": ("ужин", "мяс", "рыб", "куриц", "паста", "котлет", "запекан"),
-}
-RESTRICTION_EXPANSIONS = {
-    "глютен": ("пшениц", "мука", "хлеб", "макарон", "булгур", "манк", "овсян"),
-    "лактоза": ("молок", "сливк", "сметан", "кефир", "йогурт", "творог"),
-    "орехи": ("орех", "арахис", "миндаль", "фисташ", "фундук", "кешью"),
-    "рыба": ("рыб", "лосос", "семг", "треск", "тунец", "скумбр"),
 }
 UNIT_FACTORS = {
     "kg": ("g", Decimal("1000")),
@@ -196,6 +189,12 @@ DESSERT_TITLE_WORDS = ("десерт", "кекс", "парфе", "печенье
 LATIN_WORD_RE = re.compile(r"[a-z]{3,}", re.IGNORECASE)
 
 
+#: Код блюда, которое не принадлежит ни одной кухне (универсальная выпечка,
+#: смузи, детское питание). Проходит любой жёсткий фильтр по кухне: иначе
+#: выбор «итальянская» выкинул бы из пула овсянку и омлет.
+UNIVERSAL_CUISINE = "universal"
+
+
 def json_list(value: Any) -> list[Any]:
     if value is None:
         return []
@@ -323,20 +322,6 @@ def is_recipe_clean(recipe: dict[str, Any]) -> bool:
     )
 
 
-def _hard_terms(rules: list[dict[str, Any]]) -> tuple[str, ...]:
-    result: set[str] = set()
-    for rule in rules:
-        if not rule.get("is_hard", True):
-            continue
-        term = _normal(str(rule.get("term", "")))
-        if not term:
-            continue
-        result.add(term)
-        for expanded in RESTRICTION_EXPANSIONS.get(term, ()):
-            result.add(expanded)
-    return tuple(sorted(result))
-
-
 def _recipe_allowed(
     recipe: dict[str, Any], hard_terms: tuple[str, ...], appliances: set[str]
 ) -> bool:
@@ -356,13 +341,10 @@ def _recipe_allowed(
     ).casefold()
     if any(term in ingredient_text for term in hard_terms):
         return False
-    required = set(json_list(recipe.get("appliances")))
-    if not appliances:
-        # A2: техника не указана — не фильтруем по ней. Иначе новый пользователь,
-        # у которого при регистрации нет ни одной единицы техники, не может
-        # сгенерировать ни одного меню.
-        return True
-    return required.issubset(appliances)
+    # TZ-M8 T1 (дефект P8): фильтр по технике работает всегда. Пустой список
+    # больше не значит «разрешено всё» — семье при регистрации выдаётся
+    # DEFAULT_APPLIANCES, а рецепт без требований проходит при любом наборе.
+    return set(json_list(recipe.get("appliances"))).issubset(appliances)
 
 
 def _meal_score(recipe: dict[str, Any], meal_type: str) -> int:
@@ -389,11 +371,6 @@ def _meal_score(recipe: dict[str, Any], meal_type: str) -> int:
     if recipe.get("review_status") == "ready":
         score += 6
     return score
-
-
-def _stable_tiebreak(recipe_id: int, plan_key: str) -> int:
-    digest = hashlib.sha256(f"{plan_key}:{recipe_id}".encode()).hexdigest()
-    return int(digest[:8], 16)
 
 
 def _base_quantity(quantity: Decimal | None, unit: str | None) -> tuple[Decimal | None, str | None]:
@@ -748,61 +725,51 @@ def warm_product_matcher(
     return warmed
 
 
-def _recipe_cost_hint(
-    recipe: dict[str, Any], products: list[dict[str, Any]], price_tier: str,
-    product_matcher: ProductMatcher | None = None,
-) -> int:
-    result = 0
-    for ingredient in recipe["ingredients"]:
-        name = str(ingredient.get("normalized_name") or ingredient.get("ingredient_text") or "")
-        quantity = ingredient.get("quantity_max") or ingredient.get("quantity_min")
-        base_quantity, base_unit = _base_quantity(
-            Decimal(str(quantity)) if quantity is not None else None,
-            ingredient.get("unit_code"),
-        )
-        product = (
-            product_matcher.match(name, base_unit, price_tier, base_quantity)
-            if product_matcher is not None
-            else _product_match(name, base_unit, products, price_tier, base_quantity)
-        )
-        if not product:
-            continue
-        price = int(product.get("effective_price_kop") or 0)
-        pack_quantity, pack_unit = _base_quantity(
-            Decimal(str(product.get("pack_quantity") or 0)), product.get("pack_unit")
-        )
-        if base_quantity and pack_quantity and base_unit == pack_unit:
-            result += int(price * min(Decimal("1"), base_quantity / pack_quantity))
-        else:
-            result += price
-    return result
-
-
 DEFAULT_TARGET_KCAL = {"adult": 2000, "child": 1400}
+#: Техника, которая есть почти в каждом доме (TZ-M8 §3.3). Выдаётся семье при
+#: регистрации и миграцией — тем семьям, у которых техника не заполнена: фильтр
+#: по технике работает всегда, и пустой набор иначе отсекал бы почти всё.
+DEFAULT_APPLIANCES = ("stove", "oven", "microwave", "fridge_freezer")
 #: минимум подходящих по типу приёма кандидатов, после которого неподходящие
 #: (fit=0) в слот уже не допускаются
 _MIN_SLOT_CANDIDATES = 8
 
 
 def _ingredient_cost_hint(
-    ingredient: dict[str, Any], matcher: ProductMatcher, price_tier: str
+    ingredient: dict[str, Any],
+    matcher: ProductMatcher,
+    price_tier: str,
+    needed: Decimal | None = None,
+    unit: str | None = None,
 ) -> int | None:
-    """Стоимость одного ингредиента по каталогу; None — сопоставления нет."""
+    """Стоимость ингредиента по каталогу; None — сопоставления нет.
+
+    ``needed``/``unit`` — потребность в базовых единицах уже на семью и за
+    вычетом домашних запасов (TZ-M8 T1, дефект P6). Без них считается
+    книжное количество — так работает фоновый прогрев матчера.
+
+    Товар ищется по книжному количеству: ключ мемоизации не должен зависеть
+    от размера семьи, иначе прогрев (N1) перестаёт попадать в кэш.
+    """
     name = str(ingredient.get("normalized_name") or ingredient.get("ingredient_text") or "")
     quantity = ingredient.get("quantity_max") or ingredient.get("quantity_min")
-    base_qty, base_unit = _base_quantity(
+    book_qty, book_unit = _base_quantity(
         Decimal(str(quantity)) if quantity is not None else None,
         ingredient.get("unit_code"),
     )
-    product = matcher.match(name, base_unit, price_tier, base_qty)
+    product = matcher.match(name, book_unit, price_tier, book_qty)
     if not product:
         return None
     price = int(product.get("effective_price_kop") or 0)
     pack_base, pack_unit = _base_quantity(
         Decimal(str(product.get("pack_quantity") or 0)), product.get("pack_unit")
     )
-    if base_qty and pack_base and base_unit == pack_unit:
-        return int(price * min(Decimal("1"), base_qty / pack_base))
+    required = book_qty if needed is None else needed
+    required_unit = book_unit if needed is None else unit
+    if required is not None and pack_base and required_unit == pack_unit and pack_base > 0:
+        # Пропорция пачки, без потолка в одну штуку: три килограмма картофеля
+        # стоят трёх пачек, а не одной. Целые упаковки считает TZ-M8 T7.
+        return int(price * (required / pack_base))
     return price
 
 
@@ -910,33 +877,95 @@ def _meal_nutrition(
     }
 
 
-def _make_kcal_hint(nutrition: dict[str, dict[str, Any]] | None):
-    """Ккал ингредиента для скоринга: таблица Haiku → substring-справочник."""
+#: человеческий текст к упрощениям модели упаковок (§6.5)
+PACK_WARNING_TEXTS = {
+    "pack_model_truncated": (
+        "pack_model_truncated: продуктов в плане слишком много — целыми "
+        "пачками посчитаны только самые дорогие из общих."
+    ),
+    "pack_model_skipped": (
+        "pack_model_skipped: расчёт целых упаковок не уложился в лимит "
+        "времени — стоимость блюд посчитана по пропорции пачки."
+    ),
+}
+
+
+def _shared_packs(
+    assignment: dict[tuple[int, str], int | None],
+    positions: dict[tuple[int, str], int],
+    pack_model: Any,
+    packs: dict[int, int],
+) -> dict[tuple[int, str], tuple[str, int]]:
+    """Слот → (продукт, номер блюда), с которым он делит одну пачку.
+
+    Считается только по товарам, которых куплено меньше, чем понадобилось бы
+    блюдам по отдельности: иначе «делим пачку» превратилось бы в «оба блюда
+    содержат соль».
+    """
+    users: dict[int, list[tuple[int, str]]] = {}
+    for slot, recipe_id in assignment.items():
+        if recipe_id is None:
+            continue
+        for product_id in pack_model.needs.get(recipe_id, {}):
+            users.setdefault(product_id, []).append(slot)
+    result: dict[tuple[int, str], tuple[str, int]] = {}
+    for product_id, slots in users.items():
+        product = pack_model.products.get(product_id)
+        if product is None or len(slots) < 2:
+            continue
+        bought = packs.get(product_id)
+        alone = sum(
+            math.ceil(pack_model.need(assignment[slot], product_id) / product.pack_base)
+            for slot in slots
+        )
+        if bought is None or bought >= alone:
+            continue
+        ordered = sorted(slots, key=lambda slot: positions.get(slot, 0))
+        for index, slot in enumerate(ordered):
+            if slot in result:
+                continue
+            partner = ordered[(index + 1) % len(ordered)]
+            result[slot] = (product.label, positions.get(partner, 0))
+    return result
+
+
+def _pack_warnings(codes: list[str]) -> list[str]:
+    return [PACK_WARNING_TEXTS[code] for code in codes if code in PACK_WARNING_TEXTS]
+
+
+def _leftover_cost_share(servings_by_meal: dict[str, Decimal]) -> float:
+    """Во сколько раз дороже ужин, который готовится и на завтрашний обед.
+
+    Не всегда вдвое: если один из взрослых обедает на работе, лишних порций
+    нужно меньше (§3.1). Ноль порций ужина — деление не нужно, доли нет.
+    """
+    dinner = servings_by_meal.get("dinner") or Decimal("0")
+    lunch = servings_by_meal.get("lunch") or Decimal("0")
+    if dinner <= 0:
+        return 1.0
+    return float(lunch / dinner)
+
+
+def _make_macros_hint(nutrition: dict[str, dict[str, Any]] | None):
+    """КБЖУ ингредиента для скоринга: таблица Haiku → substring-справочник.
+
+    Возвращает четвёрку (ккал, Б, Ж, У): белок кандидата входит в целевую
+    функцию (TZ-M8 §6.2), поэтому одних калорий солверу больше не хватает.
+    Substring-справочник знает только калории — БЖУ там честно None.
+    """
 
     def _hint(
         name: str, canonical: str, quantity: Decimal | None, unit: str | None
-    ) -> Decimal | None:
+    ) -> tuple[Decimal | None, Decimal | None, Decimal | None, Decimal | None]:
         if nutrition:
             row = nutrition.get(canonical) or nutrition.get(name.strip().lower())
             if row is not None:
                 result = nutrition_from_row(row, name, quantity, unit)
                 if result is not None:
-                    return result[0]
-        return ingredient_kcal(canonical or name, quantity, unit)
+                    return result
+        return ingredient_kcal(canonical or name, quantity, unit), None, None, None
 
     return _hint
-
-
-def _daily_kcal_target(people: list[dict[str, Any]]) -> int:
-    """Дневная цель семьи: target_kcal людей (B3), без цели — честные константы."""
-    total = 0
-    for person in people:
-        target = person.get("target_kcal")
-        if target:
-            total += int(target)
-        else:
-            total += DEFAULT_TARGET_KCAL.get(str(person.get("person_type") or "adult"), 2000)
-    return total
 
 
 def build_plan(
@@ -951,17 +980,41 @@ def build_plan(
     inventory: list[dict[str, Any]],
     recipes: list[dict[str, Any]],
     products: list[dict[str, Any]],
-    price_tier: str = "balanced",
+    price_tier: str | None = None,
     product_matcher: ProductMatcher | None = None,
     budget_kop: int | None = None,
     synonyms: Any = None,
     ratings: dict[int, int] | None = None,
     nutrition: dict[str, dict[str, Any]] | None = None,
+    meals: list[str] | None = None,
+    cuisine_mode: str = "only",
+    history: list[dict[str, Any]] | None = None,
+    plan_profile: dict[str, Any] | None = None,
+    taste_events: list[dict[str, Any]] | None = None,
+    mode: str | None = None,
 ) -> dict[str, Any]:
-    """Фасад TZ-M5R: кандидаты → оценка → оптимизация → масштабирование → покупки."""
+    """Фасад TZ-M5R: кандидаты → оценка → оптимизация → масштабирование → покупки.
+
+    ``meals`` — какие приёмы планировать вообще (профиль семьи, TZ-M8 §3.4):
+    семья, которая завтракает по дороге, не должна получать завтраки.
+    ``cuisine_mode`` — ``only`` (жёсткий фильтр, по умолчанию) или ``prefer``
+    (мягкое предпочтение: кухня даёт бонус, но не отсекает кандидатов).
+    ``history`` — блюда семьи за три недели (ротация, TZ-M8 §3.7),
+    ``plan_profile`` — лимиты времени и прочие настройки семьи (§3.4).
+    ``mode`` — режим планирования (§6.4): он задаёт веса целевой функции и,
+    если ``price_tier`` не передан явно, ценовую стратегию матчера товаров.
+    """
+    from .planning import candidates as candidates_mod
+    from .planning import context as context_mod
+    from .planning import explain as explain_mod
     from .planning import optimizer as optimizer_mod
+    from .planning import profile as profile_mod
     from .planning import scaling as scaling_mod
+    from .planning import taste as taste_mod
     from .planning import shopping as shopping_mod
+    from .planning import features as features_mod
+    from .planning import packs as packs_mod
+    from .planning import weights as weights_mod
     from .planning.candidates import (
         MIN_READY_CANDIDATES, Synonyms, hard_rule_terms, ingredient_matches_terms,
         score_candidates,
@@ -973,37 +1026,78 @@ def build_plan(
         synonyms_dict = Synonyms.from_rows(synonyms or [])
 
     available_appliances = set(appliances)
-    banned = hard_rule_terms(rules, synonyms_dict, _normal)
+    # Режим планирования (§6.4) — единственный источник весов; ценовая
+    # стратегия матчера выводится из него, но явный price_tier сильнее.
+    plan_mode = mode or (plan_profile or {}).get("mode")
+    weights = weights_mod.weights_for(plan_mode)
+    price_tier = price_tier or weights_mod.price_tier_for(plan_mode)
 
-    def _passes_hard_rules(recipe: dict[str, Any]) -> bool:
+    # TZ-M8 §3.1–3.2: слот принадлежит тем, кто ест его дома. Приём, который
+    # дома не ест никто, не планируется вовсе; жёсткое правило действует на
+    # слот, только если его автор за этим столом.
+    planned_meals = set(meals) if meals else set(MEAL_LABELS)
+    meal_types = [
+        meal
+        for meal in MEAL_LABELS
+        if meal in planned_meals and profile_mod.slot_servings(people, meal) > 0
+    ] or list(MEAL_LABELS)
+    slot_terms: dict[str, set[str]] = {}
+    slot_diets: dict[str, set[str]] = {}
+    for meal in meal_types:
+        applicable, diet_tags = profile_mod.rule_terms_for_meal(rules, people, meal)
+        slot_terms[meal] = hard_rule_terms(applicable, synonyms_dict, _normal)
+        slot_diets[meal] = diet_tags
+    # Запрет, действующий во всех слотах, отсекает рецепт из пула целиком —
+    # остальные проверяются на своём слоте.
+    always_banned = set.intersection(*slot_terms.values()) if slot_terms else set()
+
+    def _blocked(recipe: dict[str, Any], terms: set[str]) -> bool:
+        if not terms:
+            return False
         for ingredient in recipe.get("ingredients", []):
             name = str(
                 ingredient.get("normalized_name") or ingredient.get("ingredient_text") or ""
             )
-            if ingredient_matches_terms(name, banned, synonyms_dict, _normal):
-                return False
-        return True
+            if ingredient_matches_terms(name, terms, synonyms_dict, _normal):
+                return True
+        return False
 
     pool = [
         recipe
         for recipe in recipes
-        if _recipe_allowed(recipe, (), available_appliances) and _passes_hard_rules(recipe)
+        if _recipe_allowed(recipe, (), available_appliances)
+        and not _blocked(recipe, always_banned)
     ]
     # Черновики добираются, только если готовых рецептов мало (TZ §2.1).
     ready_pool = [recipe for recipe in pool if recipe.get("review_status") == "ready"]
     if len(ready_pool) >= MIN_READY_CANDIDATES:
         pool = ready_pool
 
-    meal_types = list(MEAL_LABELS)
     if not pool:
         raise ValueError(
             "После применения ограничений осталось слишком мало рецептов "
             "со статусом «готов». Ослабьте ограничения в настройках."
         )
 
+    # Порции считаются по едокам слота: обед на двоих, ужин на троих. Для
+    # скоринга берётся полный состав — цена и калории кандидата пока едины на
+    # все слоты (уточнение до слота приходит с FeatureVector, TZ-M8 T6).
+    servings_by_meal = {
+        meal: profile_mod.slot_servings(people, meal) for meal in meal_types
+    }
     desired_servings = scaling_mod.desired_servings(people)
     plan_key = f"{household_id}:{starts_on.isoformat()}:{','.join(sorted(cuisines))}"
     product_matcher = product_matcher or ProductMatcher(products)
+
+    def _scale_of(recipe: dict[str, Any]) -> Decimal | None:
+        """Во сколько раз книжный рецепт разворачивается на эту семью.
+
+        K2/P6: и калории, и стоимость кандидата солвер должен видеть в
+        масштабе семьи — иначе дневной коридор ±20 % вырождается в «выбирай
+        калорийнее», а цена блюда остаётся «как в книге на две порции».
+        """
+        scale, _unknown = scaling_mod.recipe_scale(recipe, desired_servings)
+        return scale
 
     scores = score_candidates(
         pool,
@@ -1015,39 +1109,88 @@ def build_plan(
         synonyms=synonyms_dict,
         normal=_normal,
         tokens=_tokens,
-        cost_hint=lambda ingredient: _ingredient_cost_hint(
-            ingredient, product_matcher, price_tier
+        cost_hint=lambda ingredient, needed, unit: _ingredient_cost_hint(
+            ingredient, product_matcher, price_tier, needed, unit
         ),
         meal_score=_meal_score,
-        kcal_hint=_make_kcal_hint(nutrition),
+        macros_hint=_make_macros_hint(nutrition),
+        base_quantity=_base_quantity,
+        scale_of=_scale_of,
     )
-    # Оценка семьи (звёзды): любимое двигается вверх, разочаровавшее — вниз.
-    for recipe_id, rating in (ratings or {}).items():
-        if recipe_id in scores:
-            scores[recipe_id].rating_bonus = int(rating) - 3
+    # Вкус семьи (TZ-M8 §4): звёзды — лишь одно из событий, наравне с
+    # заменами и отметками «приготовили»/«пропустили». Обобщение на тип
+    # блюда, кухню и продукты даёт мнение даже о том, что семья не пробовала.
+    taste_metas = taste_mod.build_metas(pool)
+    taste_model = taste_mod.TasteModel.fit(taste_events or [], taste_metas, starts_on)
+    taste_known = taste_mod.known_recipes(taste_model)
 
-    # K2: дневная сумма в солвере сравнивается с целью всей семьи, поэтому и
-    # ккал кандидатов приводятся к масштабу семьи, а не «как в книге на 2
-    # порции». Без этого коридор ±20% вырождался в «выбирай калорийнее».
+    # Ротация и сезон (TZ-M8 §3.6–3.7).
+    plan_history = context_mod.build_history(history or [], starts_on)
     for recipe in pool:
         recipe_id = int(recipe["id"])
         score = scores[recipe_id]
-        if score.kcal:
-            kcal_scale, _unknown = scaling_mod.recipe_scale(recipe, desired_servings)
-            if kcal_scale is not None:
-                score.kcal = int(score.kcal * kcal_scale)
+        affinity = taste_model.family_affinity(taste_metas[recipe_id], people)
+        score.affinity = affinity
+        score.unknown = recipe_id not in taste_known
+        score.recency_penalty = plan_history.recency_penalty(recipe_id, affinity)
+        score.season_bonus = context_mod.season_share(
+            [
+                str(ingredient.get("normalized_name") or ingredient.get("ingredient_text") or "")
+                for ingredient in recipe.get("ingredients", [])
+            ],
+            starts_on,
+        )
+        if recipe.get("time_total_minutes") is not None:
+            score.time_minutes = int(recipe["time_total_minutes"])
 
-    cost_factor = optimizer_mod.PRICE_TIER_COST_FACTOR.get(price_tier, 10)
+    features_mod.attach_bases(scores, pool, synonyms_dict, _normal)
     cuisine_set = set(cuisines)
-    cuisine_of = {int(recipe["id"]): recipe.get("cuisine_code") for recipe in pool}
+    matches_cuisine = {
+        int(recipe["id"]): cuisine_matches(recipe, cuisine_set) for recipe in pool
+    }
     needed_distinct = _min_distinct_for_horizon(days)
     candidates_by_slot: dict[tuple[int, str], list[int]] = {}
+    slot_time_limits: dict[tuple[int, str], int | None] = {}
+    slot_warnings: list[str] = []
+    profile = plan_profile or {}
+    cooking_minutes = {
+        int(recipe["id"]): (
+            int(recipe["time_total_minutes"])
+            if recipe.get("time_total_minutes") is not None
+            else None
+        )
+        for recipe in pool
+    }
     for meal_type in meal_types:
+        # Личные запреты тех, кто за этим столом (TZ-M8 §3.2): блюдо с орехами
+        # уходит из обеда ребёнка, но остаётся во взрослом завтраке.
+        personal = slot_terms[meal_type] - always_banned
+        eligible = [
+            recipe for recipe in pool if not _blocked(recipe, personal)
+        ]
+        required_diets = slot_diets[meal_type]
+        if required_diets:
+            fitting = [
+                recipe
+                for recipe in eligible
+                if required_diets.issubset(
+                    {str(tag) for tag in json_list(recipe.get("diet_tags"))}
+                )
+            ]
+            if fitting:
+                eligible = fitting
+            else:
+                # Молча кормить вегетарианца мясом нельзя — но и оставлять его
+                # без обеда тоже: слот заполняется и честно помечается.
+                slot_warnings.append(
+                    f"diet_conflict: {MEAL_LABELS[meal_type].lower()} — в библиотеке нет "
+                    f"блюд с требуемой диетой ({', '.join(sorted(required_diets))})."
+                )
         ranked = sorted(
-            (int(recipe["id"]) for recipe in pool),
+            (int(recipe["id"]) for recipe in eligible),
             key=lambda recipe_id: (
                 scores[recipe_id].meal_fit.get(meal_type, 0.0) <= 0,
-                optimizer_mod.slot_coefficient(scores[recipe_id], meal_type, cost_factor),
+                optimizer_mod.slot_coefficient(scores[recipe_id], meal_type, weights),
                 optimizer_mod.stable_tiebreak(recipe_id, f"{plan_key}:{meal_type}"),
             ),
         )
@@ -1075,8 +1218,10 @@ def build_plan(
         # на горизонт, солвер других и не видит. Если не хватает (в библиотеке
         # четыре азиатских завтрака на все дни), слот дополняется остальными —
         # блюдо не своей кухни получит пометку cuisine_fallback.
-        if cuisine_set:
-            preferred = _cuisine_preferred(slot_list, cuisine_of.get, cuisine_set)
+        if cuisine_set and cuisine_mode != "prefer":
+            preferred = [
+                recipe_id for recipe_id in slot_list if matches_cuisine.get(recipe_id)
+            ]
             if len(preferred) >= needed_distinct:
                 slot_list = preferred
             elif preferred:
@@ -1084,24 +1229,124 @@ def build_plan(
                     recipe_id for recipe_id in slot_list if recipe_id not in set(preferred)
                 ]
                 slot_list = preferred + rest
+        # Время готовки — свойство дня, а не слота: в среду вечером двух часов
+        # нет, в субботу есть (TZ-M8 §3.5). Рецепт без указанного времени не
+        # отсеивается — он получит мягкий штраф в целевой функции (T6).
         for day in range(days):
-            candidates_by_slot[day, meal_type] = slot_list
+            context = context_mod.day_context(starts_on + timedelta(days=day))
+            limit = context_mod.slot_time_limit(meal_type, context, profile)
+            slot_time_limits[day, meal_type] = limit
+            candidates_by_slot[day, meal_type] = _fit_time_limit(
+                slot_list, limit, cooking_minutes, slot_warnings, context, meal_type
+            )
 
-    assignment, solver_status = optimizer_mod.optimize(
+    # Цели слота — суммы норм тех, кто ест этот приём дома (§6.2). Норма
+    # считается на дату слота, а не на первый день плана: у ребёнка внутри
+    # двухнедельного горизонта может смениться возрастная группа.
+    slot_targets = {
+        (day, meal_type): optimizer_mod.SlotTarget(
+            kcal=profile_mod.slot_kcal_target(
+                people, meal_type, starts_on + timedelta(days=day)
+            ),
+            protein_g=profile_mod.slot_protein_target(
+                people, meal_type, starts_on + timedelta(days=day)
+            ),
+        )
+        for day in range(days)
+        for meal_type in meal_types
+    }
+    # Целые пачки на весь горизонт (§6.3): продукт, который нужен двум
+    # блюдам, покупается один раз, и солвер об этом знает ещё до выбора.
+    candidate_ids = sorted({
+        recipe_id for slot_list in candidates_by_slot.values() for recipe_id in slot_list
+    })
+    pack_model = packs_mod.build_pack_model(
+        recipe_ids=candidate_ids,
+        recipes_by_id={int(recipe["id"]): recipe for recipe in pool},
+        costs_by_recipe={recipe_id: scores[recipe_id].cost_kop for recipe_id in candidate_ids},
+        slots=len(candidates_by_slot),
+        scale_of=_scale_of,
+        matcher=product_matcher,
+        price_tier=price_tier,
+        stock=candidates_mod._stock_lots(
+            inventory, synonyms_dict, _normal, _base_quantity
+        ),
+        synonyms=synonyms_dict,
+        normal=_normal,
+        base_quantity=_base_quantity,
+    )
+    for recipe_id, private_cost in pack_model.private_cost_kop.items():
+        scores[recipe_id].cost_private_kop = private_cost
+
+    solution = optimizer_mod.optimize(
         days=days,
         meal_types=meal_types,
         candidates_by_slot=candidates_by_slot,
         scores=scores,
         budget_kop=budget_kop,
-        daily_kcal_target=_daily_kcal_target(people),
-        price_tier=price_tier,
+        slot_targets=slot_targets,
+        weights=weights,
+        time_limits=slot_time_limits,
         plan_key=plan_key,
+        max_repeats=int(profile.get("max_repeats_per_horizon") or optimizer_mod.MAX_USES_PER_HORIZON),
+        allow_leftovers=bool(profile.get("allow_leftovers", False)),
+        novelty=profile.get("novelty"),
+        cuisine_mode=cuisine_mode,
+        leftover_cost_share=_leftover_cost_share(servings_by_meal),
+        packs=pack_model,
+        recently_eaten={
+            recipe_id
+            for recipe_id in candidate_ids
+            if (plan_history.days_since(recipe_id) or 999)
+            <= optimizer_mod.ROTATION_WINDOW_DAYS
+            and scores[recipe_id].affinity < context_mod.FAVOURITE_AFFINITY
+        },
     )
+    assignment = solution.assignment
+    solver_status = solution.status
+    # Слот-источник знает, что готовит на два раза, ещё до сборки блюд:
+    # от этого зависят и порции, и список покупок.
+    leftover_sources = {source: target for target, source in solution.leftovers.items()}
 
     recipes_by_id = {int(recipe["id"]): recipe for recipe in pool}
+    # Данные для «почему это блюдо» (TZ-M8 §5): считаются один раз на план,
+    # а применяются только к выбранным блюдам — их три десятка, не пятьсот.
+    expiring_names = candidates_mod._expiring_canonicals(
+        inventory, starts_on, synonyms_dict, _normal
+    )
+    stock_names = {
+        synonyms_dict.canonical_name(str(lot.get("name") or ""), _normal)
+        for lot in inventory
+    }
+    stock_names.discard("")
+    seasonal_names = context_mod.SEASONAL_INGREDIENTS[starts_on.month]
+    median_cost_by_slot: dict[tuple[int, str], int] = {}
+    for slot, slot_candidates in candidates_by_slot.items():
+        costs = sorted(scores[recipe_id].cost_kop for recipe_id in slot_candidates)
+        if costs:
+            median_cost_by_slot[slot] = costs[len(costs) // 2]
     plan_warnings: list[str] = []
     meals: list[dict[str, Any]] = []
     meal_ingredients: list[dict[str, Any]] = []
+    # Номера блюд известны до сборки: причина «одна пачка с обедом в среду»
+    # может ссылаться на блюдо, которого в списке ещё нет.
+    meal_position_by_slot = {
+        slot: position
+        for position, slot in enumerate(
+            (
+                (day_index, meal_type)
+                for day_index in range(days)
+                for meal_type in meal_types
+                if assignment.get((day_index, meal_type)) is not None
+            ),
+            start=1,
+        )
+    }
+    # Кто с кем делит пачку (§6.3): продукт, нужный двум выбранным блюдам,
+    # покупается один раз — и это стоит сказать вслух.
+    shared_pack_by_slot = _shared_packs(
+        assignment, meal_position_by_slot, pack_model, solution.packs
+    )
     for day_index in range(days):
         meal_date = starts_on + timedelta(days=day_index)
         for meal_type in meal_types:
@@ -1114,15 +1359,25 @@ def build_plan(
                 continue
             selected = recipes_by_id[recipe_id]
             score = scores[recipe_id]
-            scale, scale_unknown = scaling_mod.recipe_scale(selected, desired_servings)
+            slot_servings = servings_by_meal.get(meal_type, desired_servings)
+            # «На два раза» (§6.2): ужин-источник готовится и на завтрашний
+            # обед, поэтому порций у него столько, сколько едоков за обоими
+            # столами — не механическое ×2, а те же правила eats_meals.
+            heir_slot = leftover_sources.get((day_index, meal_type))
+            if heir_slot is not None:
+                slot_servings += servings_by_meal.get(heir_slot[1], desired_servings)
+            source_slot = solution.leftovers.get((day_index, meal_type))
+            scale, scale_unknown = scaling_mod.recipe_scale(selected, slot_servings)
             meal_warnings: list[str] = []
             if scale_unknown:
                 meal_warnings.append("scale_unknown")
             if score.draft:
                 meal_warnings.append("draft")
-            if cuisine_set and selected.get("cuisine_code") not in cuisine_set:
+            if cuisine_set and not cuisine_matches(selected, cuisine_set):
                 meal_warnings.append("cuisine_fallback")
-            for ingredient in selected.get("ingredients", []):
+            # Обед из вчерашнего ужина уже куплен и приготовлен: его
+            # ингредиенты в список покупок не попадают второй раз.
+            for ingredient in ([] if source_slot else selected.get("ingredients", [])):
                 meal_ingredients.append(
                     {
                         "name": str(
@@ -1134,6 +1389,51 @@ def build_plan(
                         "unit_code": ingredient.get("unit_code"),
                         "is_to_taste": bool(ingredient.get("is_to_taste")),
                     }
+                )
+            ingredient_names = [
+                synonyms_dict.canonical_name(
+                    str(ingredient.get("normalized_name")
+                        or ingredient.get("ingredient_text") or ""),
+                    _normal,
+                )
+                for ingredient in selected.get("ingredients", [])
+            ]
+            if source_slot is not None:
+                reasons = [{
+                    "code": "leftover",
+                    "source_meal": meal_position_by_slot.get(source_slot),
+                }]
+            else:
+                reasons = explain_mod.explain(
+                    score,
+                    explain_mod.ExplainContext(
+                        meal_type=meal_type,
+                        weights=weights,
+                        median_cost_kop=median_cost_by_slot.get((day_index, meal_type)),
+                        expiring_names=tuple(
+                            name for name in ingredient_names if name in expiring_names
+                        )[:3],
+                        stock_names=tuple(
+                            name for name in ingredient_names
+                            if name in stock_names and name not in expiring_names
+                        )[:3],
+                        seasonal_names=tuple(
+                            name for name in ingredient_names
+                            if name in seasonal_names
+                            or any(word in seasonal_names for word in name.split())
+                        )[:3],
+                        days_since=plan_history.days_since(recipe_id),
+                        rating=(ratings or {}).get(recipe_id),
+                        known=bool(
+                            (ratings or {}).get(recipe_id)
+                            or plan_history.days_since(recipe_id) is not None
+                        ),
+                        kcal_target=profile_mod.slot_kcal_target(
+                            people, meal_type, meal_date
+                        ),
+                        dish_type=score.dish_type,
+                        shared_pack=shared_pack_by_slot.get((day_index, meal_type)),
+                    ),
                 )
             meal_nutrition = _meal_nutrition(
                 selected.get("ingredients", []), scale, product_matcher, price_tier,
@@ -1156,8 +1456,15 @@ def build_plan(
                     "draft": score.draft,
                     "scale": scale if scale is not None else Decimal("1"),
                     "scale_unknown": scale_unknown,
-                    "servings": desired_servings,
+                    "servings": slot_servings,
                     "warnings": meal_warnings,
+                    "reasons": reasons,
+                    # Позиция блюда-источника в этом же плане: id появятся
+                    # только при сохранении (§6.2).
+                    "leftover_of": meal_position_by_slot.get(source_slot)
+                    if source_slot
+                    else None,
+                    "cooks_ahead": heir_slot is not None,
                     **meal_nutrition,
                 }
             )
@@ -1169,9 +1476,12 @@ def build_plan(
         inventory, synonyms_dict, _normal, _base_quantity
     )
     shopping, total_cost, matched_cost_items = shopping_mod.build_shopping(
-        aggregate, inventory_lots, product_matcher, price_tier, _base_quantity
+        aggregate, inventory_lots, product_matcher, price_tier, _base_quantity,
+        pack_hint=solution.packs,
     )
 
+    plan_warnings.extend(slot_warnings)
+    plan_warnings.extend(_pack_warnings(solution.warnings))
     if solver_status == "greedy":
         # K3: жадный запасной алгоритм не учитывает бюджет и калории —
         # деградация не должна быть тихой.
@@ -1283,11 +1593,166 @@ def _diversify_by_dish_type(recipes: list[dict[str, Any]]) -> list[dict[str, Any
     return result
 
 
-def _cuisine_preferred(
-    candidates: list[Any], cuisine_of: Any, cuisine_set: set[str]
-) -> list[Any]:
-    """Кандидаты выбранных кухонь, порядок сохраняется."""
-    return [item for item in candidates if cuisine_of(item) in cuisine_set]
+def recipe_cuisines(recipe: dict[str, Any]) -> set[str]:
+    """Кухни рецепта. Одна колонка-код осталась для совместимости (TZ-M8)."""
+    codes = {str(code) for code in json_list(recipe.get("cuisine_codes")) if code}
+    if not codes and recipe.get("cuisine_code"):
+        codes = {str(recipe["cuisine_code"])}
+    return codes or {UNIVERSAL_CUISINE}
+
+
+def cuisine_matches(recipe: dict[str, Any], selected: set[str]) -> bool:
+    """Подходит ли блюдо под выбранные кухни (пустой выбор — подходит всё)."""
+    if not selected:
+        return True
+    codes = recipe_cuisines(recipe)
+    return bool(codes & selected) or UNIVERSAL_CUISINE in codes
+
+
+def _fit_time_limit(
+    slot_list: list[int],
+    limit: int | None,
+    cooking_minutes: dict[int, int | None],
+    warnings: list[str],
+    context: Any,
+    meal_type: str,
+) -> list[int]:
+    """Кандидаты, укладывающиеся в отведённое на слот время (TZ-M8 §3.5).
+
+    Если после фильтра кандидатов почти не остаётся, лимит удваивается, а
+    слот честно помечается: лучше сказать «ужин выйдет долгим», чем оставить
+    семью без ужина.
+    """
+    if not limit:
+        return slot_list
+
+    def _fits(recipe_id: int, minutes_limit: int) -> bool:
+        minutes = cooking_minutes.get(recipe_id)
+        return minutes is None or minutes <= minutes_limit
+
+    fitting = [recipe_id for recipe_id in slot_list if _fits(recipe_id, limit)]
+    if len(fitting) >= _MIN_SLOT_CANDIDATES or len(fitting) == len(slot_list):
+        return fitting
+    relaxed = [recipe_id for recipe_id in slot_list if _fits(recipe_id, limit * 2)]
+    if len(relaxed) <= len(fitting):
+        # Удвоение ничего не добавило: молчим, если выбор и так есть, и
+        # снимаем лимит целиком, только когда слот иначе останется пустым.
+        if fitting:
+            return fitting
+        warnings.append(
+            f"time_limit_relaxed: {context.day.isoformat()} "
+            f"{MEAL_LABELS[meal_type].lower()} — быстрых блюд нет, "
+            f"лимит в {limit} минут снят."
+        )
+        return slot_list
+    warnings.append(
+        f"time_limit_relaxed: {context.day.isoformat()} "
+        f"{MEAL_LABELS[meal_type].lower()} — блюд в {limit} минут не хватило, "
+        f"лимит увеличен до {limit * 2}."
+    )
+    return relaxed
+
+
+#: сколько альтернатив каждой группы показывать при замене (TZ-M8 §6.6)
+ALTERNATIVE_GROUP_QUOTAS = (("similar", 4), ("other", 4), ("new", 2))
+
+
+def _alternative_group(
+    recipe: dict[str, Any],
+    current: dict[str, Any] | None,
+    known: bool,
+) -> str:
+    """«Похожее», «другое» или «новое» — относительно текущего блюда.
+
+    Похожесть сильнее новизны: тому, кто меняет суп, полезнее увидеть другой
+    суп, даже если семья его ещё не пробовала. «Новое» остаётся для блюд
+    иного типа, о которых семья ничего не знает.
+    """
+    same_type = bool(
+        current is not None
+        and recipe.get("dish_type")
+        and recipe.get("dish_type") == current.get("dish_type")
+    )
+    if same_type:
+        return "similar"
+    return "other" if known else "new"
+
+
+def _alternative_cards(
+    ranked: list[dict[str, Any]],
+    *,
+    scores: dict[int, Any],
+    current: dict[str, Any] | None,
+    meal_type: str,
+    meal_date: date,
+    weights: Any,
+    people: list[dict[str, Any]],
+    ratings: dict[int, int],
+    history: Any,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Десятка замен по группам: похожие, другие и то, что семья не пробовала.
+
+    Раньше список ранжировался одной целевой функцией и легко оказывался
+    пятью блинами подряд — они просто дешевле.
+    """
+    from .planning import explain as explain_mod
+    from .planning import profile as profile_mod
+
+    current_score = scores.get(int(current["id"])) if current else None
+    kcal_target = profile_mod.slot_kcal_target(people, meal_type, meal_date)
+    costs = sorted(scores[int(recipe["id"])].cost_kop for recipe in ranked)
+    median_cost = costs[len(costs) // 2] if costs else None
+
+    by_group: dict[str, list[dict[str, Any]]] = {"similar": [], "other": [], "new": []}
+    for recipe in ranked:
+        recipe_id = int(recipe["id"])
+        score = scores[recipe_id]
+        known = bool(ratings.get(recipe_id) or history.days_since(recipe_id) is not None)
+        card = {
+            "recipe": recipe,
+            "group": _alternative_group(recipe, current, known),
+            "reason": explain_mod.main_reason(
+                score,
+                explain_mod.ExplainContext(
+                    meal_type=meal_type,
+                    weights=weights,
+                    median_cost_kop=median_cost,
+                    days_since=history.days_since(recipe_id),
+                    rating=ratings.get(recipe_id),
+                    known=known,
+                    kcal_target=kcal_target,
+                    dish_type=score.dish_type,
+                ),
+            ),
+            "delta_kcal": (
+                score.kcal - current_score.kcal
+                if current_score is not None and score.kcal and current_score.kcal
+                else None
+            ),
+            "delta_cost_kop": (
+                score.cost_kop - current_score.cost_kop
+                if current_score is not None
+                else None
+            ),
+        }
+        by_group[card["group"]].append(card)
+
+    cards: list[dict[str, Any]] = []
+    for group, quota in ALTERNATIVE_GROUP_QUOTAS:
+        cards.extend(by_group[group][:quota])
+    if len(cards) < limit:
+        # Группы добираются друг из друга: пустая «новое» не должна оставлять
+        # пользователя с шестью вариантами вместо десяти.
+        chosen = {id(card) for card in cards}
+        for recipe_group in by_group.values():
+            for card in recipe_group:
+                if len(cards) >= limit:
+                    break
+                if id(card) not in chosen:
+                    cards.append(card)
+                    chosen.add(id(card))
+    return cards[: max(1, limit)]
 
 
 def _min_distinct_for_horizon(days: int) -> int:
@@ -1314,21 +1779,35 @@ def slot_alternatives(
     inventory: list[dict[str, Any]],
     recipes: list[dict[str, Any]],
     products: list[dict[str, Any]],
-    price_tier: str = "balanced",
+    price_tier: str | None = None,
     product_matcher: ProductMatcher | None = None,
     synonyms: Any = None,
     ratings: dict[int, int] | None = None,
     limit: int = 3,
     nutrition: dict[str, dict[str, Any]] | None = None,
     keep_ids: Sequence[int] = (),
+    history: list[dict[str, Any]] | None = None,
+    plan_profile: dict[str, Any] | None = None,
+    taste_events: list[dict[str, Any]] | None = None,
+    with_details: bool = False,
+    mode: str | None = None,
 ) -> list[dict[str, Any]]:
     """Кандидаты на один слот при зафиксированных остальных блюдах (TZ-M5R §3).
 
     Жёсткие ограничения повторяемости учитывают остальные приёмы плана:
     блюдо не предлагается, если оно уже стоит в этот же или соседний день
     или использовано дважды на горизонте.
+
+    ``with_details`` (TZ-M8 §6.6) возвращает не голые рецепты, а карточки
+    замены: группа («похожее», «другое», «новое»), одна главная причина и
+    дельты к калориям и стоимости относительно текущего блюда. Десятка из
+    одних блинов бесполезна — группы гарантируют, что выбор действительно
+    разный.
     """
+    from .planning import context as context_mod
     from .planning import optimizer as optimizer_mod
+    from .planning import taste as taste_mod
+    from .planning import weights as weights_mod
     from .planning.candidates import (
         Synonyms, hard_rule_terms, ingredient_matches_terms, score_candidates,
     )
@@ -1336,6 +1815,11 @@ def slot_alternatives(
     synonyms_dict = synonyms if isinstance(synonyms, Synonyms) else Synonyms.from_rows(synonyms or [])
     banned = hard_rule_terms(rules, synonyms_dict, _normal)
     available_appliances = set(appliances)
+    # Замены ранжируются той же формулой и теми же весами, что и план:
+    # иначе «лучшая альтернатива» была бы лучшей по другому критерию.
+    plan_mode = mode or (plan_profile or {}).get("mode")
+    weights = weights_mod.weights_for(plan_mode)
+    price_tier = price_tier or weights_mod.price_tier_for(plan_mode)
 
     blocked_ids: set[int] = set()
     use_count: dict[int, int] = {}
@@ -1371,10 +1855,29 @@ def slot_alternatives(
     ]
     if not pool:
         return []
+    # Текущее блюдо оценивается вместе с остальными: без него не посчитать,
+    # насколько альтернатива дороже или калорийнее.
+    current_recipe = next(
+        (
+            recipe
+            for recipe in recipes
+            if current_recipe_id is not None and int(recipe["id"]) == int(current_recipe_id)
+        ),
+        None,
+    )
+    scored_pool = pool + ([current_recipe] if current_recipe is not None else [])
 
     product_matcher = product_matcher or ProductMatcher(products)
+    from .planning import scaling as scaling_mod
+
+    servings = scaling_mod.desired_servings(people)
+
+    def _scale_of(recipe: dict[str, Any]) -> Decimal | None:
+        scale, _unknown = scaling_mod.recipe_scale(recipe, servings)
+        return scale
+
     scores = score_candidates(
-        pool,
+        scored_pool,
         meal_types=[meal_type],
         cuisines=cuisines,
         rules=rules,
@@ -1383,22 +1886,31 @@ def slot_alternatives(
         synonyms=synonyms_dict,
         normal=_normal,
         tokens=_tokens,
-        cost_hint=lambda ingredient: _ingredient_cost_hint(
-            ingredient, product_matcher, price_tier
+        cost_hint=lambda ingredient, needed, unit: _ingredient_cost_hint(
+            ingredient, product_matcher, price_tier, needed, unit
         ),
         meal_score=_meal_score,
-        kcal_hint=_make_kcal_hint(nutrition),
+        macros_hint=_make_macros_hint(nutrition),
+        base_quantity=_base_quantity,
+        scale_of=_scale_of,
     )
-    for rated_id, rating in (ratings or {}).items():
-        if rated_id in scores:
-            scores[rated_id].rating_bonus = int(rating) - 3
-    cost_factor = optimizer_mod.PRICE_TIER_COST_FACTOR.get(price_tier, 10)
+    # Вкус семьи — и в заменах: альтернативы ранжируются той же формулой,
+    # что и план (TZ-M8 §4, §6.6).
+    taste_metas = taste_mod.build_metas(scored_pool)
+    taste_model = taste_mod.TasteModel.fit(taste_events or [], taste_metas, meal_date)
+    taste_known = taste_mod.known_recipes(taste_model)
+    for recipe in scored_pool:
+        recipe_id = int(recipe["id"])
+        scores[recipe_id].affinity = taste_model.family_affinity(
+            taste_metas[recipe_id], people
+        )
+        scores[recipe_id].unknown = recipe_id not in taste_known
     ranked = sorted(
         pool,
         key=lambda recipe: (
             scores[int(recipe["id"])].meal_fit.get(meal_type, 0.0) <= 0,
             optimizer_mod.slot_coefficient(
-                scores[int(recipe["id"])], meal_type, cost_factor
+                scores[int(recipe["id"])], meal_type, weights
             ),
             optimizer_mod.stable_tiebreak(int(recipe["id"]), f"replace:{meal_type}"),
         ),
@@ -1433,12 +1945,26 @@ def slot_alternatives(
     # своих не хватило на весь список.
     cuisine_set = set(cuisines)
     if cuisine_set:
-        preferred = _cuisine_preferred(
-            ranked, lambda recipe: recipe.get("cuisine_code"), cuisine_set
-        )
+        preferred = [recipe for recipe in ranked if cuisine_matches(recipe, cuisine_set)]
         if preferred:
             preferred_ids = {int(recipe["id"]) for recipe in preferred}
             rest = [recipe for recipe in ranked if int(recipe["id"]) not in preferred_ids]
             ranked = _diversify_by_dish_type(preferred) + _diversify_by_dish_type(rest)
-            return ranked[: max(1, limit)]
-    return _diversify_by_dish_type(ranked)[: max(1, limit)]
+        else:
+            ranked = _diversify_by_dish_type(ranked)
+    else:
+        ranked = _diversify_by_dish_type(ranked)
+    if not with_details:
+        return ranked[: max(1, limit)]
+    return _alternative_cards(
+        ranked,
+        scores=scores,
+        current=current_recipe,
+        meal_type=meal_type,
+        meal_date=meal_date,
+        weights=weights,
+        people=people,
+        ratings=ratings or {},
+        history=context_mod.build_history(history or [], meal_date),
+        limit=limit,
+    )

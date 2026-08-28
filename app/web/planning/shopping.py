@@ -9,12 +9,15 @@ UI собирает их в секцию «уточнить в магазине�
 
 from __future__ import annotations
 
+import logging
 import math
 from datetime import date
 from decimal import Decimal
 from typing import Any
 
-from .candidates import Synonyms
+from .candidates import Synonyms, canonical_overlap
+
+_log = logging.getLogger(__name__)
 
 #: то, что есть из-под крана и не покупается — в список покупок не попадает
 PANTRY_FREE = {"вода", "кипяток", "лед", "лёд"}
@@ -78,21 +81,11 @@ def prepare_inventory(
     return prepared
 
 
-def _canonical_overlap(lot_canonical: str, canonical: str) -> bool:
-    return bool(
-        lot_canonical
-        and (
-            lot_canonical == canonical
-            or set(lot_canonical.split()) & set(canonical.split())
-        )
-    )
-
-
 def _has_stock(lots: list[dict[str, Any]], canonical: str) -> bool:
     """Есть ли продукт дома хоть в каком-то количестве (единица не важна —
     «соль по вкусу» покрывается солью в любой фасовке)."""
     return any(
-        _canonical_overlap(lot["canonical"], canonical) and lot["base_quantity"] > 0
+        canonical_overlap(lot["canonical"], canonical) and lot["base_quantity"] > 0
         for lot in lots
     )
 
@@ -106,7 +99,7 @@ def _consume_fefo(
         (
             lot
             for lot in lots
-            if lot["base_unit"] == unit and _canonical_overlap(lot["canonical"], canonical)
+            if lot["base_unit"] == unit and canonical_overlap(lot["canonical"], canonical)
         ),
         key=lambda lot: (lot.get("expires_on") is None, lot.get("expires_on") or date.max),
     )
@@ -128,14 +121,22 @@ def build_shopping(
     matcher: Any,
     price_tier: str,
     base_quantity: Any,
+    pack_hint: dict[int, int] | None = None,
 ) -> tuple[list[dict[str, Any]], int, int]:
     """Список покупок: FEFO-покрытие, упаковки, стоимость.
 
     Возвращает (позиции, суммарная стоимость, число позиций с ценой).
+
+    ``pack_hint`` — сколько пачек каждого товара взял солвер (TZ-M8 §6.3).
+    Список считает своё число пачек сам: он один видит и агрегацию по всему
+    плану, и FEFO-списание запасов. Подсказка нужна для сверки: расхождение
+    больше чем на пачку означает, что модель и список считают разное, и это
+    должно быть видно (``pack_mismatch``), а не молча разъезжаться.
     """
     shopping: list[dict[str, Any]] = []
     total_cost = 0
     matched_cost_items = 0
+    mismatches: list[str] = []
     for (canonical, unit), entry in sorted(
         aggregate.items(), key=lambda item: (item[0][0], item[0][1] or "")
     ):
@@ -175,6 +176,11 @@ def build_shopping(
                 leftover = pack_count * pack_base - buy_quantity
                 total_cost += estimated_cost
                 matched_cost_items += 1
+                hinted = (pack_hint or {}).get(int(matched_product["id"]))
+                if hinted is not None and abs(hinted - pack_count) > 1:
+                    mismatches.append(
+                        f"{canonical}: модель {hinted}, список {pack_count}"
+                    )
         shopping.append(
             {
                 "normalized_name": canonical,
@@ -193,4 +199,6 @@ def build_shopping(
                 ),
             }
         )
+    if mismatches:
+        _log.warning("planner.pack_mismatch: %s", "; ".join(mismatches))
     return shopping, total_cost, matched_cost_items

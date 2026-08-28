@@ -108,6 +108,7 @@
             <li><a class="nav__item" href="#/recipes" data-icon="book">Рецепты</a></li>
             <li><a class="nav__item" href="#/inventory" data-icon="fridge">Запасы</a></li>
             <li><a class="nav__item" href="#/products" data-icon="price">Продукты «Ленты»</a></li>
+            <li><a class="nav__item" href="#/taste" data-icon="star">Вкусы семьи</a></li>
             <li><a class="nav__item" href="#/settings" data-icon="settings">Настройки</a></li>
           </ul>
         </nav>
@@ -158,9 +159,10 @@
                 <span>Сколько дней</span>
                 <select id="plan-days">
                   <option value="1">1 день</option>
-                  <option value="3" selected>3 дня</option>
+                  <option value="3">3 дня</option>
                   <option value="5">5 дней</option>
-                  <option value="7">7 дней</option>
+                  <option value="7" selected>7 дней</option>
+                  <option value="14">14 дней</option>
                 </select>
               </label>
               <label class="field">
@@ -168,22 +170,18 @@
                 <input id="plan-budget" type="number" min="0" step="50" placeholder="без ограничения" />
               </label>
               <fieldset class="field form-grid--full fieldset">
-                <legend>Ценовая стратегия</legend>
-                <div class="chips chips--tiers">
-                  <label class="check-option">
-                    <input type="radio" name="price-tier" value="economy" />
-                    <span>Экономно</span>
-                  </label>
-                  <label class="check-option">
-                    <input type="radio" name="price-tier" value="balanced" checked />
-                    <span>Сбалансированно</span>
-                  </label>
-                  <label class="check-option">
-                    <input type="radio" name="price-tier" value="premium" />
-                    <span>Премиально</span>
-                  </label>
-                </div>
+                <legend>Режим</legend>
+                <div id="plan-modes" class="chips chips--tiers" role="radiogroup"></div>
+                <p id="plan-mode-hint" class="footnote"></p>
               </fieldset>
+              <fieldset class="field form-grid--full fieldset">
+                <legend>Какие приёмы планируем</legend>
+                <div id="plan-meals" class="chips chips--tiers"></div>
+              </fieldset>
+              <label class="check-option form-grid--full">
+                <input id="plan-leftovers" type="checkbox" />
+                <span>Готовить на два раза: ужин закрывает завтрашний обед</span>
+              </label>
               <fieldset class="field form-grid--full fieldset" id="plan-cuisines-block" hidden>
                 <legend>Кухни <span class="field__optional">необязательно</span></legend>
                 <div id="plan-cuisines" class="chips" role="group" aria-label="Предпочитаемые кухни"></div>
@@ -359,6 +357,26 @@
         </section>
 
         <!-- ---------------------------- Настройки ---------------------------- -->
+        <section id="view-taste" class="view">
+          <div class="page-head">
+            <div class="page-head__text">
+              <h1>Вкусы семьи</h1>
+              <p class="lead">
+                Планировщик учится на оценках, заменах и отметках «приготовили».
+                Здесь видно, что он уже понял, и можно подсказать напрямую.
+              </p>
+            </div>
+          </div>
+          <section class="panel">
+            <div class="panel__head"><h2>Что вы любите</h2></div>
+            <div id="taste-onboarding"></div>
+          </section>
+          <section class="panel">
+            <div class="panel__head"><h2>Что планировщик уже знает</h2></div>
+            <div id="taste-summary"></div>
+          </section>
+        </section>
+
         <section id="view-settings" class="view">
           <div class="page-head">
             <div class="page-head__text">
@@ -408,6 +426,18 @@
                 «Строгое» правило полностью исключает рецепт. Совпадение ищется по вхождению
                 слова в названия ингредиентов, поэтому редкие случаи стоит перепроверять.
               </p>
+            </section>
+
+            <section class="panel">
+              <div class="panel__head"><h2>Как планируем</h2></div>
+              <div id="settings-plan-profile" class="settings-stack"></div>
+              <p class="footnote">
+                Эти значения подставляются в форму плана. Изменения в самой форме
+                действуют только на один план и сюда не записываются.
+              </p>
+              <button id="plan-profile-save" class="btn btn--small form-submit" type="button">
+                Сохранить настройки планирования
+              </button>
             </section>
 
             <section class="panel">

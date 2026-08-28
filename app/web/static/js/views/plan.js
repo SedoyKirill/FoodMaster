@@ -20,6 +20,70 @@ import { badge, el, frag, humanError, load, metaList, mount, statePanel } from "
 
 const MEAL_SLOTS = ["breakfast", "lunch", "dinner"];
 const selectedCuisines = new Set();
+let profileApplied = false;
+
+/* Форма плана предзаполняется профилем семьи (TZ-M8 §3.4): вводить кухни,
+ * бюджет и режим заново при каждой генерации — ровно та работа, ради отмены
+ * которой профиль и заводился. Правки в форме действуют на один план и
+ * обратно в профиль не пишутся. */
+function renderModeChoices(current) {
+  const hint = document.getElementById("plan-mode-hint");
+  hint.textContent = format.PLAN_MODE_HINTS[current] || "";
+  mount(
+    document.getElementById("plan-modes"),
+    frag(
+      ...Object.entries(format.PLAN_MODES).map(([code, title]) =>
+        el("label.check-option", { title: format.PLAN_MODE_HINTS[code] }, [
+          el("input", { type: "radio", name: "plan-mode", value: code, checked: code === current }),
+          el("span", { text: title }),
+        ]),
+      ),
+    ),
+  );
+}
+
+function renderMealChoices(selected) {
+  const chosen = new Set(selected);
+  mount(
+    document.getElementById("plan-meals"),
+    frag(
+      ...MEAL_SLOTS.map((meal) =>
+        el("label.check-option", {}, [
+          el("input", { type: "checkbox", name: "plan-meal", value: meal, checked: chosen.has(meal) }),
+          el("span", { text: format.mealLabel(meal) }),
+        ]),
+      ),
+    ),
+  );
+}
+
+async function applyProfile() {
+  let profile = store.get("planProfile");
+  if (!profile) {
+    try {
+      profile = await api.planProfile();
+      store.set("planProfile", profile);
+    } catch (error) {
+      profile = null;
+    }
+  }
+  renderModeChoices(profile?.mode || "balanced");
+  renderMealChoices(profile?.meals || MEAL_SLOTS);
+  document.getElementById("plan-leftovers").checked = profile?.allow_leftovers !== false;
+  // Значения формы перетираются профилем один раз за сессию: если человек
+  // уже поменял «на 3 дня», возврат на экран не должен это отменять.
+  if (profile && !profileApplied) {
+    document.getElementById("plan-days").value = String(profile.default_days || 7);
+    if (profile.weekly_budget_kop) {
+      const days = Number(profile.default_days || 7);
+      document.getElementById("plan-budget").value = String(
+        Math.round((profile.weekly_budget_kop / 100) * (days / 7)),
+      );
+    }
+    for (const code of profile.cuisines || []) selectedCuisines.add(code);
+    profileApplied = true;
+  }
+}
 
 /* Кухни размечены — рисуем чипы-переключатели в форме; пустые фасеты
  * оставляют блок скрытым (как в фильтрах рецептов). */
@@ -106,7 +170,43 @@ function warningBadge(code) {
 function mealBadges(meal) {
   const warnings = Array.isArray(meal.warnings) ? meal.warnings : [];
   const badges = warnings.map(warningBadge).filter(Boolean);
+  // «На два раза» (§6.2): у наследника — что готовить не нужно, у источника —
+  // что порций больше, чем едоков за этим столом.
+  if (meal.leftover_of) badges.unshift(badge("остаток вчерашнего", "ok"));
+  else if (meal.cooks_ahead) badges.unshift(badge("на два раза", "ok"));
   return badges.length ? el("div.slot__badges", {}, badges) : null;
+}
+
+/* «Почему это блюдо» (§5): коды с параметрами, текст собирает format. */
+function mealReasons(meal) {
+  const texts = (Array.isArray(meal.reasons) ? meal.reasons : [])
+    .map(format.reasonText)
+    .filter(Boolean);
+  if (!texts.length) return null;
+  return el("ul.slot__reasons", {}, texts.map((text) => el("li", { text })));
+}
+
+/* Отметки «приготовили / пропустили» — самый честный сигнал вкуса (§4.1).
+ * Предлагаются только для прошедших слотов: спрашивать про завтрашний ужин
+ * бессмысленно, а молчание мнением не считается. */
+function mealStatusControls(plan, meal) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (!meal.id || !canEdit() || String(meal.meal_date) > today) return null;
+  if (meal.status) {
+    return el("span.slot__status.footnote", {
+      text: meal.status === "cooked" ? "Приготовили" : "Пропустили",
+    });
+  }
+  return el("span.slot__status", {}, [
+    el("button.btn.btn--small", {
+      type: "button", text: "Приготовили",
+      dataset: { action: "plan:cooked", planId: plan.id, mealId: meal.id, status: "cooked" },
+    }),
+    el("button.btn.btn--small", {
+      type: "button", text: "Пропустили",
+      dataset: { action: "plan:cooked", planId: plan.id, mealId: meal.id, status: "skipped" },
+    }),
+  ]);
 }
 
 function slot(plan, mealType, meal) {
@@ -117,6 +217,7 @@ function slot(plan, mealType, meal) {
       ? frag(
           el("a.slot__dish", { href: `#/recipes/${meal.recipe_id}`, text: meal.title }),
           mealBadges(meal),
+          mealReasons(meal),
           el("div.slot__foot", {}, [
             metaList([
               meal.servings ? format.countWord(meal.servings, "порция", "порции", "порций") : null,
@@ -127,6 +228,7 @@ function slot(plan, mealType, meal) {
                 ? `Б/Ж/У ${meal.estimated_protein}/${meal.estimated_fat}/${meal.estimated_carb} г`
                 : null,
             ]),
+            mealStatusControls(plan, meal),
             el("button.btn.btn--small", {
               type: "button",
               text: "Заменить",
@@ -308,7 +410,7 @@ function planView(plan) {
         }),
         metaList([
           `${coverage}% покрытия`,
-          format.PRICE_TIERS[plan.price_tier] || "Сбалансированно",
+          format.planModeLabel(plan.mode),
         ]),
       ]),
       el("div.plan-summary__price.money", { text: format.money(plan.estimated_cost_kop) || "—" }),
@@ -427,6 +529,7 @@ async function showPlan(planId) {
 
 export async function enter(planId = null) {
   document.getElementById("plan-start").value ||= new Date().toISOString().slice(0, 10);
+  await applyProfile();
   renderCuisineChoices();
   await loadHistory();
   await showPlan(planId);
@@ -443,7 +546,11 @@ export function init() {
       starts_on: document.getElementById("plan-start").value,
       days: Number(document.getElementById("plan-days").value),
       cuisines: [...selectedCuisines],
-      price_tier: document.querySelector('input[name="price-tier"]:checked')?.value || "balanced",
+      mode: document.querySelector('input[name="plan-mode"]:checked')?.value || "balanced",
+      meals: [...document.querySelectorAll('input[name="plan-meal"]:checked')].map(
+        (input) => input.value,
+      ),
+      allow_leftovers: document.getElementById("plan-leftovers").checked,
       budget_rub: budget ? Number(budget) : null,
     };
     button.disabled = true;
@@ -477,6 +584,35 @@ export function init() {
     }
   });
 
+  document.getElementById("plan-modes").addEventListener("change", (event) => {
+    if (event.target.name !== "plan-mode") return;
+    document.getElementById("plan-mode-hint").textContent =
+      format.PLAN_MODE_HINTS[event.target.value] || "";
+  });
+
+  register("plan:cooked", async (target) => {
+    const { planId, mealId, status } = target.dataset;
+    target.disabled = true;
+    try {
+      await api.setMealStatus(planId, mealId, status);
+      const plan = store.get(`plans.byId.${planId}`);
+      const meal = plan?.meals?.find((entry) => entry.id === mealId);
+      if (meal) meal.status = status;
+      mount(
+        target.parentElement,
+        el("span.footnote", { text: status === "cooked" ? "Приготовили" : "Пропустили" }),
+      );
+      toast.ok(
+        status === "cooked"
+          ? "Запомнили: это блюдо у вас пошло"
+          : "Запомнили: это блюдо не пригодилось",
+      );
+    } catch (error) {
+      target.disabled = false;
+      toast.ok(humanError(error));
+    }
+  });
+
   register("plan:cuisine", (target) => {
     const code = target.dataset.cuisine;
     if (selectedCuisines.has(code)) selectedCuisines.delete(code);
@@ -503,6 +639,7 @@ export function init() {
                 dataset: { action: "plan:swap-apply", planId, mealId, recipeId: alt.recipe_id },
               }, [
                 el("span", { text: alt.title }),
+                alt.reason ? el("small.swap-option__why", { text: format.reasonText(alt.reason) || "" }) : null,
                 alt.draft ? badge("черновик", "draft") : null,
               ]),
             ]),

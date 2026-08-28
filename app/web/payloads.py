@@ -15,6 +15,7 @@ from __future__ import annotations
 import uuid
 from datetime import date
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -63,18 +64,37 @@ class PasswordPayload(BaseModel):
     password: str
 
 
+#: TZ-M8 §3.1 — профиль едока; все мерки необязательны, без них норма
+#: считается константой, а не выдумывается.
 class PersonPayload(BaseModel):
     id: uuid.UUID | None = None
     name: str = Field(min_length=1, max_length=80)
     person_type: str = "adult"
     target_kcal: int | None = Field(default=None, ge=500, le=6000)
     portion_factor: Decimal = Field(default=Decimal("1"), gt=0, le=3)
+    birth_date: date | None = None
+    sex: Literal["female", "male"] | None = None
+    height_cm: Decimal | None = Field(default=None, ge=30, le=250)
+    weight_kg: Decimal | None = Field(default=None, ge=2, le=400)
+    activity: Literal["low", "moderate", "high"] = "moderate"
+    goal: Literal["maintain", "lose", "gain"] = "maintain"
+    protein_share: Decimal | None = Field(default=None, gt=0, le=1)
+    fat_share: Decimal | None = Field(default=None, gt=0, le=1)
+    carb_share: Decimal | None = Field(default=None, gt=0, le=1)
+    meal_shares: dict[str, Decimal] | None = None
+    eats_meals: list[Literal["breakfast", "lunch", "dinner"]] = Field(
+        default_factory=lambda: ["breakfast", "lunch", "dinner"]
+    )
 
 
 class RulePayload(BaseModel):
     rule_type: str = "exclude"
     term: str = Field(min_length=1, max_length=100)
     is_hard: bool = True
+    #: чьё правило; None — всей семьи (TZ-M8 §3.2)
+    person_id: uuid.UUID | None = None
+    #: требование к рецепту по diet_tags (vegetarian, lean, …)
+    diet_tag: str | None = Field(default=None, max_length=40)
 
 
 class SettingsPayload(BaseModel):
@@ -107,14 +127,67 @@ class PersonPatchPayload(BaseModel):
     person_type: str | None = None
     target_kcal: int | None = Field(default=None, ge=500, le=6000)
     portion_factor: Decimal | None = Field(default=None, gt=0, le=3)
+    birth_date: date | None = None
+    sex: Literal["female", "male"] | None = None
+    height_cm: Decimal | None = Field(default=None, ge=30, le=250)
+    weight_kg: Decimal | None = Field(default=None, ge=2, le=400)
+    activity: Literal["low", "moderate", "high"] | None = None
+    goal: Literal["maintain", "lose", "gain"] | None = None
+    protein_share: Decimal | None = Field(default=None, gt=0, le=1)
+    fat_share: Decimal | None = Field(default=None, gt=0, le=1)
+    carb_share: Decimal | None = Field(default=None, gt=0, le=1)
+    meal_shares: dict[str, Decimal] | None = None
+    eats_meals: list[Literal["breakfast", "lunch", "dinner"]] | None = None
+
+
+#: Режимы планирования (TZ-M8 §6.4): за каждым — свой набор весов.
+PLAN_MODES = ("economy", "balanced", "variety", "fitness", "quick")
+
+
+class PlanProfilePayload(BaseModel):
+    """Профиль планирования семьи (TZ-M8 §3.4)."""
+
+    mode: Literal[PLAN_MODES] = "balanced"  # type: ignore[valid-type]
+    default_days: int = Field(default=7, ge=1, le=14)
+    weekly_budget_kop: int | None = Field(default=None, ge=0, le=10_000_000)
+    cuisines: list[str] = Field(default_factory=list)
+    cuisine_mode: Literal["prefer", "only"] = "only"
+    weekday_max_minutes: int | None = Field(default=45, ge=5, le=600)
+    weekend_max_minutes: int | None = Field(default=None, ge=5, le=600)
+    breakfast_max_minutes: int | None = Field(default=25, ge=5, le=600)
+    meals: list[Literal["breakfast", "lunch", "dinner"]] = Field(
+        default_factory=lambda: ["breakfast", "lunch", "dinner"]
+    )
+    allow_leftovers: bool = True
+    novelty: Literal["low", "medium", "high"] = "medium"
+    max_repeats_per_horizon: int = Field(default=2, ge=1, le=7)
 
 
 class PlanPayload(BaseModel):
+    """Форма плана. Незаполненные поля берутся из профиля семьи (§3.4)."""
+
     starts_on: date = Field(default_factory=date.today)
-    days: int = Field(default=3, ge=1, le=7)
-    cuisines: list[str] = Field(default_factory=list)
+    days: int | None = Field(default=None, ge=1, le=14)
+    cuisines: list[str] | None = None
     budget_rub: Decimal | None = Field(default=None, ge=0, le=1_000_000)
-    price_tier: str = "balanced"
+    price_tier: str | None = None
+    mode: Literal[PLAN_MODES] | None = None  # type: ignore[valid-type]
+    meals: list[Literal["breakfast", "lunch", "dinner"]] | None = None
+    allow_leftovers: bool | None = None
+
+
+class MealStatusPayload(BaseModel):
+    status: Literal["cooked", "skipped"]
+
+
+class OnboardingAnswer(BaseModel):
+    recipe_id: int = Field(ge=1)
+    #: None — «пропустить»: молчание мнением не считается
+    liked: bool | None = None
+
+
+class OnboardingPayload(BaseModel):
+    answers: list[OnboardingAnswer] = Field(default_factory=list, max_length=60)
 
 
 class RatingPayload(BaseModel):
