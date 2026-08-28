@@ -10,7 +10,7 @@ import time
 from collections import defaultdict
 from datetime import date, timedelta
 from decimal import Decimal
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Sequence
 
 from .nutrition import ingredient_kcal, nutrition_from_row
 
@@ -1320,6 +1320,7 @@ def slot_alternatives(
     ratings: dict[int, int] | None = None,
     limit: int = 3,
     nutrition: dict[str, dict[str, Any]] | None = None,
+    keep_ids: Sequence[int] = (),
 ) -> list[dict[str, Any]]:
     """Кандидаты на один слот при зафиксированных остальных блюдах (TZ-M5R §3).
 
@@ -1417,6 +1418,17 @@ def slot_alternatives(
         ranked = exact
     elif len(partial) >= threshold:
         ranked = partial
+    # keep_ids: блюдо, выбранное человеком вручную, ранжирующий фильтр
+    # отсекать не должен. «Поставить в четверг на ужин» — это решение, а не
+    # подсказка; жёсткие ограничения (техника, аллергии, повторы) уже
+    # применены к пулу выше, а разметка meal_types есть не у всех рецептов.
+    if keep_ids:
+        present = {int(recipe["id"]) for recipe in ranked}
+        wanted = {int(value) for value in keep_ids}
+        ranked = ranked + [
+            recipe for recipe in pool
+            if int(recipe["id"]) in wanted and int(recipe["id"]) not in present
+        ]
     # Блюда выбранной кухни идут первыми; остальные добираются, только если
     # своих не хватило на весь список.
     cuisine_set = set(cuisines)

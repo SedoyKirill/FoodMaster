@@ -110,6 +110,11 @@ class _AppRepo:
     async def recipe_facets(self):
         return self.facets
 
+    async def get_profile(self, session):
+        return getattr(self, "profile", None) or {
+            "appliances": [], "people": [], "dietary_rules": [],
+        }
+
     async def recipe_detail(self, recipe_id, household_id=None):
         return self.card if self.card and int(self.card["id"]) == int(recipe_id) else None
 
@@ -370,25 +375,36 @@ class AddToPlanTests(unittest.TestCase):
         self.assertEqual((meal_date, meal_type, recipe_id), (date(2026, 9, 2), "dinner", 7))
         self.assertIn("День 2 из 3", result.edit.text)
 
-    def test_unsuitable_recipe_explains_why(self) -> None:
+    def test_unsuitable_recipe_names_the_missing_appliance(self) -> None:
+        """Причина должна быть проверяемой, а не выдуманной."""
         app_repository = _AppRepo(
             plan=plan_with_days(3),
+            card={**detail(7), "appliances": ["oven", "steamer"]},
             add_error=ValueError("Этот рецепт нельзя поставить в выбранный слот"),
         )
+        app_repository.profile = {"appliances": ["oven"], "people": [], "dietary_rules": []}
         result = run_async(recipes.put_in_plan(app_repository, CONTEXT, 7, 1, "breakfast"))
-        self.assertIn("нельзя поставить", result.edit.text)
-        self.assertIn("технике или ограничениям", result.edit.text)
+        self.assertIn("нужна техника", result.edit.text)
+        self.assertIn("Пароварка", result.edit.text)
 
-    def test_cuisine_filter_is_named_as_the_reason(self) -> None:
-        """Кухня — жёсткий фильтр плана, но пользователю про это нигде не сказано."""
-        plan = {**plan_with_days(3), "cuisine_preferences": ["asian"]}
+    def test_recipe_already_in_plan_is_named_as_the_reason(self) -> None:
+        plan = plan_with_days(3)
+        plan["meals"][0]["recipe_id"] = 7
         app_repository = _AppRepo(
-            plan=plan, card={**detail(1), "cuisine_code": "middle_eastern"},
+            plan=plan, card=detail(7),
             add_error=ValueError("Этот рецепт нельзя поставить в выбранный слот"),
         )
-        result = run_async(recipes.put_in_plan(app_repository, CONTEXT, 1, 1, "lunch"))
-        self.assertIn("Азиатская", result.edit.text)
-        self.assertIn("ближневосточная", result.edit.text)
+        result = run_async(recipes.put_in_plan(app_repository, CONTEXT, 7, 1, "lunch"))
+        self.assertIn("уже стоит в плане", result.edit.text)
+
+    def test_unknown_reason_is_not_invented(self) -> None:
+        app_repository = _AppRepo(
+            plan=plan_with_days(3), card={**detail(7), "appliances": []},
+            add_error=ValueError("Этот рецепт нельзя поставить в выбранный слот"),
+        )
+        app_repository.profile = {"appliances": ["oven"], "people": [], "dietary_rules": []}
+        result = run_async(recipes.put_in_plan(app_repository, CONTEXT, 7, 1, "breakfast"))
+        self.assertIn("ограничение в питании", result.edit.text)
 
     def test_day_out_of_range(self) -> None:
         result = run_async(recipes.put_in_plan(

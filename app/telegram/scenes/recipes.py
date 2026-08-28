@@ -12,7 +12,7 @@ import uuid as uuid_mod
 from datetime import date
 from typing import Any
 
-from app.web.categories import cuisine_label, dish_type_label
+from app.web.categories import APPLIANCES, cuisine_label, dish_type_label
 from app.web.planner import clean_dish_title
 
 from ..callbacks import encode_callback
@@ -407,24 +407,26 @@ async def put_in_plan(app_repository: Any, session: dict[str, Any], recipe_id: i
 
 async def _rejection_hint(app_repository: Any, session: dict[str, Any],
                           plan: dict[str, Any], recipe_id: int) -> str:
-    """Почему рецепт не встал в слот — по тем причинам, что видно из данных.
+    """Почему рецепт не встал в слот — только то, что видно из данных.
 
-    Чаще всего дело в кухне: план собран под выбранные кухни, и они работают
-    жёстким фильтром (решение TZ-M6R). Человеку про это нигде не сказано,
-    поэтому говорим здесь.
+    Раньше здесь предполагалась кухня плана, но она лишь меняет порядок выдачи
+    и никого не отсекает. Настоящих причин две: не хватает техники или блюдо
+    уже стоит в плане рядом (повторы ограничены). Если ни то ни другое —
+    честно говорим, что дело в ограничениях семьи, и не выдумываем причину.
     """
-    wanted = [str(code) for code in (plan.get("cuisine_preferences") or [])]
-    if not wanted:
-        return " Возможно, он не подходит по технике или ограничениям семьи."
     detail = await app_repository.recipe_detail(recipe_id, session["household_id"])
-    own = str((detail or {}).get("cuisine_code") or "")
-    if own and own not in wanted:
-        names = ", ".join(cuisine_label(code) for code in wanted)
-        return (
-            f" Меню собрано под кухни: {names}, а рецепт — "
-            f"{cuisine_label(own).lower()}. Соберите меню без фильтра по кухне."
-        )
-    return " Возможно, он не подходит по технике или ограничениям семьи."
+    if detail is None:
+        return ""
+    for meal in plan.get("meals") or []:
+        if int(meal.get("recipe_id") or 0) == int(recipe_id):
+            return " Это блюдо уже стоит в плане, а повторы подряд ограничены."
+    profile = await app_repository.get_profile(session)
+    needed = {str(code) for code in (detail.get("appliances") or [])}
+    missing = needed - {str(code) for code in (profile.get("appliances") or [])}
+    if missing:
+        names = ", ".join(sorted(appliance_label(code) for code in missing))
+        return f" Для него нужна техника, которой нет в настройках: {names}."
+    return " Похоже, мешает строгое ограничение в питании — проверьте настройки."
 
 
 def _as_uuid(value: Any) -> Any:
@@ -450,3 +452,7 @@ async def handle_navigation(app_repository: Any, dialogs: Any, session: dict[str
             app_repository, session, int(parts[2]), int(parts[3]), parts[4]
         )
     return None
+
+
+def appliance_label(code: str) -> str:
+    return APPLIANCES.get(str(code), str(code))

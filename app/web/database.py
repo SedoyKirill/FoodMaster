@@ -1463,6 +1463,9 @@ class AppRepository:
                 cuisines=cuisines,
                 price_tier=header["price_tier"],
                 limit=MEAL_ALTERNATIVES_LIMIT if new_recipe_id is None else 1000,
+                # выбранное вручную блюдо проверяем по жёстким ограничениям,
+                # а не по ранжированию слота (TZ-M7 §5.7)
+                keep_ids=() if new_recipe_id is None else (int(new_recipe_id),),
                 **{
                     key: data[key]
                     for key in (
