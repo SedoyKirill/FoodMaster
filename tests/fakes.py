@@ -304,6 +304,28 @@ class FakeRepository:
                 return person
         return None
 
+    async def person_target(
+        self, session: dict[str, Any], person_id: uuid.UUID, on_date: Any = None
+    ) -> dict[str, Any] | None:
+        from datetime import date as _date
+
+        from app.web.planning.profile import daily_target
+
+        for person in self.people[session["household_id"]]:
+            if str(person["id"]) == str(person_id):
+                target = daily_target(person, on_date or _date.today())
+                return {
+                    "person_id": str(person["id"]),
+                    "name": person["name"],
+                    "kcal": target.kcal,
+                    "protein_g": target.protein_g,
+                    "fat_g": target.fat_g,
+                    "carb_g": target.carb_g,
+                    "by_meal": target.by_meal,
+                    "target_source": target.source,
+                }
+        return None
+
     # --- данные экранов ----------------------------------------------------
 
     async def dashboard(self, session: dict[str, Any]) -> dict[str, Any]:

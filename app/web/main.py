@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager, suppress
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import (
     APIRouter, Cookie, Depends, FastAPI, Header, HTTPException, Request, Response, status,
@@ -72,18 +72,37 @@ class AuthPayload(BaseModel):
     household_name: str = "Моя семья"
 
 
+#: TZ-M8 §3.1 — профиль едока; все мерки необязательны, без них норма
+#: считается константой, а не выдумывается.
 class PersonPayload(BaseModel):
     id: uuid.UUID | None = None
     name: str = Field(min_length=1, max_length=80)
     person_type: str = "adult"
     target_kcal: int | None = Field(default=None, ge=500, le=6000)
     portion_factor: Decimal = Field(default=Decimal("1"), gt=0, le=3)
+    birth_date: date | None = None
+    sex: Literal["female", "male"] | None = None
+    height_cm: Decimal | None = Field(default=None, ge=30, le=250)
+    weight_kg: Decimal | None = Field(default=None, ge=2, le=400)
+    activity: Literal["low", "moderate", "high"] = "moderate"
+    goal: Literal["maintain", "lose", "gain"] = "maintain"
+    protein_share: Decimal | None = Field(default=None, gt=0, le=1)
+    fat_share: Decimal | None = Field(default=None, gt=0, le=1)
+    carb_share: Decimal | None = Field(default=None, gt=0, le=1)
+    meal_shares: dict[str, Decimal] | None = None
+    eats_meals: list[Literal["breakfast", "lunch", "dinner"]] = Field(
+        default_factory=lambda: ["breakfast", "lunch", "dinner"]
+    )
 
 
 class RulePayload(BaseModel):
     rule_type: str = "exclude"
     term: str = Field(min_length=1, max_length=100)
     is_hard: bool = True
+    #: чьё правило; None — всей семьи (TZ-M8 §3.2)
+    person_id: uuid.UUID | None = None
+    #: требование к рецепту по diet_tags (vegetarian, lean, …)
+    diet_tag: str | None = Field(default=None, max_length=40)
 
 
 class SettingsPayload(BaseModel):
@@ -116,6 +135,17 @@ class PersonPatchPayload(BaseModel):
     person_type: str | None = None
     target_kcal: int | None = Field(default=None, ge=500, le=6000)
     portion_factor: Decimal | None = Field(default=None, gt=0, le=3)
+    birth_date: date | None = None
+    sex: Literal["female", "male"] | None = None
+    height_cm: Decimal | None = Field(default=None, ge=30, le=250)
+    weight_kg: Decimal | None = Field(default=None, ge=2, le=400)
+    activity: Literal["low", "moderate", "high"] | None = None
+    goal: Literal["maintain", "lose", "gain"] | None = None
+    protein_share: Decimal | None = Field(default=None, gt=0, le=1)
+    fat_share: Decimal | None = Field(default=None, gt=0, le=1)
+    carb_share: Decimal | None = Field(default=None, gt=0, le=1)
+    meal_shares: dict[str, Decimal] | None = None
+    eats_meals: list[Literal["breakfast", "lunch", "dinner"]] | None = None
 
 
 class PlanPayload(BaseModel):
@@ -504,6 +534,15 @@ async def patch_person(
     if not updated:
         raise HTTPException(status_code=404, detail="Человек не найден")
     return updated
+
+
+@router.get("/api/settings/people/{person_id}/target")
+async def person_target(person_id: uuid.UUID, repo: Repo, session: Session) -> dict[str, Any]:
+    """Норма едока и то, как она посчитана (TZ-M8 §3.1)."""
+    target = await repo.person_target(session, person_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Человек не найден")
+    return target
 
 
 @router.post("/api/telegram/link-token", status_code=201)

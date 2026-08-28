@@ -921,6 +921,7 @@ def build_plan(
 ) -> dict[str, Any]:
     """Фасад TZ-M5R: кандидаты → оценка → оптимизация → масштабирование → покупки."""
     from .planning import optimizer as optimizer_mod
+    from .planning import profile as profile_mod
     from .planning import scaling as scaling_mod
     from .planning import shopping as shopping_mod
     from .planning.candidates import (
@@ -934,34 +935,57 @@ def build_plan(
         synonyms_dict = Synonyms.from_rows(synonyms or [])
 
     available_appliances = set(appliances)
-    banned = hard_rule_terms(rules, synonyms_dict, _normal)
 
-    def _passes_hard_rules(recipe: dict[str, Any]) -> bool:
+    # TZ-M8 §3.1–3.2: слот принадлежит тем, кто ест его дома. Приём, который
+    # дома не ест никто, не планируется вовсе; жёсткое правило действует на
+    # слот, только если его автор за этим столом.
+    meal_types = [
+        meal for meal in MEAL_LABELS if profile_mod.slot_servings(people, meal) > 0
+    ] or list(MEAL_LABELS)
+    slot_terms: dict[str, set[str]] = {}
+    slot_diets: dict[str, set[str]] = {}
+    for meal in meal_types:
+        applicable, diet_tags = profile_mod.rule_terms_for_meal(rules, people, meal)
+        slot_terms[meal] = hard_rule_terms(applicable, synonyms_dict, _normal)
+        slot_diets[meal] = diet_tags
+    # Запрет, действующий во всех слотах, отсекает рецепт из пула целиком —
+    # остальные проверяются на своём слоте.
+    always_banned = set.intersection(*slot_terms.values()) if slot_terms else set()
+
+    def _blocked(recipe: dict[str, Any], terms: set[str]) -> bool:
+        if not terms:
+            return False
         for ingredient in recipe.get("ingredients", []):
             name = str(
                 ingredient.get("normalized_name") or ingredient.get("ingredient_text") or ""
             )
-            if ingredient_matches_terms(name, banned, synonyms_dict, _normal):
-                return False
-        return True
+            if ingredient_matches_terms(name, terms, synonyms_dict, _normal):
+                return True
+        return False
 
     pool = [
         recipe
         for recipe in recipes
-        if _recipe_allowed(recipe, (), available_appliances) and _passes_hard_rules(recipe)
+        if _recipe_allowed(recipe, (), available_appliances)
+        and not _blocked(recipe, always_banned)
     ]
     # Черновики добираются, только если готовых рецептов мало (TZ §2.1).
     ready_pool = [recipe for recipe in pool if recipe.get("review_status") == "ready"]
     if len(ready_pool) >= MIN_READY_CANDIDATES:
         pool = ready_pool
 
-    meal_types = list(MEAL_LABELS)
     if not pool:
         raise ValueError(
             "После применения ограничений осталось слишком мало рецептов "
             "со статусом «готов». Ослабьте ограничения в настройках."
         )
 
+    # Порции считаются по едокам слота: обед на двоих, ужин на троих. Для
+    # скоринга берётся полный состав — цена и калории кандидата пока едины на
+    # все слоты (уточнение до слота приходит с FeatureVector, TZ-M8 T6).
+    servings_by_meal = {
+        meal: profile_mod.slot_servings(people, meal) for meal in meal_types
+    }
     desired_servings = scaling_mod.desired_servings(people)
     plan_key = f"{household_id}:{starts_on.isoformat()}:{','.join(sorted(cuisines))}"
     product_matcher = product_matcher or ProductMatcher(products)
@@ -1004,9 +1028,34 @@ def build_plan(
     cuisine_of = {int(recipe["id"]): recipe.get("cuisine_code") for recipe in pool}
     needed_distinct = _min_distinct_for_horizon(days)
     candidates_by_slot: dict[tuple[int, str], list[int]] = {}
+    slot_warnings: list[str] = []
     for meal_type in meal_types:
+        # Личные запреты тех, кто за этим столом (TZ-M8 §3.2): блюдо с орехами
+        # уходит из обеда ребёнка, но остаётся во взрослом завтраке.
+        personal = slot_terms[meal_type] - always_banned
+        eligible = [
+            recipe for recipe in pool if not _blocked(recipe, personal)
+        ]
+        required_diets = slot_diets[meal_type]
+        if required_diets:
+            fitting = [
+                recipe
+                for recipe in eligible
+                if required_diets.issubset(
+                    {str(tag) for tag in json_list(recipe.get("diet_tags"))}
+                )
+            ]
+            if fitting:
+                eligible = fitting
+            else:
+                # Молча кормить вегетарианца мясом нельзя — но и оставлять его
+                # без обеда тоже: слот заполняется и честно помечается.
+                slot_warnings.append(
+                    f"diet_conflict: {MEAL_LABELS[meal_type].lower()} — в библиотеке нет "
+                    f"блюд с требуемой диетой ({', '.join(sorted(required_diets))})."
+                )
         ranked = sorted(
-            (int(recipe["id"]) for recipe in pool),
+            (int(recipe["id"]) for recipe in eligible),
             key=lambda recipe_id: (
                 scores[recipe_id].meal_fit.get(meal_type, 0.0) <= 0,
                 optimizer_mod.slot_coefficient(scores[recipe_id], meal_type, cost_factor),
@@ -1076,7 +1125,8 @@ def build_plan(
                 continue
             selected = recipes_by_id[recipe_id]
             score = scores[recipe_id]
-            scale, scale_unknown = scaling_mod.recipe_scale(selected, desired_servings)
+            slot_servings = servings_by_meal.get(meal_type, desired_servings)
+            scale, scale_unknown = scaling_mod.recipe_scale(selected, slot_servings)
             meal_warnings: list[str] = []
             if scale_unknown:
                 meal_warnings.append("scale_unknown")
@@ -1118,7 +1168,7 @@ def build_plan(
                     "draft": score.draft,
                     "scale": scale if scale is not None else Decimal("1"),
                     "scale_unknown": scale_unknown,
-                    "servings": desired_servings,
+                    "servings": slot_servings,
                     "warnings": meal_warnings,
                     **meal_nutrition,
                 }
@@ -1134,6 +1184,7 @@ def build_plan(
         aggregate, inventory_lots, product_matcher, price_tier, _base_quantity
     )
 
+    plan_warnings.extend(slot_warnings)
     if solver_status == "greedy":
         # K3: жадный запасной алгоритм не учитывает бюджет и калории —
         # деградация не должна быть тихой.

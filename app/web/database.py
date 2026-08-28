@@ -13,6 +13,7 @@ from typing import Any
 
 import asyncpg
 
+from .planning.profile import MEAL_TYPES, daily_target
 from .planner import (
     DEFAULT_APPLIANCES, ProductMatcher, ProductMatcherCache, _base_quantity,
     clean_dish_title, warm_product_matcher,
@@ -95,6 +96,19 @@ def _as_uuid(value: Any) -> uuid.UUID | None:
         return None
 
 
+#: поля человека, которые в БД лежат как JSONB
+PERSON_JSON_FIELDS = frozenset({"meal_shares", "eats_meals"})
+#: словари «код → допустимые значения» для полей профиля (TZ-M8 §3.1)
+PERSON_ENUMS = {
+    "sex": ({"female", "male"}, None),
+    "activity": ({"low", "moderate", "high"}, "moderate"),
+    "goal": ({"maintain", "lose", "gain"}, "maintain"),
+}
+PERSON_NUMERIC_FIELDS = frozenset(
+    {"height_cm", "weight_kg", "protein_share", "fat_share", "carb_share"}
+)
+
+
 def _coerce_person_field(field: str, value: Any) -> Any:
     if field == "name":
         return str(value or "")[:80]
@@ -102,7 +116,35 @@ def _coerce_person_field(field: str, value: Any) -> Any:
         return "child" if value == "child" else "adult"
     if field == "portion_factor":
         return Decimal(str(value))
+    if field in PERSON_ENUMS:
+        allowed, fallback = PERSON_ENUMS[field]
+        return str(value) if value in allowed else fallback
+    if field in PERSON_NUMERIC_FIELDS:
+        return None if value in (None, "") else Decimal(str(value))
+    if field == "birth_date":
+        if isinstance(value, date) or value is None:
+            return value
+        try:
+            return date.fromisoformat(str(value))
+        except ValueError:
+            return None
+    if field in PERSON_JSON_FIELDS:
+        return json.dumps(value, ensure_ascii=False) if value is not None else None
     return value
+
+
+def _person_profile_values(person: dict[str, Any]) -> tuple[Any, ...]:
+    """Поля профиля едока в порядке колонок ``app_core.people`` (TZ-M8 §3.1)."""
+    values = [
+        _coerce_person_field(field, person.get(field))
+        for field in (
+            "birth_date", "sex", "height_cm", "weight_kg", "activity", "goal",
+            "protein_share", "fat_share", "carb_share", "meal_shares", "eats_meals",
+        )
+    ]
+    if values[-1] is None:  # eats_meals NOT NULL: не указано — ест дома всё
+        values[-1] = json.dumps(list(MEAL_TYPES), ensure_ascii=False)
+    return tuple(values)
 
 
 class AppRepository:
@@ -266,7 +308,9 @@ class AppRepository:
         household_id = session["household_id"]
         people = await self.db().fetch(
             """
-            SELECT id, name, person_type, target_kcal, portion_factor
+            SELECT id, name, person_type, target_kcal, portion_factor,
+                   birth_date, sex, height_cm, weight_kg, activity, goal,
+                   protein_share, fat_share, carb_share, meal_shares, eats_meals
             FROM app_core.people WHERE household_id=$1 ORDER BY position, created_at
             """,
             household_id,
@@ -277,7 +321,7 @@ class AppRepository:
         )
         rules = await self.db().fetch(
             """
-            SELECT id, rule_type, term, is_hard
+            SELECT id, rule_type, term, is_hard, person_id, diet_tag
             FROM app_core.dietary_rules WHERE household_id=$1 ORDER BY rule_type, term
             """,
             household_id,
@@ -333,26 +377,34 @@ class AppRepository:
                 portion_factor = Decimal(str(
                     person.get("portion_factor") or ("0.65" if person_type == "child" else "1")
                 ))
+                extra = _person_profile_values(person)
                 if person_id in existing:
                     await connection.execute(
                         """
                         UPDATE app_core.people
-                        SET name=$3, person_type=$4, target_kcal=$5, portion_factor=$6, position=$7
+                        SET name=$3, person_type=$4, target_kcal=$5, portion_factor=$6,
+                            position=$7, birth_date=$8, sex=$9, height_cm=$10,
+                            weight_kg=$11, activity=$12, goal=$13, protein_share=$14,
+                            fat_share=$15, carb_share=$16, meal_shares=$17::jsonb,
+                            eats_meals=$18::jsonb
                         WHERE id=$1 AND household_id=$2
                         """,
                         person_id, household_id, name, person_type,
-                        person.get("target_kcal"), portion_factor, position,
+                        person.get("target_kcal"), portion_factor, position, *extra,
                     )
                 else:
                     person_id = uuid.uuid4()
                     await connection.execute(
                         """
                         INSERT INTO app_core.people (
-                            id, household_id, name, person_type, target_kcal, portion_factor, position
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                            id, household_id, name, person_type, target_kcal,
+                            portion_factor, position, birth_date, sex, height_cm,
+                            weight_kg, activity, goal, protein_share, fat_share,
+                            carb_share, meal_shares, eats_meals
+                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb,$18::jsonb)
                         """,
                         person_id, household_id, name, person_type,
-                        person.get("target_kcal"), portion_factor, position,
+                        person.get("target_kcal"), portion_factor, position, *extra,
                     )
                 keep.append(person_id)
             await connection.execute(
@@ -365,25 +417,40 @@ class AppRepository:
                 [(household_id, code) for code in sorted(set(appliances))],
             )
             await connection.execute("DELETE FROM app_core.dietary_rules WHERE household_id=$1", household_id)
+            kept_people = set(keep)
             for rule in rules:
                 term = str(rule.get("term") or "").strip().casefold()
                 if not term:
                     continue
+                # Правило нового человека приходит без сохранённого id: пока он
+                # не сохранён, правило считается семейным — терять аллергию
+                # из-за порядка сохранения нельзя (TZ-M8 §3.2).
+                person_ref = _as_uuid(rule.get("person_id"))
+                if person_ref not in kept_people:
+                    person_ref = None
+                diet_tag = str(rule.get("diet_tag") or "").strip().casefold() or None
                 await connection.execute(
                     """
-                    INSERT INTO app_core.dietary_rules (id, household_id, rule_type, term, is_hard)
-                    VALUES ($1, $2, $3, $4, $5)
+                    INSERT INTO app_core.dietary_rules (
+                        id, household_id, rule_type, term, is_hard, person_id, diet_tag
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
                     """,
                     uuid.uuid4(),
                     household_id,
                     rule.get("rule_type") if rule.get("rule_type") in {"allergy", "intolerance", "exclude", "dislike"} else "exclude",
                     term[:100],
                     bool(rule.get("is_hard", True)),
+                    person_ref,
+                    diet_tag[:40] if diet_tag else None,
                 )
             await self._audit(connection, household_id, session["user_id"], "settings.updated", "household", household_id)
 
     #: колонки, которые можно менять через PATCH — имя колонки никогда не приходит извне
-    PERSON_PATCH_COLUMNS = ("name", "person_type", "target_kcal", "portion_factor")
+    PERSON_PATCH_COLUMNS = (
+        "name", "person_type", "target_kcal", "portion_factor", "birth_date",
+        "sex", "height_cm", "weight_kg", "activity", "goal", "protein_share",
+        "fat_share", "carb_share", "meal_shares", "eats_meals",
+    )
 
     async def update_person(
         self, session: dict[str, Any], person_id: uuid.UUID, changes: dict[str, Any]
@@ -397,14 +464,17 @@ class AppRepository:
             if field not in changes:
                 continue
             args.append(_coerce_person_field(field, changes[field]))
-            assignments.append(f"{field} = ${len(args)}")
+            cast = "::jsonb" if field in PERSON_JSON_FIELDS else ""
+            assignments.append(f"{field} = ${len(args)}{cast}")
         if not assignments:
             raise ValueError("Нечего изменять")
         row = await self.db().fetchrow(
             f"""
             UPDATE app_core.people SET {', '.join(assignments)}
             WHERE id=$1 AND household_id=$2
-            RETURNING id, name, person_type, target_kcal, portion_factor, position
+            RETURNING id, name, person_type, target_kcal, portion_factor, position,
+                      birth_date, sex, height_cm, weight_kg, activity, goal,
+                      protein_share, fat_share, carb_share, meal_shares, eats_meals
             """,
             *args,
         )
@@ -412,6 +482,39 @@ class AppRepository:
             return None
         await self.audit(session, "settings.person_updated", "person", person_id)
         return row_dict(row)
+
+    async def person_target(
+        self, session: dict[str, Any], person_id: uuid.UUID, on_date: date | None = None
+    ) -> dict[str, Any] | None:
+        """Норма едока с пометкой, как она получена (TZ-M8 §3.1).
+
+        Пользователь должен видеть, посчитана норма по мерках, взята из его
+        ручной цели или подставлена константой — иначе «2000 ккал» выглядят
+        как медицинское заключение.
+        """
+        row = await self.db().fetchrow(
+            """
+            SELECT id, name, person_type, target_kcal, portion_factor, birth_date,
+                   sex, height_cm, weight_kg, activity, goal, protein_share,
+                   fat_share, carb_share, meal_shares, eats_meals
+            FROM app_core.people WHERE id=$1 AND household_id=$2
+            """,
+            person_id, session["household_id"],
+        )
+        if not row:
+            return None
+        person = row_dict(row)
+        target = daily_target(person, on_date or date.today())
+        return {
+            "person_id": str(person["id"]),
+            "name": person["name"],
+            "kcal": target.kcal,
+            "protein_g": target.protein_g,
+            "fat_g": target.fat_g,
+            "carb_g": target.carb_g,
+            "by_meal": target.by_meal,
+            "target_source": target.source,
+        }
 
     async def dashboard(self, session: dict[str, Any]) -> dict[str, Any]:
         household_id = session["household_id"]
@@ -870,7 +973,7 @@ class AppRepository:
             WITH picked AS (
                 SELECT r.id, r.title, r.source_page_start, r.source_servings_min,
                        r.cuisine_code, r.meal_types, r.appliances, r.review_status,
-                       r.extraction_confidence, r.dish_type
+                       r.extraction_confidence, r.dish_type, r.diet_tags
                 FROM recipe_library.recipes r
                 WHERE r.review_status IN ('ready', 'needs_review')
                   AND r.ingredient_count >= 3
@@ -882,7 +985,7 @@ class AppRepository:
             , cuisine_picked AS (
                 SELECT r.id, r.title, r.source_page_start, r.source_servings_min,
                        r.cuisine_code, r.meal_types, r.appliances, r.review_status,
-                       r.extraction_confidence, r.dish_type
+                       r.extraction_confidence, r.dish_type, r.diet_tags
                 FROM recipe_library.recipes r
                 WHERE r.review_status IN ('ready', 'needs_review')
                   AND r.ingredient_count >= 3
@@ -943,14 +1046,23 @@ class AppRepository:
     ) -> dict[str, Any]:
         household_id = session["household_id"]
         people = [row_dict(row) for row in await self.db().fetch(
-            "SELECT name, person_type, target_kcal, portion_factor FROM app_core.people WHERE household_id=$1 ORDER BY position",
+            """
+            SELECT id, name, person_type, target_kcal, portion_factor,
+                   birth_date, sex, height_cm, weight_kg, activity, goal,
+                   protein_share, fat_share, carb_share, meal_shares, eats_meals
+            FROM app_core.people WHERE household_id=$1 ORDER BY position
+            """,
             household_id,
         )]
         appliances = [row["appliance_code"] for row in await self.db().fetch(
             "SELECT appliance_code FROM app_core.appliances WHERE household_id=$1", household_id
         )]
         rules = [row_dict(row) for row in await self.db().fetch(
-            "SELECT rule_type, term, is_hard FROM app_core.dietary_rules WHERE household_id=$1", household_id
+            """
+            SELECT rule_type, term, is_hard, person_id, diet_tag
+            FROM app_core.dietary_rules WHERE household_id=$1
+            """,
+            household_id,
         )]
         inventory = [dict(row) for row in await self.db().fetch(
             "SELECT name, quantity, unit_code, expires_on FROM app_core.inventory_lots WHERE household_id=$1 AND quantity>0",

@@ -58,6 +58,39 @@ CREATE TABLE IF NOT EXISTS app_core.people (
     CHECK (portion_factor > 0 AND portion_factor <= 3)
 );
 
+-- TZ-M8 §3.1: у каждого едока своя норма и свои приёмы дома. Мерки
+-- необязательны: без них норма берётся константой, а источник расчёта
+-- показывается пользователем (target_source).
+ALTER TABLE app_core.people
+    ADD COLUMN IF NOT EXISTS birth_date DATE,
+    ADD COLUMN IF NOT EXISTS sex TEXT,
+    ADD COLUMN IF NOT EXISTS height_cm NUMERIC,
+    ADD COLUMN IF NOT EXISTS weight_kg NUMERIC,
+    ADD COLUMN IF NOT EXISTS activity TEXT NOT NULL DEFAULT 'moderate',
+    ADD COLUMN IF NOT EXISTS goal TEXT NOT NULL DEFAULT 'maintain',
+    ADD COLUMN IF NOT EXISTS protein_share NUMERIC,
+    ADD COLUMN IF NOT EXISTS fat_share NUMERIC,
+    ADD COLUMN IF NOT EXISTS carb_share NUMERIC,
+    ADD COLUMN IF NOT EXISTS meal_shares JSONB,
+    ADD COLUMN IF NOT EXISTS eats_meals JSONB NOT NULL
+        DEFAULT '["breakfast","lunch","dinner"]'::jsonb;
+
+ALTER TABLE app_core.people DROP CONSTRAINT IF EXISTS people_sex_check;
+ALTER TABLE app_core.people
+    ADD CONSTRAINT people_sex_check CHECK (sex IS NULL OR sex IN ('female', 'male'));
+ALTER TABLE app_core.people DROP CONSTRAINT IF EXISTS people_activity_check;
+ALTER TABLE app_core.people
+    ADD CONSTRAINT people_activity_check CHECK (activity IN ('low', 'moderate', 'high'));
+ALTER TABLE app_core.people DROP CONSTRAINT IF EXISTS people_goal_check;
+ALTER TABLE app_core.people
+    ADD CONSTRAINT people_goal_check CHECK (goal IN ('maintain', 'lose', 'gain'));
+ALTER TABLE app_core.people DROP CONSTRAINT IF EXISTS people_measurements_check;
+ALTER TABLE app_core.people
+    ADD CONSTRAINT people_measurements_check CHECK (
+        (height_cm IS NULL OR height_cm BETWEEN 30 AND 250)
+        AND (weight_kg IS NULL OR weight_kg BETWEEN 2 AND 400)
+    );
+
 CREATE TABLE IF NOT EXISTS app_core.appliances (
     household_id UUID NOT NULL REFERENCES app_core.households(id) ON DELETE CASCADE,
     appliance_code TEXT NOT NULL,
@@ -73,8 +106,17 @@ CREATE TABLE IF NOT EXISTS app_core.dietary_rules (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CHECK (rule_type IN ('allergy', 'intolerance', 'exclude', 'dislike'))
 );
-CREATE UNIQUE INDEX IF NOT EXISTS ux_dietary_rules
-    ON app_core.dietary_rules (household_id, rule_type, lower(term));
+-- TZ-M8 §3.2: правило может принадлежать одному человеку (NULL — вся семья)
+-- и может требовать диету по тегам рецепта (vegetarian, lean, …).
+ALTER TABLE app_core.dietary_rules
+    ADD COLUMN IF NOT EXISTS person_id UUID REFERENCES app_core.people(id) ON DELETE CASCADE,
+    ADD COLUMN IF NOT EXISTS diet_tag TEXT;
+
+-- Одинаковый запрет для разных людей — разные правила, поэтому старый
+-- уникальный индекс (без person_id) заменяется.
+DROP INDEX IF EXISTS app_core.ux_dietary_rules;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_dietary_rules_person
+    ON app_core.dietary_rules (household_id, rule_type, lower(term), COALESCE(person_id, '00000000-0000-0000-0000-000000000000'::uuid));
 
 CREATE TABLE IF NOT EXISTS app_core.inventory_lots (
     id UUID PRIMARY KEY,

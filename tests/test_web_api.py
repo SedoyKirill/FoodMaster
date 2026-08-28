@@ -536,6 +536,57 @@ class SettingsPeopleApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["target_kcal"], 2100)
 
+    def test_person_profile_fields_survive_save(self) -> None:
+        """TZ-M8 §3.1: мерки, цель и «ест дома» доходят до хранилища."""
+        person_id = self._people()[0]["id"]
+        payload = {
+            "household_name": "Моя семья",
+            "people": [{
+                "id": person_id, "name": "Иван", "sex": "male",
+                "birth_date": "1990-05-01", "height_cm": 180, "weight_kg": 80,
+                "activity": "high", "goal": "lose",
+                "eats_meals": ["breakfast", "dinner"],
+            }],
+        }
+        self.assertEqual(self.client.put("/api/settings", json=payload).status_code, 200)
+        saved = self._people()[0]
+        self.assertEqual(saved["sex"], "male")
+        self.assertEqual(saved["goal"], "lose")
+        self.assertEqual(saved["eats_meals"], ["breakfast", "dinner"])
+
+    def test_person_target_shows_how_it_was_calculated(self) -> None:
+        """Норма едока приходит с пометкой источника (manual/formula/default)."""
+        person_id = self._people()[0]["id"]
+        self.client.patch(f"/api/settings/people/{person_id}", json={"target_kcal": 2100})
+        response = self.client.get(f"/api/settings/people/{person_id}/target")
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["kcal"], 2100)
+        self.assertEqual(body["target_source"], "manual")
+        self.assertEqual(sum(body["by_meal"].values()), 2100)
+
+    def test_person_target_404_for_stranger(self) -> None:
+        import uuid as uuid_module
+
+        response = self.client.get(f"/api/settings/people/{uuid_module.uuid4()}/target")
+        self.assertEqual(response.status_code, 404)
+
+    def test_rule_can_belong_to_one_person(self) -> None:
+        """TZ-M8 §3.2: правило с person_id и diet_tag сохраняется как есть."""
+        person_id = self._people()[0]["id"]
+        payload = {
+            "household_name": "Моя семья",
+            "people": [{"id": person_id, "name": "Иван"}],
+            "dietary_rules": [{
+                "rule_type": "allergy", "term": "орехи", "is_hard": True,
+                "person_id": person_id, "diet_tag": "vegetarian",
+            }],
+        }
+        self.assertEqual(self.client.put("/api/settings", json=payload).status_code, 200)
+        rule = self.client.get("/api/me").json()["dietary_rules"][0]
+        self.assertEqual(str(rule["person_id"]), person_id)
+        self.assertEqual(rule["diet_tag"], "vegetarian")
+
     def test_a4_patch_person_forbidden_for_editor(self) -> None:
         person_id = self._people()[0]["id"]
         for household in self.repository.households.values():
