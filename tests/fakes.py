@@ -152,6 +152,8 @@ class FakeRepository:
         self.planner_recipes: list[dict[str, Any]] = []
         self.planner_appliances: list[str] = []
         self.plan_profiles: dict[str, dict[str, Any]] = {}
+        self.plan_history_rows: list[dict[str, Any]] = []
+        self.planner_data_starts_on: Any = None
         self.audit: list[dict[str, Any]] = []
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
         self.warm_calls = 0
@@ -503,10 +505,14 @@ class FakeRepository:
     # --- планы -------------------------------------------------------------
 
     async def planner_data(
-        self, session: dict[str, Any], cuisines: list[str] | None = None
+        self,
+        session: dict[str, Any],
+        cuisines: list[str] | None = None,
+        starts_on: Any = None,
     ) -> dict[str, Any]:
         household_id = session["household_id"]
         self.planner_data_cuisines = list(cuisines or [])
+        self.planner_data_starts_on = starts_on
         return {
             "people": self.people[household_id],
             "appliances": self.planner_appliances or self.appliances[household_id],
@@ -514,6 +520,8 @@ class FakeRepository:
             "inventory": [],
             "recipes": self.planner_recipes or [make_recipe(id=index) for index in range(1, 13)],
             "products": self.products,
+            "history": self.plan_history_rows,
+            "plan_profile": await self.plan_profile(session),
         }
 
     async def save_plan(

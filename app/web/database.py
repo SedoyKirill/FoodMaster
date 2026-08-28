@@ -13,6 +13,7 @@ from typing import Any
 
 import asyncpg
 
+from .planning.context import HISTORY_WINDOW_DAYS
 from .planning.profile import MEAL_TYPES, daily_target
 from .planner import (
     DEFAULT_APPLIANCES, ProductMatcher, ProductMatcherCache, _base_quantity,
@@ -1064,7 +1065,8 @@ class AppRepository:
             WITH picked AS (
                 SELECT r.id, r.title, r.source_page_start, r.source_servings_min,
                        r.cuisine_code, r.cuisine_codes, r.meal_types, r.appliances,
-                       r.review_status, r.extraction_confidence, r.dish_type, r.diet_tags
+                       r.review_status, r.extraction_confidence, r.dish_type,
+                       r.diet_tags, r.time_total_minutes
                 FROM recipe_library.recipes r
                 WHERE r.review_status IN ('ready', 'needs_review')
                   AND r.ingredient_count >= 3
@@ -1076,7 +1078,8 @@ class AppRepository:
             , cuisine_picked AS (
                 SELECT r.id, r.title, r.source_page_start, r.source_servings_min,
                        r.cuisine_code, r.cuisine_codes, r.meal_types, r.appliances,
-                       r.review_status, r.extraction_confidence, r.dish_type, r.diet_tags
+                       r.review_status, r.extraction_confidence, r.dish_type,
+                       r.diet_tags, r.time_total_minutes
                 FROM recipe_library.recipes r
                 WHERE r.review_status IN ('ready', 'needs_review')
                   AND r.ingredient_count >= 3
@@ -1132,8 +1135,33 @@ class AppRepository:
         matcher.warmed = True
         return warmed
 
+    async def plan_history(
+        self, session: dict[str, Any], starts_on: date
+    ) -> list[dict[str, Any]]:
+        """Блюда семьи за окно ротации — из всех планов, не только последнего.
+
+        Без этого «новое меню» повторяло вчерашний ужин: планировщик просто не
+        знал, что семья уже ела (дефект P1).
+        """
+        rows = await self.db().fetch(
+            """
+            SELECT pm.recipe_id, pm.meal_date, r.dish_type
+            FROM app_core.plan_meals pm
+            JOIN app_core.meal_plans mp ON mp.id = pm.plan_id
+            JOIN recipe_library.recipes r ON r.id = pm.recipe_id
+            WHERE mp.household_id = $1
+              AND pm.meal_date >= $2::date - $3::int
+              AND pm.meal_date < $2::date
+            """,
+            session["household_id"], starts_on, HISTORY_WINDOW_DAYS,
+        )
+        return [row_dict(row) for row in rows]
+
     async def planner_data(
-        self, session: dict[str, Any], cuisines: list[str] | None = None
+        self,
+        session: dict[str, Any],
+        cuisines: list[str] | None = None,
+        starts_on: date | None = None,
     ) -> dict[str, Any]:
         household_id = session["household_id"]
         people = [row_dict(row) for row in await self.db().fetch(
@@ -1185,6 +1213,8 @@ class AppRepository:
                     household_id,
                 )
             },
+            "history": await self.plan_history(session, starts_on or date.today()),
+            "plan_profile": await self.plan_profile(session),
         }
 
     async def ingredient_synonyms(self) -> list[dict[str, Any]]:
@@ -1365,7 +1395,7 @@ class AppRepository:
         if target is None:
             return None
         cuisines = [str(item) for item in _json_column(header["cuisine_preferences"])]
-        data = await self.planner_data(session, cuisines)
+        data = await self.planner_data(session, cuisines, target["meal_date"])
         # K7: полный скоринг пула — тяжёлая синхронная работа, в поток.
         alternatives = await asyncio.to_thread(
             functools.partial(

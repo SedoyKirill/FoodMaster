@@ -493,6 +493,76 @@ class ProductMatcherCacheTests(unittest.TestCase):
         self.assertGreater(plan["estimated_cost_kop"], 0)
 
 
+class HistoryAndTimeTests(unittest.TestCase):
+    """Ротация и время готовки в плане (TZ-M8 §3.5, §3.7)."""
+
+    @staticmethod
+    def _recipe(recipe_id: int, title: str, minutes: int | None = None) -> dict:
+        item = recipe(recipe_id, title, "dinner")
+        item["time_total_minutes"] = minutes
+        return item
+
+    @staticmethod
+    def _plan(recipes: list[dict], **kwargs) -> dict:
+        return build_plan(
+            household_id="household",
+            starts_on=kwargs.pop("starts_on", date(2026, 8, 26)),  # среда
+            days=1,
+            cuisines=[],
+            people=[{"name": "Взрослый", "person_type": "adult", "portion_factor": Decimal("1")}],
+            appliances=[],
+            rules=[],
+            inventory=[],
+            recipes=recipes,
+            products=[],
+            meals=["dinner"],
+            **kwargs,
+        )
+
+    def test_dish_eaten_yesterday_loses_to_a_forgotten_one(self) -> None:
+        recipes = [self._recipe(1, "Гречка с грибами"), self._recipe(2, "Рис с овощами")]
+        history = [{"recipe_id": 1, "meal_date": date(2026, 8, 25), "dish_type": None}]
+        plan = self._plan(recipes, history=history)
+        self.assertEqual(plan["meals"][0]["recipe_id"], 2)
+
+    def test_history_older_than_three_weeks_does_not_matter(self) -> None:
+        recipes = [self._recipe(1, "Гречка с грибами"), self._recipe(2, "Рис с овощами")]
+        history = [{"recipe_id": 1, "meal_date": date(2026, 7, 1), "dish_type": None}]
+        plan = self._plan(recipes, history=history)
+        self.assertEqual(plan["meals"][0]["recipe_id"], 1)  # порядок как без истории
+
+    def test_weekday_dinner_avoids_long_recipes(self) -> None:
+        recipes = [
+            self._recipe(index, f"Долгое блюдо {index}", minutes=120) for index in range(1, 9)
+        ] + [self._recipe(9, "Быстрое блюдо", minutes=30)]
+        plan = self._plan(recipes, plan_profile={"weekday_max_minutes": 45})
+        self.assertEqual(plan["meals"][0]["recipe_id"], 9)
+        self.assertNotIn(
+            "time_limit_relaxed", " ".join(plan["warnings"])
+        )
+
+    def test_weekend_dinner_may_take_its_time(self) -> None:
+        recipes = [self._recipe(1, "Долгое блюдо", minutes=120)]
+        plan = self._plan(
+            recipes, starts_on=date(2026, 8, 29), plan_profile={"weekday_max_minutes": 45}
+        )
+        self.assertEqual(plan["meals"][0]["recipe_id"], 1)
+
+    def test_relaxed_limit_is_reported_instead_of_an_empty_slot(self) -> None:
+        recipes = [self._recipe(1, "Долгое блюдо", minutes=80)]
+        plan = self._plan(recipes, plan_profile={"weekday_max_minutes": 45})
+        self.assertEqual(len(plan["meals"]), 1)
+        self.assertTrue(
+            any("time_limit_relaxed" in warning for warning in plan["warnings"]),
+            plan["warnings"],
+        )
+
+    def test_recipe_without_known_time_is_not_dropped(self) -> None:
+        recipes = [self._recipe(1, "Блюдо без времени", minutes=None)]
+        plan = self._plan(recipes, plan_profile={"weekday_max_minutes": 45})
+        self.assertEqual(len(plan["meals"]), 1)
+
+
 class MultiCuisineTests(unittest.TestCase):
     """У рецепта несколько кухонь, «universal» проходит любой фильтр (TZ-M8).
 

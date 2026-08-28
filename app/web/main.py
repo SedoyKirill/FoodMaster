@@ -457,7 +457,7 @@ async def generate_plan(payload: PlanPayload, repo: Repo, session: Mutating) -> 
     meals = payload.meals if payload.meals is not None else list(profile["meals"])
     if price_tier not in {"economy", "balanced", "premium"}:
         raise HTTPException(status_code=422, detail="Неизвестная ценовая стратегия")
-    data = await repo.planner_data(session, cuisines)
+    data = await repo.planner_data(session, cuisines, payload.starts_on)
     if payload.budget_rub is not None:
         budget_kop = int(payload.budget_rub * 100)
     elif profile.get("weekly_budget_kop"):
@@ -479,7 +479,7 @@ async def generate_plan(payload: PlanPayload, repo: Repo, session: Mutating) -> 
                 budget_kop=budget_kop,
                 meals=meals,
                 cuisine_mode=str(profile["cuisine_mode"]),
-                **data,
+                **data,  # включая history и plan_profile (TZ-M8 §3.4–3.7)
             )
         )
     except ValueError as exc:

@@ -26,6 +26,12 @@ W_TASTE = 500
 W_CUISINE = 200
 W_FIT = 300
 W_RATING = 400
+# TZ-M8 §3.7: блюдо, которое ели вчера, должно проигрывать такому же, которого
+# не было три недели. Вес сопоставим с рейтингом: ротация важна, но не важнее
+# того, что семья действительно любит.
+W_RECENCY = 400
+# Сезонность — приятный, но не решающий сигнал (§3.6).
+W_SEASON = 100
 # Пустой слот хуже любого реалистичного перерасхода бюджета: план с дырами —
 # крайняя мера при настоящей нехватке рецептов, а не способ «сэкономить».
 W_EMPTY_SLOT = 10_000_000
@@ -74,6 +80,8 @@ def slot_coefficient(
         - W_WASTE * score.expiry_bonus
         - W_CUISINE * score.cuisine_bonus
         - W_RATING * score.rating_bonus
+        + int(W_RECENCY * score.recency_penalty)
+        - int(W_SEASON * score.season_bonus)
         - int(W_FIT * fit)
     )
     return value

@@ -170,6 +170,8 @@ class CandidateScore:
         "recipe_id", "cost_kop", "cost_estimated", "kcal", "kcal_estimated",
         "expiry_bonus", "dislike_penalty", "cuisine_bonus", "meal_fit",
         "meal_bias", "main_ingredient", "draft", "rating_bonus", "dish_type",
+        # TZ-M8 §3.6–3.7: сезонность и ротация по истории семьи
+        "recency_penalty", "season_bonus", "time_minutes",
     )
 
     def __init__(self, recipe_id: int) -> None:
@@ -187,6 +189,12 @@ class CandidateScore:
         self.draft = False
         self.rating_bonus = 0
         self.dish_type: str | None = None
+        #: 1.0 — ели вчера, 0.0 — три недели не было (или не было вовсе)
+        self.recency_penalty = 0.0
+        #: доля сезонных продуктов в блюде
+        self.season_bonus = 0.0
+        #: время приготовления по книге, если оно известно
+        self.time_minutes: int | None = None
 
 
 def _expiring_canonicals(

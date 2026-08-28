@@ -926,6 +926,8 @@ def build_plan(
     nutrition: dict[str, dict[str, Any]] | None = None,
     meals: list[str] | None = None,
     cuisine_mode: str = "only",
+    history: list[dict[str, Any]] | None = None,
+    plan_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Фасад TZ-M5R: кандидаты → оценка → оптимизация → масштабирование → покупки.
 
@@ -933,7 +935,10 @@ def build_plan(
     семья, которая завтракает по дороге, не должна получать завтраки.
     ``cuisine_mode`` — ``only`` (жёсткий фильтр, по умолчанию) или ``prefer``
     (мягкое предпочтение: кухня даёт бонус, но не отсекает кандидатов).
+    ``history`` — блюда семьи за три недели (ротация, TZ-M8 §3.7),
+    ``plan_profile`` — лимиты времени и прочие настройки семьи (§3.4).
     """
+    from .planning import context as context_mod
     from .planning import optimizer as optimizer_mod
     from .planning import profile as profile_mod
     from .planning import scaling as scaling_mod
@@ -1040,6 +1045,24 @@ def build_plan(
         if recipe_id in scores:
             scores[recipe_id].rating_bonus = int(rating) - 3
 
+    # Ротация и сезон (TZ-M8 §3.6–3.7). Аффинити пока выводится из звёзд —
+    # события вкуса появятся в T5 и заменят этот прокси.
+    plan_history = context_mod.build_history(history or [], starts_on)
+    for recipe in pool:
+        recipe_id = int(recipe["id"])
+        score = scores[recipe_id]
+        affinity = ((ratings or {}).get(recipe_id, 3) - 3) / 2
+        score.recency_penalty = plan_history.recency_penalty(recipe_id, affinity)
+        score.season_bonus = context_mod.season_share(
+            [
+                str(ingredient.get("normalized_name") or ingredient.get("ingredient_text") or "")
+                for ingredient in recipe.get("ingredients", [])
+            ],
+            starts_on,
+        )
+        if recipe.get("time_total_minutes") is not None:
+            score.time_minutes = int(recipe["time_total_minutes"])
+
     cost_factor = optimizer_mod.PRICE_TIER_COST_FACTOR.get(price_tier, 10)
     cuisine_set = set(cuisines)
     matches_cuisine = {
@@ -1048,6 +1071,15 @@ def build_plan(
     needed_distinct = _min_distinct_for_horizon(days)
     candidates_by_slot: dict[tuple[int, str], list[int]] = {}
     slot_warnings: list[str] = []
+    profile = plan_profile or {}
+    cooking_minutes = {
+        int(recipe["id"]): (
+            int(recipe["time_total_minutes"])
+            if recipe.get("time_total_minutes") is not None
+            else None
+        )
+        for recipe in pool
+    }
     for meal_type in meal_types:
         # Личные запреты тех, кто за этим столом (TZ-M8 §3.2): блюдо с орехами
         # уходит из обеда ребёнка, но остаётся во взрослом завтраке.
@@ -1116,8 +1148,15 @@ def build_plan(
                     recipe_id for recipe_id in slot_list if recipe_id not in set(preferred)
                 ]
                 slot_list = preferred + rest
+        # Время готовки — свойство дня, а не слота: в среду вечером двух часов
+        # нет, в субботу есть (TZ-M8 §3.5). Рецепт без указанного времени не
+        # отсеивается — он получит мягкий штраф в целевой функции (T6).
         for day in range(days):
-            candidates_by_slot[day, meal_type] = slot_list
+            context = context_mod.day_context(starts_on + timedelta(days=day))
+            limit = context_mod.slot_time_limit(meal_type, context, profile)
+            candidates_by_slot[day, meal_type] = _fit_time_limit(
+                slot_list, limit, cooking_minutes, slot_warnings, context, meal_type
+            )
 
     assignment, solver_status = optimizer_mod.optimize(
         days=days,
@@ -1331,6 +1370,50 @@ def cuisine_matches(recipe: dict[str, Any], selected: set[str]) -> bool:
         return True
     codes = recipe_cuisines(recipe)
     return bool(codes & selected) or UNIVERSAL_CUISINE in codes
+
+
+def _fit_time_limit(
+    slot_list: list[int],
+    limit: int | None,
+    cooking_minutes: dict[int, int | None],
+    warnings: list[str],
+    context: Any,
+    meal_type: str,
+) -> list[int]:
+    """Кандидаты, укладывающиеся в отведённое на слот время (TZ-M8 §3.5).
+
+    Если после фильтра кандидатов почти не остаётся, лимит удваивается, а
+    слот честно помечается: лучше сказать «ужин выйдет долгим», чем оставить
+    семью без ужина.
+    """
+    if not limit:
+        return slot_list
+
+    def _fits(recipe_id: int, minutes_limit: int) -> bool:
+        minutes = cooking_minutes.get(recipe_id)
+        return minutes is None or minutes <= minutes_limit
+
+    fitting = [recipe_id for recipe_id in slot_list if _fits(recipe_id, limit)]
+    if len(fitting) >= _MIN_SLOT_CANDIDATES or len(fitting) == len(slot_list):
+        return fitting
+    relaxed = [recipe_id for recipe_id in slot_list if _fits(recipe_id, limit * 2)]
+    if len(relaxed) <= len(fitting):
+        # Удвоение ничего не добавило: молчим, если выбор и так есть, и
+        # снимаем лимит целиком, только когда слот иначе останется пустым.
+        if fitting:
+            return fitting
+        warnings.append(
+            f"time_limit_relaxed: {context.day.isoformat()} "
+            f"{MEAL_LABELS[meal_type].lower()} — быстрых блюд нет, "
+            f"лимит в {limit} минут снят."
+        )
+        return slot_list
+    warnings.append(
+        f"time_limit_relaxed: {context.day.isoformat()} "
+        f"{MEAL_LABELS[meal_type].lower()} — блюд в {limit} минут не хватило, "
+        f"лимит увеличен до {limit * 2}."
+    )
+    return relaxed
 
 
 def _min_distinct_for_horizon(days: int) -> int:
