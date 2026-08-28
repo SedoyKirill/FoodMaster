@@ -24,6 +24,8 @@ SOLVER_TIME_LIMIT_SECONDS = 10.0
 #: потолок времени решателя: две недели с упаковками должны укладываться (§6.5)
 SOLVER_TIME_LIMIT_MAX_SECONDS = 30.0
 SOLVER_WORKERS = 4
+#: во сколько раз предел по стенным часам щедрее детерминированного
+WALL_CLOCK_SAFETY = 3.0
 MAX_CANDIDATES_PER_SLOT = 40
 #: на горизонте длиннее недели список кандидатов режется: переменных иначе
 #: втрое больше, а выбор от сорокового кандидата уже не меняется (§6.5)
@@ -607,8 +609,16 @@ def _solve_cpsat(
 
     model.Minimize(sum(objective))
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = time_limit_seconds
+    # Приёмка §9.2 требует стабильности: та же семья и та же дата — тот же
+    # план. Лимит по стенным часам её не даёт: сколько узлов успеет солвер,
+    # зависит от загрузки машины, и меню менялось от запуска к запуску (на
+    # равных кандидатах — шесть разных вариантов из восьми прогонов).
+    # Поэтому основной предел — детерминированный, а секунды остаются
+    # страховкой на случай, если он окажется щедрее ожидаемого.
+    solver.parameters.max_deterministic_time = time_limit_seconds
+    solver.parameters.max_time_in_seconds = time_limit_seconds * WALL_CLOCK_SAFETY
     solver.parameters.num_workers = SOLVER_WORKERS
+    solver.parameters.interleave_search = True
     solver.parameters.random_seed = 7
     # План в пределах 2% от оптимума неотличим для пользователя, а доказательство
     # строгой оптимальности съедает весь лимит времени.

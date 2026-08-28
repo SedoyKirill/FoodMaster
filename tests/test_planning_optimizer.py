@@ -402,6 +402,25 @@ class VarietyTests(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(HAS_ORTOOLS, "ortools не установлен")
+class StabilityTests(unittest.TestCase):
+    """Приёмка §9.2: та же семья и дата — тот же план.
+
+    Лимит по стенным часам этого не давал: сколько узлов успеет солвер,
+    зависит от загрузки машины, и на равных кандидатах меню менялось от
+    запуска к запуску. Пересборка «того же самого» не должна показывать
+    другое меню — это выглядит как случайный подбор.
+    """
+
+    def test_same_input_gives_the_same_plan(self) -> None:
+        plans = set()
+        for _ in range(5):
+            scores = {index: score(index, cost=20000) for index in range(1, 25)}
+            assignment, _status = run_optimize(5, scores)
+            plans.add(tuple(assignment[slot] for slot in sorted(assignment)))
+        self.assertEqual(len(plans), 1)
+
+
 class NoveltyCapTests(unittest.TestCase):
     """Сколько непробованного попадает в план (TZ-M8 §4.5)."""
 
