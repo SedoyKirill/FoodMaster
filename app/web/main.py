@@ -8,7 +8,6 @@ import time
 import uuid
 from contextlib import asynccontextmanager, suppress
 from datetime import date
-from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -18,10 +17,15 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
-
 from .database import (
     PLANNER_WARM_INTERVAL_SECONDS, AppRepository, AuthenticationError, ConflictError,
+)
+from .payloads import (
+    EXPIRED_TEXT, PRICE_TIERS, STORAGE_AREAS, UNIT_CODES, UNKNOWN_STORAGE_TEXT,
+    UNKNOWN_TIER_TEXT, UNKNOWN_UNIT_TEXT, AuthPayload, InventoryPayload,
+    PasswordPayload, PersonPatchPayload, PersonPayload, PlanPayload,
+    PurchasePayload, RatingPayload, ReplaceMealPayload, ReviewPayload,
+    RulePayload, SettingsPayload, TelegramLoginPayload,
 )
 from .planner import build_plan
 from .ratelimit import RateLimiter
@@ -64,66 +68,6 @@ def get_repository(request: Request) -> Any:
 # ``Any`` вместо AppRepository намеренно: FastAPI не валидирует аннотацию
 # параметра-зависимости, поэтому подставленный фейковый репозиторий проходит как есть.
 Repo = Annotated[Any, Depends(get_repository)]
-
-
-class AuthPayload(BaseModel):
-    login: str
-    password: str
-    household_name: str = "Моя семья"
-
-
-class PersonPayload(BaseModel):
-    id: uuid.UUID | None = None
-    name: str = Field(min_length=1, max_length=80)
-    person_type: str = "adult"
-    target_kcal: int | None = Field(default=None, ge=500, le=6000)
-    portion_factor: Decimal = Field(default=Decimal("1"), gt=0, le=3)
-
-
-class RulePayload(BaseModel):
-    rule_type: str = "exclude"
-    term: str = Field(min_length=1, max_length=100)
-    is_hard: bool = True
-
-
-class SettingsPayload(BaseModel):
-    household_name: str = Field(min_length=1, max_length=100)
-    people: list[PersonPayload]
-    appliances: list[str] = Field(default_factory=list)
-    dietary_rules: list[RulePayload] = Field(default_factory=list)
-
-
-class InventoryPayload(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
-    quantity: Decimal = Field(gt=0, le=1_000_000)
-    unit_code: str
-    expires_on: date | None = None
-    storage_area: str = "fridge"
-    # Срок в прошлом ломает сортировку FEFO, поэтому его надо подтвердить явно (S8).
-    already_expired: bool = False
-
-
-class ReviewPayload(BaseModel):
-    status: str
-
-
-class PurchasePayload(BaseModel):
-    purchased: bool = True
-
-
-class PersonPatchPayload(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=80)
-    person_type: str | None = None
-    target_kcal: int | None = Field(default=None, ge=500, le=6000)
-    portion_factor: Decimal | None = Field(default=None, gt=0, le=3)
-
-
-class PlanPayload(BaseModel):
-    starts_on: date = Field(default_factory=date.today)
-    days: int = Field(default=3, ge=1, le=7)
-    cuisines: list[str] = Field(default_factory=list)
-    budget_rub: Decimal | None = Field(default=None, ge=0, le=1_000_000)
-    price_tier: str = "balanced"
 
 
 def set_auth_cookies(response: Response, session_token: str, csrf_token: str) -> None:
@@ -220,6 +164,41 @@ async def login(
     return {"ok": True}
 
 
+@router.post("/api/auth/telegram-login")
+async def telegram_login(
+    payload: TelegramLoginPayload, request: Request, response: Response, repo: Repo
+) -> dict[str, Any]:
+    """Вход по одноразовому коду из бота (TZ-M7 §3.3).
+
+    Код короткий — шесть цифр, — поэтому лимит здесь строже, чем на обычном
+    входе: он и есть основная защита от перебора.
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    retry_after = request.app.state.code_limiter.hit(client_ip)
+    if retry_after:
+        raise HTTPException(
+            status_code=429,
+            detail="Слишком много попыток. Попробуйте позже.",
+            headers={"Retry-After": str(retry_after)},
+        )
+    try:
+        session_token, csrf_token = await repo.telegram_login(payload.code)
+    except AuthenticationError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    set_auth_cookies(response, session_token, csrf_token)
+    return {"ok": True}
+
+
+@router.post("/api/auth/set-password")
+async def set_password(payload: PasswordPayload, repo: Repo, session: Mutating) -> dict[str, Any]:
+    """Задать пароль аккаунту, заведённому из бота (TZ-M7 §3.3, шаг 4)."""
+    try:
+        await repo.set_password(session, payload.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True}
+
+
 @router.post("/api/auth/logout")
 async def logout(
     response: Response,
@@ -292,10 +271,6 @@ async def recipe_detail(recipe_id: int, repo: Repo, session: Session) -> dict[st
     return recipe
 
 
-class RatingPayload(BaseModel):
-    rating: int | None = Field(default=None, ge=1, le=5)
-
-
 @router.post("/api/recipes/{recipe_id}/rating")
 async def rate_recipe(
     recipe_id: int, payload: RatingPayload, repo: Repo, session: Mutating
@@ -354,14 +329,14 @@ async def inventory(repo: Repo, session: Session) -> list[dict[str, Any]]:
 
 @router.post("/api/inventory", status_code=201)
 async def add_inventory(payload: InventoryPayload, repo: Repo, session: Mutating) -> dict[str, Any]:
-    if payload.unit_code not in {"g", "kg", "ml", "l", "piece"}:
-        raise HTTPException(status_code=422, detail="Неизвестная единица")
-    if payload.storage_area not in {"fridge", "freezer", "pantry"}:
-        raise HTTPException(status_code=422, detail="Неизвестное место хранения")
+    if payload.unit_code not in UNIT_CODES:
+        raise HTTPException(status_code=422, detail=UNKNOWN_UNIT_TEXT)
+    if payload.storage_area not in STORAGE_AREAS:
+        raise HTTPException(status_code=422, detail=UNKNOWN_STORAGE_TEXT)
     if payload.expires_on is not None and payload.expires_on < date.today() and not payload.already_expired:
         raise HTTPException(
             status_code=422,
-            detail="Срок годности в прошлом. Отметьте «уже просрочено», если это верно.",
+            detail=EXPIRED_TEXT,
         )
     item = payload.model_dump()
     item.pop("already_expired", None)
@@ -386,8 +361,8 @@ async def delete_inventory(item_id: uuid.UUID, repo: Repo, session: Mutating) ->
 async def generate_plan(payload: PlanPayload, repo: Repo, session: Mutating) -> dict[str, Any]:
     if session["role"] == "viewer":
         raise HTTPException(status_code=403, detail="Режим просмотра не позволяет создавать планы")
-    if payload.price_tier not in {"economy", "balanced", "premium"}:
-        raise HTTPException(status_code=422, detail="Неизвестная ценовая стратегия")
+    if payload.price_tier not in PRICE_TIERS:
+        raise HTTPException(status_code=422, detail=UNKNOWN_TIER_TEXT)
     data = await repo.planner_data(session, payload.cuisines)
     budget_kop = int(payload.budget_rub * 100) if payload.budget_rub is not None else None
     try:
@@ -436,10 +411,6 @@ async def get_plan(plan_id: uuid.UUID, repo: Repo, session: Session) -> dict[str
     if not plan:
         raise HTTPException(status_code=404, detail="План не найден")
     return plan
-
-
-class ReplaceMealPayload(BaseModel):
-    recipe_id: int | None = Field(default=None, ge=1)
 
 
 @router.post("/api/plans/{plan_id}/meals/{meal_id}/replace")
@@ -516,6 +487,15 @@ async def telegram_link_token(repo: Repo, session: Mutating) -> dict[str, Any]:
         "deep_link": f"https://t.me/{bot_username}?start=link_{token}" if bot_username else None,
         "command": f"/start link_{token}",
     }
+
+
+@router.delete("/api/telegram/link")
+async def telegram_unlink(repo: Repo, session: Mutating) -> dict[str, Any]:
+    """Отвязать Telegram (TZ-M7 §3.4). Раньше отвязки не было нигде."""
+    unlinked = await repo.unlink_telegram(session)
+    if not unlinked:
+        raise HTTPException(status_code=404, detail="Telegram не был привязан")
+    return {"ok": True}
 
 
 async def validation_error(_: Request, __: RequestValidationError) -> JSONResponse:
@@ -597,6 +577,9 @@ def create_app(repository: Any | None = None) -> FastAPI:
     application.state.repository = repo
     application.state.login_limiter = RateLimiter(capacity=5, window_seconds=60.0)
     application.state.login_ip_limiter = RateLimiter(capacity=20, window_seconds=60.0)
+    # TZ-M7 §3.3: код входа всего шестизначный, поэтому лимит здесь жёстче
+    # обычного входа — за время жизни кода можно проверить единицы вариантов.
+    application.state.code_limiter = RateLimiter(capacity=10, window_seconds=60.0)
     application.add_exception_handler(RequestValidationError, validation_error)
     application.middleware("http")(security_headers)
     application.middleware("http")(disable_local_frontend_cache)

@@ -28,6 +28,7 @@ from .render import (
     today_keyboard,
 )
 from .repository import BotRepository, bot_session
+from .scenes import auth
 
 __all__ = [
     "BUTTON_TEXT_LIMIT", "BotRepository", "CallbackReply", "HELP_TEXT",
@@ -43,11 +44,19 @@ __all__ = [
 # --- обработка входящих сообщений --------------------------------------------
 
 async def handle_message(
-    repository: BotRepository, user_id: int, text: str, today: date
+    repository: BotRepository,
+    user_id: int,
+    text: str,
+    today: date,
+    *,
+    app_repository: Any = None,
+    dialogs: Any = None,
 ) -> Reply:
     """Ответ на текстовое сообщение. Не бросает — ошибки ловит транспорт.
 
     ``user_id`` — Telegram ``from.id``: личность, а не чат (TZ-M7 §3.1).
+    ``app_repository`` и ``dialogs`` нужны сценам аккаунта (§3.2–3.4); без них
+    работают только команды, которым хватает выборок бота.
     """
     text = (text or "").strip()
     lowered = text.lower()
@@ -63,14 +72,25 @@ async def handle_message(
                 )
             return Reply(f"Готово! Аккаунт «{login}» привязан.\n\n{HELP_TEXT}")
         context = await repository.context_for_user(user_id)
-        return Reply(HELP_TEXT if context else f"Привет!\n\n{NOT_LINKED_TEXT}")
+        if context:
+            return Reply(HELP_TEXT)
+        # §3.2: аккаунта нет — предлагаем завести его прямо здесь
+        return auth.welcome_reply() if dialogs is not None else Reply(
+            f"Привет!\n\n{NOT_LINKED_TEXT}"
+        )
 
     if lowered in {"/help", "помощь", "help"}:
         return Reply(HELP_TEXT)
 
     context = await repository.context_for_user(user_id)
     if context is None:
-        return Reply(NOT_LINKED_TEXT)
+        return auth.welcome_reply() if dialogs is not None else Reply(NOT_LINKED_TEXT)
+
+    if lowered in {"/web", "/unlink"} and app_repository is not None:
+        if lowered == "/web":
+            return await auth.web_login(app_repository, context)
+        has_password = await app_repository.has_password(context["user_id"])
+        return auth.unlink_confirmation(has_password)
 
     if lowered in {"/today", "сегодня", "🍽 сегодня"}:
         meals = await repository.latest_plan_meals(context["household_id"])
@@ -104,6 +124,8 @@ async def handle_callback(
     user_id: int,
     data: str,
     today: date,
+    *,
+    dialogs: Any = None,
 ) -> CallbackReply:
     """Единая точка обработки callback_query для всех глаголов.
 
@@ -118,10 +140,31 @@ async def handle_callback(
     if verb == "n" and parts[:1] == ["noop"]:
         return CallbackReply()
 
+    # §3.2: кнопки приветствия жмут те, у кого аккаунта ещё нет,
+    # поэтому они разбираются до проверки привязки
+    if verb == "n" and parts[:1] == ["link"]:
+        return CallbackReply(edit=auth.have_account_reply())
+    if verb == "n" and parts[:1] in (["reg"], ["regdef"]):
+        if dialogs is None:
+            return CallbackReply(toast="Регистрация недоступна.", show_alert=True)
+        if await bot_repository.context_for_user(user_id) is not None:
+            return CallbackReply(toast="Ваш Telegram уже привязан.", show_alert=True)
+        if parts[0] == "regdef":
+            reply = await auth.create_account(
+                app_repository, bot_repository, dialogs, user_id,
+                auth.DEFAULT_HOUSEHOLD_NAME,
+            )
+        else:
+            reply = await auth.begin(dialogs, user_id)
+        return CallbackReply(edit=reply)
+
     context = await bot_repository.context_for_user(user_id)
     if context is None:
         return CallbackReply(toast=NOT_LINKED_TEXT, show_alert=True)
     session = bot_session(context)
+
+    if verb == "y" and parts[:1] == ["unlink"]:
+        return await auth.unlink(app_repository, session)
 
     try:
         if verb == "p":

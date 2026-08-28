@@ -73,6 +73,30 @@ class BotRepository:
             )
             return str(login or "")
 
+    async def relink_account(self, login: str, user_id: int) -> bool:
+        """Вернуть прежний аккаунт `tg<id>` тому же Telegram-аккаунту (§3.2).
+
+        Логин выведен из ``from.id``, поэтому «занят» он может быть только
+        самим этим человеком, который однажды отвязался. Привязываем обратно,
+        но лишь если аккаунт сейчас ни к какому Telegram не привязан.
+        """
+        row = await self.pool.fetchrow(
+            """
+            INSERT INTO app_core.auth_identities (provider, provider_user_id, user_id)
+            SELECT 'telegram', $2, u.id
+            FROM app_core.users u
+            WHERE lower(u.login) = lower($1) AND u.status = 'active'
+              AND NOT EXISTS (
+                  SELECT 1 FROM app_core.auth_identities ai
+                  WHERE ai.provider='telegram' AND ai.user_id = u.id
+              )
+            ON CONFLICT DO NOTHING
+            RETURNING user_id
+            """,
+            login, str(user_id),
+        )
+        return row is not None
+
     async def context_for_user(self, user_id: int) -> dict[str, Any] | None:
         """Аккаунт, активная семья и роль по Telegram ``from.id``.
 

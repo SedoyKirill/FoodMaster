@@ -23,8 +23,23 @@ function setFieldError(inputId, message) {
 function clearErrors() {
   setFieldError("auth-login", "");
   setFieldError("auth-password", "");
+  setFieldError("auth-code", "");
   document.getElementById("auth-form-error").textContent = "";
 }
+
+const TITLES = {
+  register: "Создайте аккаунт",
+  login: "С возвращением",
+  telegram: "Вход по коду из бота",
+};
+
+const SUBTITLES = {
+  register: "Аккаунт хранится только на этом компьютере.",
+  login: "Введите логин и пароль от локального аккаунта.",
+  telegram: "Отправьте боту «Супостат» команду /web — он пришлёт код.",
+};
+
+const SUBMIT_LABELS = { register: "Создать аккаунт", login: "Войти", telegram: "Войти по коду" };
 
 export function setMode(next) {
   mode = next;
@@ -34,13 +49,16 @@ export function setMode(next) {
     tab.tabIndex = selected ? 0 : -1;
   }
   const registering = next === "register";
-  document.getElementById("auth-title").textContent = registering ? "Создайте аккаунт" : "С возвращением";
-  document.getElementById("auth-subtitle").textContent = registering
-    ? "Аккаунт хранится только на этом компьютере."
-    : "Введите логин и пароль от локального аккаунта.";
+  const byCode = next === "telegram";
+  document.getElementById("auth-title").textContent = TITLES[next];
+  document.getElementById("auth-subtitle").textContent = SUBTITLES[next];
+  // Вход по коду не спрашивает ни логина, ни пароля: код и есть удостоверение.
+  document.getElementById("auth-login").closest(".field").hidden = byCode;
+  document.getElementById("auth-password").closest(".field").hidden = byCode;
+  document.getElementById("auth-code-field").hidden = !byCode;
   document.getElementById("auth-household-field").hidden = !registering;
   document.getElementById("auth-rules").hidden = !registering;
-  document.getElementById("auth-submit").textContent = registering ? "Создать аккаунт" : "Войти";
+  document.getElementById("auth-submit").textContent = SUBMIT_LABELS[next];
   document.getElementById("auth-password").setAttribute(
     "autocomplete",
     registering ? "new-password" : "current-password",
@@ -95,30 +113,45 @@ export function init(onSuccess) {
     clearErrors();
     const login = document.getElementById("auth-login").value.trim();
     const password = document.getElementById("auth-password").value;
-    if (login.length < 3) {
-      setFieldError("auth-login", "Логин: не короче трёх символов.");
-      return;
-    }
-    if (mode === "register" && password.length < 8) {
-      setFieldError("auth-password", "Пароль: не менее 8 символов.");
-      return;
+    const code = document.getElementById("auth-code").value.trim();
+    if (mode === "telegram") {
+      if (!code) {
+        setFieldError("auth-code", "Введите код из бота.");
+        return;
+      }
+    } else {
+      if (login.length < 3) {
+        setFieldError("auth-login", "Логин: не короче трёх символов.");
+        return;
+      }
+      if (mode === "register" && password.length < 8) {
+        setFieldError("auth-password", "Пароль: не менее 8 символов.");
+        return;
+      }
     }
 
     const button = document.getElementById("auth-submit");
     button.disabled = true;
     try {
-      const payload = { login, password };
-      if (mode === "register") {
-        payload.household_name =
-          document.getElementById("auth-household").value.trim() || "Моя семья";
-        await api.register(payload);
+      if (mode === "telegram") {
+        await api.telegramLogin(code);
+      } else if (mode === "register") {
+        await api.register({
+          login,
+          password,
+          household_name:
+            document.getElementById("auth-household").value.trim() || "Моя семья",
+        });
       } else {
-        await api.login(payload);
+        await api.login({ login, password });
       }
       await onSuccess(mode);
     } catch (error) {
-      if (error.status === 401) setFieldError("auth-password", "Неверный логин или пароль.");
-      else if (error.status === 409) setFieldError("auth-login", "Такой логин уже занят.");
+      if (error.status === 401 && mode === "telegram") {
+        setFieldError("auth-code", "Код не подошёл: он просрочен или уже использован.");
+      } else if (error.status === 401) {
+        setFieldError("auth-password", "Неверный логин или пароль.");
+      } else if (error.status === 409) setFieldError("auth-login", "Такой логин уже занят.");
       else if (error.status === 429) startCountdown(error.retryAfter || 60);
       else document.getElementById("auth-form-error").textContent = humanError(error);
     } finally {

@@ -49,7 +49,9 @@ function showView(name) {
 function showAuth() {
   document.getElementById("auth-view").hidden = false;
   document.getElementById("app-view").hidden = true;
-  document.getElementById("auth-login").focus();
+  // во вкладке «Через Telegram» поля логина нет — фокусируем то, что видно
+  const first = document.querySelector("#auth-form .field:not([hidden]) input");
+  if (first) first.focus();
 }
 
 function showApp() {
@@ -164,9 +166,29 @@ async function boot() {
   try {
     store.set("me", await api.me());
     await startSession();
+    return;
   } catch (error) {
-    showAuth();
+    // сессии нет — ниже пробуем ссылку из бота, иначе показываем вход
   }
+
+  // TZ-M7 §3.3: бот присылает ссылку #/login/tg/<код> — входим по ней сразу,
+  // чтобы с телефона не пришлось переписывать код руками.
+  const fromBot = /^#\/login\/tg\/([^/?]+)/.exec(location.hash || "");
+  if (fromBot) {
+    history.replaceState(null, "", location.pathname);
+    try {
+      await api.telegramLogin(decodeURIComponent(fromBot[1]));
+      store.set("me", await api.me());
+      await startSession();
+      router.go("#/", { replace: true });
+      return;
+    } catch (error) {
+      showAuth();
+      auth.setMode("telegram");
+      return;
+    }
+  }
+  showAuth();
 }
 
 boot();

@@ -41,6 +41,8 @@ PLANNER_WARM_INTERVAL_SECONDS = 300.0
 AUDIT_CHANNELS = frozenset({"web", "telegram"})
 # Ключ advisory-лока на применение DDL: веб и бот могут стартовать разом.
 SCHEMA_LOCK_KEY = 79_160_728
+# TZ-M7 §3.3: код входа в веб живёт недолго — его диктуют вслух и набирают руками.
+WEB_LOGIN_CODE_TTL = timedelta(minutes=5)
 
 
 class ConflictError(Exception):
@@ -158,9 +160,27 @@ class AppRepository:
             raise RuntimeError("Database is not connected")
         return self.pool
 
-    async def register(self, login: str, password: str, household_name: str) -> tuple[str, str]:
+    async def register_account(
+        self,
+        login: str,
+        password: str | None,
+        household_name: str,
+        *,
+        telegram_user_id: int | None = None,
+        channel: str | None = None,
+    ) -> uuid.UUID:
+        """Новый аккаунт вместе с семьёй; возвращает id пользователя.
+
+        ``password=None`` — аккаунт из Telegram (TZ-M7 §3.2, А1): строки в
+        ``password_credentials`` нет, войти по паролю нельзя, пока владелец не
+        задаст его в вебе.
+
+        ``telegram_user_id`` — привязать Telegram сразу, в той же транзакции:
+        иначе сбой между «создали аккаунт» и «привязали» оставил бы человеку
+        аккаунт, в который он не может войти ни одним способом.
+        """
         normalized_login = validate_login(login)
-        password_hash = hash_password(password)
+        password_hash = hash_password(password) if password is not None else None
         user_id = uuid.uuid4()
         household_id = uuid.uuid4()
         person_id = uuid.uuid4()
@@ -171,11 +191,12 @@ class AppRepository:
                     user_id,
                     normalized_login,
                 )
-                await connection.execute(
-                    "INSERT INTO app_core.password_credentials (user_id, password_hash) VALUES ($1, $2)",
-                    user_id,
-                    password_hash,
-                )
+                if password_hash is not None:
+                    await connection.execute(
+                        "INSERT INTO app_core.password_credentials (user_id, password_hash) VALUES ($1, $2)",
+                        user_id,
+                        password_hash,
+                    )
                 await connection.execute(
                     "INSERT INTO app_core.households (id, name, created_by) VALUES ($1, $2, $3)",
                     household_id,
@@ -195,9 +216,26 @@ class AppRepository:
                     person_id,
                     household_id,
                 )
-                await self._audit(connection, household_id, user_id, "user.registered", "user", user_id)
+                if telegram_user_id is not None:
+                    await connection.execute(
+                        """
+                        INSERT INTO app_core.auth_identities (provider, provider_user_id, user_id)
+                        VALUES ('telegram', $1, $2)
+                        """,
+                        str(telegram_user_id),
+                        user_id,
+                    )
+                await self._audit(
+                    connection, household_id, user_id, "user.registered", "user", user_id,
+                    channel=channel,
+                )
         except asyncpg.UniqueViolationError as exc:
             raise ConflictError("Такой логин уже зарегистрирован") from exc
+        return user_id
+
+    async def register(self, login: str, password: str, household_name: str) -> tuple[str, str]:
+        """Регистрация из веба: аккаунт с паролем и сразу сессия."""
+        user_id = await self.register_account(login, password, household_name)
         return await self.create_session(user_id)
 
     async def login(self, login: str, password: str) -> tuple[str, str]:
@@ -308,8 +346,18 @@ class AppRepository:
             "SELECT provider_user_id FROM app_core.auth_identities WHERE provider='telegram' AND user_id=$1",
             session["user_id"],
         )
+        # TZ-M7 §3.3: у аккаунта из бота пароля нет. Интерфейс должен предложить
+        # его задать и предупредить перед отвязкой, иначе войти будет нечем.
+        has_password = await self.db().fetchval(
+            "SELECT 1 FROM app_core.password_credentials WHERE user_id=$1",
+            session["user_id"],
+        )
         return {
-            "user": {"id": str(session["user_id"]), "login": session["login"]},
+            "user": {
+                "id": str(session["user_id"]),
+                "login": session["login"],
+                "has_password": has_password is not None,
+            },
             "household": {
                 "id": str(household_id),
                 "name": session["household_name"],
@@ -1419,6 +1467,96 @@ class AppRepository:
             token_hash(raw_token), session["user_id"], datetime.now(UTC) + timedelta(minutes=10),
         )
         return raw_token
+
+    async def web_login_code(self, user_id: Any) -> str:
+        """Одноразовый код входа в веб для владельца Telegram-аккаунта (§3.3).
+
+        Шесть цифр, а не длинный токен: код придётся набирать руками с телефона.
+        Перебор закрыт с трёх сторон — код живёт 5 минут, гасится при первом
+        применении, а эндпоинт входа ограничен по частоте.
+        """
+        expires_at = datetime.now(UTC) + WEB_LOGIN_CODE_TTL
+        # Коллизия шестизначного кода маловероятна, но token_hash — первичный
+        # ключ, поэтому пробуем несколько раз, а не падаем.
+        for _ in range(10):
+            code = f"{secrets.randbelow(1_000_000):06d}"
+            try:
+                await self.db().execute(
+                    """
+                    INSERT INTO app_core.one_time_tokens (token_hash, user_id, purpose, expires_at)
+                    VALUES ($1,$2,'web_login',$3)
+                    """,
+                    token_hash(code), user_id, expires_at,
+                )
+            except asyncpg.UniqueViolationError:
+                continue
+            return code
+        raise RuntimeError("Не удалось выдать код входа")
+
+    async def telegram_login(self, code: str) -> tuple[str, str]:
+        """Обменять код из бота на сессию веба. Ошибка — та же, что у входа."""
+        row = await self.db().fetchrow(
+            """
+            UPDATE app_core.one_time_tokens
+            SET used_at = CURRENT_TIMESTAMP
+            WHERE token_hash=$1 AND purpose='web_login'
+              AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP
+            RETURNING user_id
+            """,
+            token_hash((code or "").strip()),
+        )
+        if not row:
+            raise AuthenticationError("Код не подошёл: он просрочен или уже использован")
+        status = await self.db().fetchval(
+            "SELECT status FROM app_core.users WHERE id=$1", row["user_id"]
+        )
+        if status != "active":
+            raise AuthenticationError("Аккаунт недоступен")
+        return await self.create_session(row["user_id"])
+
+    async def has_password(self, user_id: Any) -> bool:
+        """Есть ли у аккаунта пароль: без него отвязка Telegram запирает вход."""
+        return await self.db().fetchval(
+            "SELECT 1 FROM app_core.password_credentials WHERE user_id=$1", user_id
+        ) is not None
+
+    async def set_password(self, session: dict[str, Any], password: str) -> None:
+        """Задать или сменить пароль (§3.3, шаг 4) — для аккаунтов из бота."""
+        password_hash = hash_password(password)
+        await self.db().execute(
+            """
+            INSERT INTO app_core.password_credentials (user_id, password_hash)
+            VALUES ($1,$2)
+            ON CONFLICT (user_id) DO UPDATE
+            SET password_hash=EXCLUDED.password_hash, changed_at=CURRENT_TIMESTAMP
+            """,
+            session["user_id"], password_hash,
+        )
+        await self.audit(session, "auth.password_set", "user", session["user_id"])
+
+    async def unlink_telegram(self, session: dict[str, Any]) -> bool:
+        """Отвязать Telegram (§3.4). Незавершённый диалог тоже стирается —
+        это персональные данные, которым незачем переживать отвязку."""
+        async with self.db().acquire() as connection, connection.transaction():
+            row = await connection.fetchrow(
+                """
+                DELETE FROM app_core.auth_identities
+                WHERE provider='telegram' AND user_id=$1
+                RETURNING provider_user_id
+                """,
+                session["user_id"],
+            )
+            if row is not None:
+                await connection.execute(
+                    "DELETE FROM app_core.telegram_dialog_state WHERE user_id=$1",
+                    int(row["provider_user_id"]),
+                )
+                await self._audit(
+                    connection, session["household_id"], session["user_id"],
+                    "auth.telegram_unlinked", "user", session["user_id"],
+                    channel=session.get("channel"),
+                )
+        return row is not None
 
     async def audit(
         self,

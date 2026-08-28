@@ -48,6 +48,9 @@
             <button class="auth-tab" type="button" role="tab" data-mode="login" aria-selected="false" aria-controls="auth-panel" tabindex="-1">
               Вход
             </button>
+            <button class="auth-tab" type="button" role="tab" data-mode="telegram" aria-selected="false" aria-controls="auth-panel" tabindex="-1">
+              Через Telegram
+            </button>
           </div>
 
           <div id="auth-panel" role="tabpanel">
@@ -74,6 +77,12 @@
           <label class="field" id="auth-household-field">
             <span>Название семьи</span>
             <input id="auth-household" type="text" value="Моя семья" maxlength="100" />
+          </label>
+
+          <label class="field" id="auth-code-field" hidden>
+            <span>Код из бота</span>
+            <input id="auth-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456" />
+            <span class="field-error" id="auth-code-error" role="alert"></span>
           </label>
 
           <button id="auth-submit" class="btn btn--action btn--wide" type="submit">Создать аккаунт</button>
@@ -408,11 +417,28 @@
 
             <section class="panel">
               <div class="panel__head"><h2>Телеграм</h2></div>
-              <p class="footnote">Бот подключается одноразовой командой; без токена он выключен.</p>
+              <p class="footnote" id="telegram-status">Бот подключается одноразовой командой; без токена он выключен.</p>
               <button id="telegram-link" class="btn btn--small form-submit" type="button">
                 Получить команду
               </button>
               <code id="telegram-command" hidden></code>
+              <button id="telegram-unlink" class="btn btn--small btn--danger form-submit" type="button" hidden>
+                Отвязать Telegram
+              </button>
+              <p class="field-error" id="telegram-error" role="alert"></p>
+            </section>
+
+            <section class="panel">
+              <div class="panel__head"><h2>Аккаунт</h2></div>
+              <p class="footnote" id="account-status"></p>
+              <label class="field">
+                <span>Новый пароль</span>
+                <input id="account-password" type="password" autocomplete="new-password" minlength="8" />
+                <span class="field-error" id="account-password-error" role="alert"></span>
+              </label>
+              <button id="account-save-password" class="btn btn--small form-submit" type="button">
+                Задать пароль
+              </button>
             </section>
 
             <section class="panel">

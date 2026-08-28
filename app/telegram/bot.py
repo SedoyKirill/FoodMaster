@@ -21,6 +21,7 @@ from app.web.ratelimit import RateLimiter
 from .fsm import CANCEL_DATA, CANCEL_TEXT, DialogStore
 from .repository import BotRepository
 from .router import TOO_FAST_TEXT, Actor, Incoming, Router, parse_update
+from .scenes import SceneContext, auth
 from .service import (
     CallbackReply, Reply, callback_verb, handle_callback, handle_message,
     split_for_telegram,
@@ -54,6 +55,9 @@ BOT_COMMANDS = [
     ("today", "Меню на сегодня"),
     ("week", "Текущий план"),
     ("shopping", "Список покупок"),
+    ("web", "Войти в веб-приложение"),
+    ("unlink", "Отвязать Telegram"),
+    ("cancel", "Отменить текущий диалог"),
     ("help", "Что я умею"),
 ]
 
@@ -304,10 +308,18 @@ class BotApp:
                 reply = Reply(CANCEL_TEXT)
             elif route == "scene":
                 scene = self.router.scenes[state.scene]
-                reply = await scene(self, actor, text, state)
+                reply = await scene(SceneContext(
+                    actor=actor, text=text, state=state,
+                    bot_repository=self.bot_repository,
+                    app_repository=self.app_repository,
+                    dialogs=self.router.dialogs,
+                    today=self._today(),
+                ))
             else:
                 reply = await handle_message(
-                    self.bot_repository, actor.user_id, text, self._today()
+                    self.bot_repository, actor.user_id, text, self._today(),
+                    app_repository=self.app_repository,
+                    dialogs=self.router.dialogs,
                 )
         except Exception:
             log.exception("Ошибка обработки сообщения от %s", actor.user_id)
@@ -374,7 +386,8 @@ class BotApp:
         # лёгкие глаголы — inline
         try:
             result = await handle_callback(
-                self.app_repository, self.bot_repository, actor.user_id, data, self._today()
+                self.app_repository, self.bot_repository, actor.user_id, data,
+                self._today(), dialogs=self.router.dialogs,
             )
         except Exception:
             log.exception("Ошибка callback %r от %s", data, actor.user_id)
@@ -393,7 +406,7 @@ class BotApp:
             result = await asyncio.wait_for(
                 handle_callback(
                     self.app_repository, self.bot_repository, actor.user_id, data,
-                    self._today(),
+                    self._today(), dialogs=self.router.dialogs,
                 ),
                 self.heavy_timeout,
             )
@@ -495,7 +508,7 @@ async def main() -> None:
     # channel='telegram' — чтобы audit_log не помечал действия бота как 'web'.
     app_repository = AppRepository(database_url, channel="telegram")
     app_repository.pool = pool
-    router = Router(dialogs=DialogStore(pool))
+    router = Router(dialogs=DialogStore(pool), scenes={auth.SCENE: auth.handle_step})
 
     offset: int | None = None
     async with httpx.AsyncClient() as http:
