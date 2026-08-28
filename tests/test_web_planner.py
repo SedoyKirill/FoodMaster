@@ -493,6 +493,124 @@ class ProductMatcherCacheTests(unittest.TestCase):
         self.assertGreater(plan["estimated_cost_kop"], 0)
 
 
+class PlanReasonsTests(unittest.TestCase):
+    """Каждое блюдо плана объясняет себя (TZ-M8 §5)."""
+
+    @staticmethod
+    def _plan(**kwargs) -> dict:
+        recipes = [recipe(index, f"Блюдо {index}", "dinner") for index in (1, 2, 3)]
+        return build_plan(
+            household_id="household",
+            starts_on=date(2026, 8, 26),
+            days=1,
+            cuisines=[],
+            people=[{"name": "Взрослый", "person_type": "adult", "portion_factor": Decimal("1")}],
+            appliances=[],
+            rules=[],
+            inventory=kwargs.pop("inventory", []),
+            recipes=recipes,
+            products=[],
+            meals=["dinner"],
+            **kwargs,
+        )
+
+    def test_every_meal_carries_at_least_one_reason(self) -> None:
+        plan = self._plan()
+        for meal in plan["meals"]:
+            self.assertTrue(meal["reasons"], meal["title"])
+            self.assertLessEqual(len(meal["reasons"]), 3)
+
+    def test_expiring_stock_becomes_the_reason(self) -> None:
+        """Молоко портится через два дня — это и есть довод за блюдо."""
+        inventory = [{
+            "name": "Молоко", "quantity": Decimal("200"), "unit_code": "ml",
+            "expires_on": date(2026, 8, 28),
+        }]
+        plan = self._plan(inventory=inventory)
+        codes = [reason["code"] for reason in plan["meals"][0]["reasons"]]
+        self.assertIn("uses_expiring", codes)
+
+    def test_rotation_is_named_for_a_long_forgotten_dish(self) -> None:
+        history = [{"recipe_id": 1, "meal_date": date(2026, 8, 10), "dish_type": None}]
+        plan = self._plan(history=history)
+        by_recipe = {meal["recipe_id"]: meal["reasons"] for meal in plan["meals"]}
+        if 1 in by_recipe:
+            self.assertIn("rotation", [reason["code"] for reason in by_recipe[1]])
+
+
+class AlternativeGroupTests(unittest.TestCase):
+    """Замена предлагает похожее, другое и новое (TZ-M8 §6.6)."""
+
+    @staticmethod
+    def _recipes() -> list[dict]:
+        recipes = []
+        for index in range(1, 5):
+            item = recipe(index, f"Суп номер {index}", "dinner")
+            item["dish_type"] = "soup"
+            recipes.append(item)
+        for index in range(5, 9):
+            item = recipe(index, f"Запеканка номер {index}", "dinner")
+            item["dish_type"] = "casserole"
+            recipes.append(item)
+        return recipes
+
+    def _cards(self, **kwargs) -> list[dict]:
+        return slot_alternatives(
+            meal_date=date(2026, 8, 26),
+            meal_type="dinner",
+            current_recipe_id=1,
+            other_meals=[],
+            cuisines=[],
+            people=[{"name": "Взрослый", "person_type": "adult", "portion_factor": Decimal("1")}],
+            appliances=[],
+            rules=[],
+            inventory=[],
+            recipes=self._recipes(),
+            products=[],
+            limit=10,
+            with_details=True,
+            **kwargs,
+        )
+
+    def test_cards_are_split_into_groups(self) -> None:
+        """Семья, которая знает все блюда, получает «похожее» и «другое»."""
+        history = [
+            {"recipe_id": index, "meal_date": date(2026, 8, 20), "dish_type": None}
+            for index in range(1, 9)
+        ]
+        groups = {card["group"] for card in self._cards(history=history)}
+        self.assertIn("similar", groups)
+        self.assertIn("other", groups)
+
+    def test_new_group_appears_when_the_family_knows_nothing(self) -> None:
+        groups = {card["group"] for card in self._cards()}
+        self.assertIn("similar", groups)
+        self.assertIn("new", groups)
+
+    def test_similar_group_keeps_the_dish_type_of_the_current_meal(self) -> None:
+        for card in self._cards():
+            if card["group"] == "similar":
+                self.assertEqual(card["recipe"]["dish_type"], "soup")
+
+    def test_unknown_dish_of_another_type_lands_in_the_new_group(self) -> None:
+        """Знакомы все, кроме одной запеканки, — она и есть «новое»."""
+        history = [
+            {"recipe_id": index, "meal_date": date(2026, 8, 20), "dish_type": None}
+            for index in range(1, 8)
+        ]
+        cards = self._cards(history=history)
+        new_cards = [card for card in cards if card["group"] == "new"]
+        self.assertEqual([card["recipe"]["id"] for card in new_cards], [8])
+
+    def test_every_card_has_one_reason_and_deltas(self) -> None:
+        for card in self._cards():
+            self.assertIn("code", card["reason"])
+            self.assertIsNotNone(card["delta_cost_kop"])
+
+    def test_current_dish_is_never_offered(self) -> None:
+        self.assertNotIn(1, [card["recipe"]["id"] for card in self._cards()])
+
+
 class HistoryAndTimeTests(unittest.TestCase):
     """Ротация и время готовки в плане (TZ-M8 §3.5, §3.7)."""
 

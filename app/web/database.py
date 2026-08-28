@@ -1255,8 +1255,8 @@ class AppRepository:
                     INSERT INTO app_core.plan_meals (
                         id, plan_id, meal_date, meal_type, recipe_id, scale,
                         servings, estimated_kcal, position, warnings,
-                        estimated_protein, estimated_fat, estimated_carb
-                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13)
+                        estimated_protein, estimated_fat, estimated_carb, reasons
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14::jsonb)
                     """,
                     uuid.uuid4(), plan_id, meal["meal_date"], meal["meal_type"],
                     meal["recipe_id"], meal["scale"], meal["servings"],
@@ -1264,6 +1264,7 @@ class AppRepository:
                     json.dumps(meal.get("warnings") or [], ensure_ascii=False),
                     meal.get("estimated_protein"), meal.get("estimated_fat"),
                     meal.get("estimated_carb"),
+                    json.dumps(meal.get("reasons") or [], ensure_ascii=False),
                 )
             for item in plan["shopping"]:
                 await connection.execute(
@@ -1411,37 +1412,49 @@ class AppRepository:
                 cuisines=cuisines,
                 price_tier=header["price_tier"],
                 limit=MEAL_ALTERNATIVES_LIMIT if new_recipe_id is None else 1000,
+                with_details=True,
                 **{
                     key: data[key]
                     for key in (
                         "people", "appliances", "rules", "inventory", "recipes",
                         "products", "product_matcher", "synonyms", "ratings",
-                        "nutrition",
+                        "nutrition", "history", "plan_profile",
                     )
                     if key in data
                 },
             )
         )
         if new_recipe_id is None:
+            # TZ-M8 §6.6: у каждой карточки своя группа, причина и дельты —
+            # «дешевле на 80 ₽» полезнее, чем просто список названий.
             return {
                 "alternatives": [
                     {
-                        "recipe_id": int(recipe["id"]),
-                        "title": clean_dish_title(recipe["title"]),
-                        "source_page_start": recipe.get("source_page_start"),
-                        "review_status": recipe.get("review_status"),
-                        "draft": recipe.get("review_status") != "ready",
+                        "recipe_id": int(card["recipe"]["id"]),
+                        "title": clean_dish_title(card["recipe"]["title"]),
+                        "source_page_start": card["recipe"].get("source_page_start"),
+                        "review_status": card["recipe"].get("review_status"),
+                        "draft": card["recipe"].get("review_status") != "ready",
+                        "group": card["group"],
+                        "reason": card["reason"],
+                        "delta_kcal": card["delta_kcal"],
+                        "delta_cost_kop": card["delta_cost_kop"],
                     }
-                    for recipe in alternatives[:MEAL_ALTERNATIVES_LIMIT]
+                    for card in alternatives[:MEAL_ALTERNATIVES_LIMIT]
                 ]
             }
 
-        selected = next(
-            (recipe for recipe in alternatives if int(recipe["id"]) == int(new_recipe_id)),
+        chosen = next(
+            (
+                card
+                for card in alternatives
+                if int(card["recipe"]["id"]) == int(new_recipe_id)
+            ),
             None,
         )
-        if selected is None:
+        if chosen is None:
             raise ValueError("Этот рецепт нельзя поставить в выбранный слот")
+        selected = chosen["recipe"]
         entry = meal_entry_for(
             selected,
             target["meal_date"],
@@ -1452,13 +1465,16 @@ class AppRepository:
             synonyms=data.get("synonyms"),
             nutrition_table=data.get("nutrition"),
         )
+        # Причина замены сохраняется вместе с блюдом: план не должен терять
+        # объяснение после ручной правки (TZ-M8 §5).
+        entry["reasons"] = [chosen["reason"]]
         async with self.db().acquire() as connection, connection.transaction():
             await connection.execute(
                 """
                 UPDATE app_core.plan_meals
                 SET recipe_id=$3, scale=$4, servings=$5, estimated_kcal=$6,
                     warnings=$7::jsonb, estimated_protein=$8, estimated_fat=$9,
-                    estimated_carb=$10
+                    estimated_carb=$10, reasons=$11::jsonb
                 WHERE id=$1 AND plan_id=$2
                 """,
                 meal_id, plan_id, entry["recipe_id"], entry["scale"],
@@ -1466,6 +1482,7 @@ class AppRepository:
                 json.dumps(entry["warnings"], ensure_ascii=False),
                 entry.get("estimated_protein"), entry.get("estimated_fat"),
                 entry.get("estimated_carb"),
+                json.dumps(entry.get("reasons") or [], ensure_ascii=False),
             )
             await self._audit(
                 connection, session["household_id"], session["user_id"],
@@ -1569,7 +1586,7 @@ class AppRepository:
         meals = await self.db().fetch(
             """
             SELECT pm.id, pm.meal_date, pm.meal_type, pm.recipe_id, pm.scale,
-                   pm.servings, pm.estimated_kcal, pm.warnings,
+                   pm.servings, pm.estimated_kcal, pm.warnings, pm.reasons,
                    pm.estimated_protein, pm.estimated_fat, pm.estimated_carb,
                    r.title, r.cuisine_code, r.review_status, r.source_page_start
             FROM app_core.plan_meals pm
@@ -1612,6 +1629,7 @@ class AppRepository:
         for meal in result["meals"]:
             meal["title"] = clean_dish_title(meal["title"])
             meal["warnings"] = _json_column(meal.get("warnings"))
+            meal["reasons"] = _json_column(meal.get("reasons")) or []
         result["shopping"] = [row_dict(row) for row in shopping]
         result["warnings"] = stored_warnings or [
             # Фолбэк для планов, сохранённых до появления plan_warnings.

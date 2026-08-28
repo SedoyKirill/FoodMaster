@@ -205,6 +205,11 @@ CREATE TABLE IF NOT EXISTS app_core.plan_meals (
 ALTER TABLE app_core.plan_meals
     ADD COLUMN IF NOT EXISTS warnings JSONB NOT NULL DEFAULT '[]'::jsonb;
 
+-- TZ-M8 §5: «почему это блюдо» — коды причин с параметрами. Текст собирают
+-- интерфейс и бот, в базе лежат только факты выбора.
+ALTER TABLE app_core.plan_meals
+    ADD COLUMN IF NOT EXISTS reasons JSONB NOT NULL DEFAULT '[]'::jsonb;
+
 CREATE TABLE IF NOT EXISTS app_core.plan_ingredients (
     id UUID PRIMARY KEY,
     plan_id UUID NOT NULL REFERENCES app_core.meal_plans(id) ON DELETE CASCADE,

@@ -938,7 +938,9 @@ def build_plan(
     ``history`` — блюда семьи за три недели (ротация, TZ-M8 §3.7),
     ``plan_profile`` — лимиты времени и прочие настройки семьи (§3.4).
     """
+    from .planning import candidates as candidates_mod
     from .planning import context as context_mod
+    from .planning import explain as explain_mod
     from .planning import optimizer as optimizer_mod
     from .planning import profile as profile_mod
     from .planning import scaling as scaling_mod
@@ -1170,6 +1172,22 @@ def build_plan(
     )
 
     recipes_by_id = {int(recipe["id"]): recipe for recipe in pool}
+    # Данные для «почему это блюдо» (TZ-M8 §5): считаются один раз на план,
+    # а применяются только к выбранным блюдам — их три десятка, не пятьсот.
+    expiring_names = candidates_mod._expiring_canonicals(
+        inventory, starts_on, synonyms_dict, _normal
+    )
+    stock_names = {
+        synonyms_dict.canonical_name(str(lot.get("name") or ""), _normal)
+        for lot in inventory
+    }
+    stock_names.discard("")
+    seasonal_names = context_mod.SEASONAL_INGREDIENTS[starts_on.month]
+    median_cost_by_slot: dict[tuple[int, str], int] = {}
+    for slot, slot_candidates in candidates_by_slot.items():
+        costs = sorted(scores[recipe_id].cost_kop for recipe_id in slot_candidates)
+        if costs:
+            median_cost_by_slot[slot] = costs[len(costs) // 2]
     plan_warnings: list[str] = []
     meals: list[dict[str, Any]] = []
     meal_ingredients: list[dict[str, Any]] = []
@@ -1207,6 +1225,41 @@ def build_plan(
                         "is_to_taste": bool(ingredient.get("is_to_taste")),
                     }
                 )
+            ingredient_names = [
+                synonyms_dict.canonical_name(
+                    str(ingredient.get("normalized_name")
+                        or ingredient.get("ingredient_text") or ""),
+                    _normal,
+                )
+                for ingredient in selected.get("ingredients", [])
+            ]
+            reasons = explain_mod.explain(
+                score,
+                explain_mod.ExplainContext(
+                    meal_type=meal_type,
+                    cost_factor=cost_factor,
+                    median_cost_kop=median_cost_by_slot.get((day_index, meal_type)),
+                    expiring_names=tuple(
+                        name for name in ingredient_names if name in expiring_names
+                    )[:3],
+                    stock_names=tuple(
+                        name for name in ingredient_names
+                        if name in stock_names and name not in expiring_names
+                    )[:3],
+                    seasonal_names=tuple(
+                        name for name in ingredient_names
+                        if name in seasonal_names
+                        or any(word in seasonal_names for word in name.split())
+                    )[:3],
+                    days_since=plan_history.days_since(recipe_id),
+                    rating=(ratings or {}).get(recipe_id),
+                    known=bool(
+                        (ratings or {}).get(recipe_id)
+                        or plan_history.days_since(recipe_id) is not None
+                    ),
+                    kcal_target=profile_mod.slot_kcal_target(people, meal_type, meal_date),
+                ),
+            )
             meal_nutrition = _meal_nutrition(
                 selected.get("ingredients", []), scale, product_matcher, price_tier,
                 synonyms=synonyms_dict, normal=_normal, nutrition=nutrition,
@@ -1230,6 +1283,7 @@ def build_plan(
                     "scale_unknown": scale_unknown,
                     "servings": slot_servings,
                     "warnings": meal_warnings,
+                    "reasons": reasons,
                     **meal_nutrition,
                 }
             )
@@ -1416,6 +1470,107 @@ def _fit_time_limit(
     return relaxed
 
 
+#: сколько альтернатив каждой группы показывать при замене (TZ-M8 §6.6)
+ALTERNATIVE_GROUP_QUOTAS = (("similar", 4), ("other", 4), ("new", 2))
+
+
+def _alternative_group(
+    recipe: dict[str, Any],
+    current: dict[str, Any] | None,
+    known: bool,
+) -> str:
+    """«Похожее», «другое» или «новое» — относительно текущего блюда.
+
+    Похожесть сильнее новизны: тому, кто меняет суп, полезнее увидеть другой
+    суп, даже если семья его ещё не пробовала. «Новое» остаётся для блюд
+    иного типа, о которых семья ничего не знает.
+    """
+    same_type = bool(
+        current is not None
+        and recipe.get("dish_type")
+        and recipe.get("dish_type") == current.get("dish_type")
+    )
+    if same_type:
+        return "similar"
+    return "other" if known else "new"
+
+
+def _alternative_cards(
+    ranked: list[dict[str, Any]],
+    *,
+    scores: dict[int, Any],
+    current: dict[str, Any] | None,
+    meal_type: str,
+    meal_date: date,
+    cost_factor: int,
+    people: list[dict[str, Any]],
+    ratings: dict[int, int],
+    history: Any,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Десятка замен по группам: похожие, другие и то, что семья не пробовала.
+
+    Раньше список ранжировался одной целевой функцией и легко оказывался
+    пятью блинами подряд — они просто дешевле.
+    """
+    from .planning import explain as explain_mod
+    from .planning import profile as profile_mod
+
+    current_score = scores.get(int(current["id"])) if current else None
+    kcal_target = profile_mod.slot_kcal_target(people, meal_type, meal_date)
+    costs = sorted(scores[int(recipe["id"])].cost_kop for recipe in ranked)
+    median_cost = costs[len(costs) // 2] if costs else None
+
+    by_group: dict[str, list[dict[str, Any]]] = {"similar": [], "other": [], "new": []}
+    for recipe in ranked:
+        recipe_id = int(recipe["id"])
+        score = scores[recipe_id]
+        known = bool(ratings.get(recipe_id) or history.days_since(recipe_id) is not None)
+        card = {
+            "recipe": recipe,
+            "group": _alternative_group(recipe, current, known),
+            "reason": explain_mod.main_reason(
+                score,
+                explain_mod.ExplainContext(
+                    meal_type=meal_type,
+                    cost_factor=cost_factor,
+                    median_cost_kop=median_cost,
+                    days_since=history.days_since(recipe_id),
+                    rating=ratings.get(recipe_id),
+                    known=known,
+                    kcal_target=kcal_target,
+                ),
+            ),
+            "delta_kcal": (
+                score.kcal - current_score.kcal
+                if current_score is not None and score.kcal and current_score.kcal
+                else None
+            ),
+            "delta_cost_kop": (
+                score.cost_kop - current_score.cost_kop
+                if current_score is not None
+                else None
+            ),
+        }
+        by_group[card["group"]].append(card)
+
+    cards: list[dict[str, Any]] = []
+    for group, quota in ALTERNATIVE_GROUP_QUOTAS:
+        cards.extend(by_group[group][:quota])
+    if len(cards) < limit:
+        # Группы добираются друг из друга: пустая «новое» не должна оставлять
+        # пользователя с шестью вариантами вместо десяти.
+        chosen = {id(card) for card in cards}
+        for recipe_group in by_group.values():
+            for card in recipe_group:
+                if len(cards) >= limit:
+                    break
+                if id(card) not in chosen:
+                    cards.append(card)
+                    chosen.add(id(card))
+    return cards[: max(1, limit)]
+
+
 def _min_distinct_for_horizon(days: int) -> int:
     """Сколько разных блюд нужно слоту на горизонт.
 
@@ -1446,13 +1601,23 @@ def slot_alternatives(
     ratings: dict[int, int] | None = None,
     limit: int = 3,
     nutrition: dict[str, dict[str, Any]] | None = None,
+    history: list[dict[str, Any]] | None = None,
+    plan_profile: dict[str, Any] | None = None,
+    with_details: bool = False,
 ) -> list[dict[str, Any]]:
     """Кандидаты на один слот при зафиксированных остальных блюдах (TZ-M5R §3).
 
     Жёсткие ограничения повторяемости учитывают остальные приёмы плана:
     блюдо не предлагается, если оно уже стоит в этот же или соседний день
     или использовано дважды на горизонте.
+
+    ``with_details`` (TZ-M8 §6.6) возвращает не голые рецепты, а карточки
+    замены: группа («похожее», «другое», «новое»), одна главная причина и
+    дельты к калориям и стоимости относительно текущего блюда. Десятка из
+    одних блинов бесполезна — группы гарантируют, что выбор действительно
+    разный.
     """
+    from .planning import context as context_mod
     from .planning import optimizer as optimizer_mod
     from .planning.candidates import (
         Synonyms, hard_rule_terms, ingredient_matches_terms, score_candidates,
@@ -1496,6 +1661,17 @@ def slot_alternatives(
     ]
     if not pool:
         return []
+    # Текущее блюдо оценивается вместе с остальными: без него не посчитать,
+    # насколько альтернатива дороже или калорийнее.
+    current_recipe = next(
+        (
+            recipe
+            for recipe in recipes
+            if current_recipe_id is not None and int(recipe["id"]) == int(current_recipe_id)
+        ),
+        None,
+    )
+    scored_pool = pool + ([current_recipe] if current_recipe is not None else [])
 
     product_matcher = product_matcher or ProductMatcher(products)
     from .planning import scaling as scaling_mod
@@ -1507,7 +1683,7 @@ def slot_alternatives(
         return scale
 
     scores = score_candidates(
-        pool,
+        scored_pool,
         meal_types=[meal_type],
         cuisines=cuisines,
         rules=rules,
@@ -1562,5 +1738,21 @@ def slot_alternatives(
             preferred_ids = {int(recipe["id"]) for recipe in preferred}
             rest = [recipe for recipe in ranked if int(recipe["id"]) not in preferred_ids]
             ranked = _diversify_by_dish_type(preferred) + _diversify_by_dish_type(rest)
-            return ranked[: max(1, limit)]
-    return _diversify_by_dish_type(ranked)[: max(1, limit)]
+        else:
+            ranked = _diversify_by_dish_type(ranked)
+    else:
+        ranked = _diversify_by_dish_type(ranked)
+    if not with_details:
+        return ranked[: max(1, limit)]
+    return _alternative_cards(
+        ranked,
+        scores=scores,
+        current=current_recipe,
+        meal_type=meal_type,
+        meal_date=meal_date,
+        cost_factor=cost_factor,
+        people=people,
+        ratings=ratings or {},
+        history=context_mod.build_history(history or [], meal_date),
+        limit=limit,
+    )
