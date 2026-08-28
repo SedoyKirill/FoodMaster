@@ -78,6 +78,30 @@ DISH_TYPES: dict[str, str] = {
 }
 
 
+APPLIANCES: dict[str, str] = {
+    "stove": "Плита",
+    "oven": "Духовка",
+    "microwave": "Микроволновка",
+    "blender": "Блендер",
+    "mixer": "Миксер",
+    "multicooker": "Мультиварка",
+    "air_fryer": "Аэрогриль",
+    "grill": "Гриль",
+    "electric_grill": "Электрогриль",
+    "steamer": "Пароварка",
+    "food_processor": "Кухонный комбайн",
+    "pressure_cooker": "Скороварка",
+    "fridge_freezer": "Холодильник с морозилкой",
+}
+
+RULE_TYPES: dict[str, str] = {
+    "allergy": "Аллергия",
+    "intolerance": "Непереносимость",
+    "exclude": "Исключение",
+    "dislike": "Не любит",
+}
+
+
 def cuisine_label(code: str | None) -> str:
     return CUISINES.get(str(code or ""), str(code or "")) or "—"
 

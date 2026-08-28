@@ -33,6 +33,7 @@ from .scenes import inventory as inventory_scene
 from .scenes import plan as plan_scene
 from .scenes import products as products_scene
 from .scenes import recipes as recipes_scene
+from .scenes import settings as settings_scene
 from .scenes import shopping as shopping_scene
 
 __all__ = [
@@ -126,6 +127,8 @@ async def handle_message(
             )
         if lowered in {"/products", "продукты", "каталог"}:
             return await products_scene.begin(dialogs, app_repository, user_id)
+        if lowered in {"/settings", "настройки", "⚙️ настройки"}:
+            return await settings_scene.begin(dialogs, session, user_id)
 
     if lowered in {"/week", "неделя", "план", "📅 неделя", "📅 меню", "меню"}:
         meals = await repository.latest_plan_meals(context["household_id"])
@@ -223,6 +226,12 @@ async def handle_callback(
             if result is not None:
                 return result
         if verb == "o":
+            # тумблеры разных экранов: техника в настройках помечена «ap»,
+            # чипы кухонь в мастере меню идут без области
+            if parts[:1] == ["ap"]:
+                return await settings_scene.toggle_appliance(
+                    app_repository, session, parts[1] if len(parts) > 1 else ""
+                )
             return await plan_scene.toggle_cuisine(
                 dialogs, app_repository, user_id, parts[0] if parts else ""
             )
@@ -236,6 +245,20 @@ async def handle_callback(
                 edit=await plan_scene.history_reply(app_repository, session, page)
             )
         # --- библиотека рецептов (§5.7) ---------------------------------------
+        if verb == "n" and parts[:1] == ["st"]:
+            result = await settings_scene.handle_navigation(
+                app_repository, dialogs, session, user_id, parts
+            )
+            if result is not None:
+                return result
+        if verb == "y" and parts[:1] == ["sp"]:
+            return await settings_scene.delete_person(
+                app_repository, session, parts[1] if len(parts) > 1 else ""
+            )
+        if verb == "y" and parts[:1] == ["sr"]:
+            return await settings_scene.delete_rule(
+                app_repository, session, parts[1] if len(parts) > 1 else ""
+            )
         if verb == "n" and parts[:1] == ["pr"]:
             result = await products_scene.handle_navigation(
                 app_repository, dialogs, user_id, parts

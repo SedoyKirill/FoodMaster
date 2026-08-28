@@ -22,7 +22,7 @@ from .callbacks import heavy_placeholder
 from .fsm import CANCEL_DATA, CANCEL_TEXT, DialogStore
 from .repository import BotRepository, bot_session
 from .router import TOO_FAST_TEXT, Actor, Incoming, Router, parse_update
-from .scenes import SceneContext, auth, inventory, plan, products, recipes
+from .scenes import SceneContext, auth, inventory, plan, products, recipes, settings
 from .service import (
     CallbackReply, Reply, callback_verb, handle_callback, handle_message,
     split_for_telegram,
@@ -35,7 +35,7 @@ KEYBOARD = {
     "keyboard": [
         [{"text": "🍽 Сегодня"}, {"text": "📅 Меню"}],
         [{"text": "🛒 Покупки"}, {"text": "📖 Рецепты"}],
-        [{"text": "🧊 Запасы"}],
+        [{"text": "🧊 Запасы"}, {"text": "⚙️ Настройки"}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
@@ -59,6 +59,7 @@ BOT_COMMANDS = [
     ("recipes", "Поиск по библиотеке рецептов"),
     ("inventory", "Запасы дома"),
     ("products", "Каталог «Ленты»"),
+    ("settings", "Настройки семьи"),
     ("web", "Войти в веб-приложение"),
     ("unlink", "Отвязать Telegram"),
     ("cancel", "Отменить текущий диалог"),
@@ -540,6 +541,7 @@ async def main() -> None:
             recipes.SCENE: recipes.handle_step,
             inventory.SCENE: inventory.handle_step,
             products.SCENE: products.handle_step,
+            settings.SCENE: settings.handle_step,
         },
     )
 

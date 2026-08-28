@@ -484,6 +484,129 @@ class AppRepository:
         await self.audit(session, "settings.person_updated", "person", person_id)
         return row_dict(row)
 
+    # --- точечные правки настроек (TZ-M7 §5.10) --------------------------------
+    # Бот меняет по одному полю за раз, поэтому полный save_settings ему не
+    # годится: он требует прислать людей, технику и правила целиком, а значит
+    # любая гонка двух каналов затирала бы чужие изменения.
+
+    def _require_admin(self, session: dict[str, Any]) -> None:
+        if session.get("role") not in {"owner", "admin"}:
+            raise PermissionError("Недостаточно прав для изменения настроек")
+
+    async def rename_household(self, session: dict[str, Any], name: str) -> str:
+        self._require_admin(session)
+        name = (name or "").strip()
+        if not 1 <= len(name) <= 100:
+            raise ValueError("Название семьи: от 1 до 100 символов")
+        await self.db().execute(
+            "UPDATE app_core.households SET name=$2, updated_at=CURRENT_TIMESTAMP WHERE id=$1",
+            session["household_id"], name,
+        )
+        await self.audit(session, "settings.household_renamed", "household",
+                         session["household_id"], {"name": name})
+        return name
+
+    async def update_appliances(self, session: dict[str, Any], codes: list[str]) -> list[str]:
+        """Полный набор техники: это тринадцать тумблеров, менять их по одному
+        нечем — но людей и правила такая замена уже не задевает."""
+        self._require_admin(session)
+        unique = sorted({str(code).strip() for code in codes if str(code).strip()})
+        async with self.db().acquire() as connection, connection.transaction():
+            await connection.execute(
+                "DELETE FROM app_core.appliances WHERE household_id=$1",
+                session["household_id"],
+            )
+            if unique:
+                await connection.executemany(
+                    "INSERT INTO app_core.appliances (household_id, appliance_code) VALUES ($1,$2)",
+                    [(session["household_id"], code) for code in unique],
+                )
+            await self._audit(
+                connection, session["household_id"], session["user_id"],
+                "settings.appliances_updated", "household", session["household_id"],
+                {"codes": unique}, channel=session.get("channel"),
+            )
+        return unique
+
+    async def add_person(self, session: dict[str, Any], person: dict[str, Any]) -> dict[str, Any]:
+        self._require_admin(session)
+        name = str(person.get("name") or "").strip()
+        if not 1 <= len(name) <= 80:
+            raise ValueError("Имя: от 1 до 80 символов")
+        person_id = uuid.uuid4()
+        row = await self.db().fetchrow(
+            """
+            INSERT INTO app_core.people (
+                id, household_id, name, person_type, target_kcal, portion_factor, position
+            )
+            SELECT $1, $2, $3, $4, $5, $6,
+                   COALESCE(MAX(p.position), 0) + 1
+            FROM app_core.people p WHERE p.household_id = $2
+            RETURNING id, name, person_type, target_kcal, portion_factor, position
+            """,
+            person_id, session["household_id"], name,
+            _coerce_person_field("person_type", person.get("person_type")),
+            _coerce_person_field("target_kcal", person.get("target_kcal")),
+            _coerce_person_field("portion_factor", person.get("portion_factor", 1)),
+        )
+        await self.audit(session, "settings.person_added", "person", person_id, {"name": name})
+        return row_dict(row)
+
+    async def delete_person(self, session: dict[str, Any], person_id: uuid.UUID) -> bool:
+        """Последнего человека убрать нельзя: без едоков планировать нечего."""
+        self._require_admin(session)
+        async with self.db().acquire() as connection, connection.transaction():
+            total = await connection.fetchval(
+                "SELECT count(*) FROM app_core.people WHERE household_id=$1",
+                session["household_id"],
+            )
+            if int(total or 0) <= 1:
+                raise ValueError("В семье должен остаться хотя бы один человек")
+            status = await connection.execute(
+                "DELETE FROM app_core.people WHERE id=$1 AND household_id=$2",
+                person_id, session["household_id"],
+            )
+            if affected_rows(status) != 1:
+                return False
+            await self._audit(
+                connection, session["household_id"], session["user_id"],
+                "settings.person_removed", "person", person_id,
+                channel=session.get("channel"),
+            )
+        return True
+
+    async def add_dietary_rule(
+        self, session: dict[str, Any], rule: dict[str, Any]
+    ) -> dict[str, Any]:
+        self._require_admin(session)
+        term = str(rule.get("term") or "").strip()
+        if not 1 <= len(term) <= 100:
+            raise ValueError("Продукт: от 1 до 100 символов")
+        rule_id = uuid.uuid4()
+        row = await self.db().fetchrow(
+            """
+            INSERT INTO app_core.dietary_rules (id, household_id, rule_type, term, is_hard)
+            VALUES ($1,$2,$3,$4,$5)
+            RETURNING id, rule_type, term, is_hard
+            """,
+            rule_id, session["household_id"],
+            str(rule.get("rule_type") or "exclude"), term,
+            bool(rule.get("is_hard", True)),
+        )
+        await self.audit(session, "settings.rule_added", "dietary_rule", rule_id, {"term": term})
+        return row_dict(row)
+
+    async def delete_dietary_rule(self, session: dict[str, Any], rule_id: uuid.UUID) -> bool:
+        self._require_admin(session)
+        status = await self.db().execute(
+            "DELETE FROM app_core.dietary_rules WHERE id=$1 AND household_id=$2",
+            rule_id, session["household_id"],
+        )
+        if affected_rows(status) != 1:
+            return False
+        await self.audit(session, "settings.rule_removed", "dietary_rule", rule_id)
+        return True
+
     async def dashboard(self, session: dict[str, Any]) -> dict[str, Any]:
         household_id = session["household_id"]
         row = await self.db().fetchrow(
