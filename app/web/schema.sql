@@ -155,6 +155,39 @@ CREATE TABLE IF NOT EXISTS app_core.meal_plans (
 ALTER TABLE app_core.meal_plans
     ADD COLUMN IF NOT EXISTS price_tier TEXT NOT NULL DEFAULT 'balanced';
 
+-- TZ-M8 §3.4: как эта семья планирует. Раньше кухни, бюджет и стратегия
+-- вводились заново при каждой генерации; теперь они хранятся, а поля формы
+-- переопределяют профиль только на текущий план.
+CREATE TABLE IF NOT EXISTS app_core.household_plan_profiles (
+    household_id UUID PRIMARY KEY REFERENCES app_core.households(id) ON DELETE CASCADE,
+    mode TEXT NOT NULL DEFAULT 'balanced',
+    default_days INTEGER NOT NULL DEFAULT 7,
+    weekly_budget_kop BIGINT,
+    cuisines JSONB NOT NULL DEFAULT '[]'::jsonb,
+    -- Решение владельца 28.08.2026: кухня остаётся жёстким фильтром по
+    -- умолчанию, мягкое предпочтение доступно как 'prefer'.
+    cuisine_mode TEXT NOT NULL DEFAULT 'only',
+    weekday_max_minutes INTEGER DEFAULT 45,
+    weekend_max_minutes INTEGER,
+    breakfast_max_minutes INTEGER DEFAULT 25,
+    meals JSONB NOT NULL DEFAULT '["breakfast","lunch","dinner"]'::jsonb,
+    allow_leftovers BOOLEAN NOT NULL DEFAULT TRUE,
+    novelty TEXT NOT NULL DEFAULT 'medium',
+    max_repeats_per_horizon INTEGER NOT NULL DEFAULT 2,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (mode IN ('economy', 'balanced', 'variety', 'fitness', 'quick')),
+    CHECK (cuisine_mode IN ('prefer', 'only')),
+    CHECK (novelty IN ('low', 'medium', 'high')),
+    CHECK (default_days BETWEEN 1 AND 14),
+    CHECK (max_repeats_per_horizon BETWEEN 1 AND 7),
+    CHECK (weekly_budget_kop IS NULL OR weekly_budget_kop >= 0)
+);
+
+-- TZ-M8 §3.4: горизонт до двух недель — ротация блюд на неделе не видна.
+ALTER TABLE app_core.meal_plans DROP CONSTRAINT IF EXISTS meal_plans_days_check;
+ALTER TABLE app_core.meal_plans
+    ADD CONSTRAINT meal_plans_days_check CHECK (days BETWEEN 1 AND 14);
+
 CREATE TABLE IF NOT EXISTS app_core.plan_meals (
     id UUID PRIMARY KEY,
     plan_id UUID NOT NULL REFERENCES app_core.meal_plans(id) ON DELETE CASCADE,

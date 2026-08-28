@@ -508,6 +508,72 @@ class PlanHistoryTests(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
 
 
+class PlanProfileApiTests(unittest.TestCase):
+    """Профиль планирования семьи (TZ-M8 §3.4)."""
+
+    def setUp(self) -> None:
+        self.client, self.repository = make_client(self)
+
+    def test_defaults_are_returned_before_first_save(self) -> None:
+        profile = self.client.get("/api/settings/plan-profile").json()
+        self.assertEqual(profile["mode"], "balanced")
+        self.assertEqual(profile["default_days"], 7)
+        # Решение владельца: кухня остаётся жёстким фильтром по умолчанию.
+        self.assertEqual(profile["cuisine_mode"], "only")
+
+    def test_saved_profile_prefills_generation(self) -> None:
+        """План без полей формы собирается по профилю: дни и приёмы оттуда."""
+        saved = self.client.put("/api/settings/plan-profile", json={
+            "mode": "quick", "default_days": 2, "meals": ["breakfast", "dinner"],
+            "cuisines": [], "cuisine_mode": "only",
+        })
+        self.assertEqual(saved.status_code, 200, saved.text)
+        response = self.client.post("/api/plans/generate", json={"starts_on": "2026-08-17"})
+        self.assertEqual(response.status_code, 201, response.text)
+        plan = response.json()
+        self.assertEqual(plan["days"], 2)
+        self.assertEqual(plan["mode"], "quick")
+        self.assertEqual(
+            sorted({meal["meal_type"] for meal in plan["meals"]}), ["breakfast", "dinner"]
+        )
+
+    def test_form_overrides_profile_without_saving_it(self) -> None:
+        self.client.put("/api/settings/plan-profile", json={"default_days": 5})
+        response = self.client.post(
+            "/api/plans/generate", json={"days": 1, "starts_on": "2026-08-17"}
+        )
+        self.assertEqual(response.json()["days"], 1)
+        self.assertEqual(
+            self.client.get("/api/settings/plan-profile").json()["default_days"], 5
+        )
+
+    def test_weekly_budget_scales_to_horizon(self) -> None:
+        self.client.put("/api/settings/plan-profile", json={"weekly_budget_kop": 700000})
+        response = self.client.post(
+            "/api/plans/generate", json={"days": 1, "starts_on": "2026-08-17"}
+        )
+        self.assertEqual(response.json()["budget_kop"], 100000)
+
+    def test_two_week_horizon_is_accepted(self) -> None:
+        response = self.client.post(
+            "/api/plans/generate", json={"days": 14, "starts_on": "2026-08-17"}
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json()["days"], 14)
+
+    def test_horizon_over_two_weeks_is_rejected(self) -> None:
+        response = self.client.post(
+            "/api/plans/generate", json={"days": 15, "starts_on": "2026-08-17"}
+        )
+        self.assertEqual(response.status_code, 422)
+
+    def test_editor_cannot_save_plan_profile(self) -> None:
+        for household in self.repository.households.values():
+            household["role"] = "editor"
+        response = self.client.put("/api/settings/plan-profile", json={"mode": "economy"})
+        self.assertEqual(response.status_code, 403)
+
+
 class SettingsPeopleApiTests(unittest.TestCase):
     """A4 — люди не пересоздаются, редактируются по одному."""
 

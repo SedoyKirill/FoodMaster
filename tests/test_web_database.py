@@ -121,6 +121,47 @@ class RegistrationDefaultsTests(unittest.TestCase):
         self.assertEqual(codes, sorted(db_module.DEFAULT_APPLIANCES))
 
 
+class PlanProfileRepositoryTests(unittest.TestCase):
+    """Профиль планирования: UPSERT одной записью, дефолты без записи."""
+
+    def test_missing_profile_falls_back_to_defaults(self) -> None:
+        pool = FakePool()
+        profile = asyncio.run(repository_with_pool(pool).plan_profile(SESSION))
+        self.assertEqual(profile, db_module.DEFAULT_PLAN_PROFILE)
+
+    def test_stored_profile_overrides_defaults(self) -> None:
+        pool = FakePool().on(
+            "fetchrow", "FROM app_core.household_plan_profiles",
+            {
+                "mode": "economy", "default_days": 14, "weekly_budget_kop": 500000,
+                "cuisines": '["italian"]', "cuisine_mode": "prefer",
+                "weekday_max_minutes": 30, "weekend_max_minutes": None,
+                "breakfast_max_minutes": 20, "meals": '["lunch","dinner"]',
+                "allow_leftovers": False, "novelty": "high",
+                "max_repeats_per_horizon": 3,
+            },
+        )
+        profile = asyncio.run(repository_with_pool(pool).plan_profile(SESSION))
+        self.assertEqual(profile["mode"], "economy")
+        self.assertEqual(profile["cuisines"], ["italian"])
+        self.assertEqual(profile["meals"], ["lunch", "dinner"])
+        self.assertIsNone(profile["weekend_max_minutes"])
+
+    def test_save_uses_single_upsert(self) -> None:
+        pool = FakePool()
+        asyncio.run(
+            repository_with_pool(pool).save_plan_profile(SESSION, {"mode": "variety"})
+        )
+        sql, args = pool.first_matching("INSERT INTO app_core.household_plan_profiles")
+        self.assertIn("ON CONFLICT (household_id) DO UPDATE", sql)
+        self.assertEqual(args[1], "variety")
+
+    def test_viewer_cannot_save_profile(self) -> None:
+        repository = repository_with_pool(FakePool())
+        with self.assertRaises(PermissionError):
+            asyncio.run(repository.save_plan_profile(session(role="viewer"), {}))
+
+
 class LatestPlanTests(unittest.TestCase):
     """B1/A1 — сохранённый план обязан возвращаться всегда."""
 

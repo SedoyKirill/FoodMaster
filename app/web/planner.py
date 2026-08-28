@@ -918,8 +918,13 @@ def build_plan(
     synonyms: Any = None,
     ratings: dict[int, int] | None = None,
     nutrition: dict[str, dict[str, Any]] | None = None,
+    meals: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Фасад TZ-M5R: кандидаты → оценка → оптимизация → масштабирование → покупки."""
+    """Фасад TZ-M5R: кандидаты → оценка → оптимизация → масштабирование → покупки.
+
+    ``meals`` — какие приёмы планировать вообще (профиль семьи, TZ-M8 §3.4):
+    семья, которая завтракает по дороге, не должна получать завтраки.
+    """
     from .planning import optimizer as optimizer_mod
     from .planning import profile as profile_mod
     from .planning import scaling as scaling_mod
@@ -939,8 +944,11 @@ def build_plan(
     # TZ-M8 §3.1–3.2: слот принадлежит тем, кто ест его дома. Приём, который
     # дома не ест никто, не планируется вовсе; жёсткое правило действует на
     # слот, только если его автор за этим столом.
+    planned_meals = set(meals) if meals else set(MEAL_LABELS)
     meal_types = [
-        meal for meal in MEAL_LABELS if profile_mod.slot_servings(people, meal) > 0
+        meal
+        for meal in MEAL_LABELS
+        if meal in planned_meals and profile_mod.slot_servings(people, meal) > 0
     ] or list(MEAL_LABELS)
     slot_terms: dict[str, set[str]] = {}
     slot_diets: dict[str, set[str]] = {}

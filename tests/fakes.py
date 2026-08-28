@@ -151,6 +151,7 @@ class FakeRepository:
         self.products: list[dict[str, Any]] = []
         self.planner_recipes: list[dict[str, Any]] = []
         self.planner_appliances: list[str] = []
+        self.plan_profiles: dict[str, dict[str, Any]] = {}
         self.audit: list[dict[str, Any]] = []
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
         self.warm_calls = 0
@@ -303,6 +304,28 @@ class FakeRepository:
                 person.update(changes)
                 return person
         return None
+
+    async def plan_profile(self, session: dict[str, Any]) -> dict[str, Any]:
+        from app.web.database import DEFAULT_PLAN_PROFILE
+
+        return {
+            **DEFAULT_PLAN_PROFILE,
+            **self.plan_profiles.get(session["household_id"], {}),
+        }
+
+    async def save_plan_profile(
+        self, session: dict[str, Any], changes: dict[str, Any]
+    ) -> dict[str, Any]:
+        from app.web.database import DEFAULT_PLAN_PROFILE
+
+        self._record("save_plan_profile", changes)
+        if session["role"] not in {"owner", "admin"}:
+            raise PermissionError("Недостаточно прав для изменения настроек")
+        profile = {**DEFAULT_PLAN_PROFILE, **{
+            key: value for key, value in changes.items() if key in DEFAULT_PLAN_PROFILE
+        }}
+        self.plan_profiles[session["household_id"]] = profile
+        return profile
 
     async def person_target(
         self, session: dict[str, Any], person_id: uuid.UUID, on_date: Any = None

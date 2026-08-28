@@ -147,6 +147,30 @@ def _person_profile_values(person: dict[str, Any]) -> tuple[Any, ...]:
     return tuple(values)
 
 
+#: Значения профиля планирования по умолчанию (TZ-M8 §3.4). Держатся рядом с
+#: репозиторием, чтобы семья без сохранённого профиля и семья со свежей
+#: записью планировались одинаково.
+DEFAULT_PLAN_PROFILE: dict[str, Any] = {
+    "mode": "balanced",
+    "default_days": 7,
+    "weekly_budget_kop": None,
+    "cuisines": [],
+    # Кухня — жёсткий фильтр (решение владельца 28.08.2026); 'prefer' мягче.
+    "cuisine_mode": "only",
+    "weekday_max_minutes": 45,
+    "weekend_max_minutes": None,
+    "breakfast_max_minutes": 25,
+    "meals": ["breakfast", "lunch", "dinner"],
+    "allow_leftovers": True,
+    "novelty": "medium",
+    "max_repeats_per_horizon": 2,
+}
+#: поля профиля, у которых NULL — осмысленное значение («без лимита»)
+PLAN_PROFILE_NULLABLE = frozenset(
+    {"weekly_budget_kop", "weekday_max_minutes", "weekend_max_minutes", "breakfast_max_minutes"}
+)
+
+
 class AppRepository:
     def __init__(self, database_url: str | None = None) -> None:
         self.database_url = database_url or os.getenv(
@@ -515,6 +539,70 @@ class AppRepository:
             "by_meal": target.by_meal,
             "target_source": target.source,
         }
+
+    #: колонки профиля планирования (TZ-M8 §3.4); имена в SQL не приходят извне
+    PLAN_PROFILE_COLUMNS = (
+        "mode", "default_days", "weekly_budget_kop", "cuisines", "cuisine_mode",
+        "weekday_max_minutes", "weekend_max_minutes", "breakfast_max_minutes",
+        "meals", "allow_leftovers", "novelty", "max_repeats_per_horizon",
+    )
+    PLAN_PROFILE_JSON_COLUMNS = frozenset({"cuisines", "meals"})
+
+    async def plan_profile(self, session: dict[str, Any]) -> dict[str, Any]:
+        """Профиль планирования семьи; без записи — значения по умолчанию."""
+        row = await self.db().fetchrow(
+            f"""
+            SELECT {', '.join(self.PLAN_PROFILE_COLUMNS)}
+            FROM app_core.household_plan_profiles WHERE household_id=$1
+            """,
+            session["household_id"],
+        )
+        profile = dict(DEFAULT_PLAN_PROFILE)
+        if row:
+            stored = row_dict(row)
+            for column in self.PLAN_PROFILE_COLUMNS:
+                value = stored.get(column)
+                if column in self.PLAN_PROFILE_JSON_COLUMNS:
+                    value = _json_column(value)
+                if value is not None or column in PLAN_PROFILE_NULLABLE:
+                    profile[column] = value
+        return profile
+
+    async def save_plan_profile(
+        self, session: dict[str, Any], changes: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Сохраняет профиль целиком (UPSERT): форма присылает все поля."""
+        if session["role"] not in {"owner", "admin"}:
+            raise PermissionError("Недостаточно прав для изменения настроек")
+        profile = {**DEFAULT_PLAN_PROFILE, **{
+            key: value for key, value in changes.items()
+            if key in self.PLAN_PROFILE_COLUMNS
+        }}
+        values = [
+            json.dumps(profile[column], ensure_ascii=False)
+            if column in self.PLAN_PROFILE_JSON_COLUMNS
+            else profile[column]
+            for column in self.PLAN_PROFILE_COLUMNS
+        ]
+        placeholders = ", ".join(
+            f"${index + 2}" + ("::jsonb" if column in self.PLAN_PROFILE_JSON_COLUMNS else "")
+            for index, column in enumerate(self.PLAN_PROFILE_COLUMNS)
+        )
+        assignments = ", ".join(
+            f"{column}=EXCLUDED.{column}" for column in self.PLAN_PROFILE_COLUMNS
+        )
+        await self.db().execute(
+            f"""
+            INSERT INTO app_core.household_plan_profiles (
+                household_id, {', '.join(self.PLAN_PROFILE_COLUMNS)}
+            ) VALUES ($1, {placeholders})
+            ON CONFLICT (household_id) DO UPDATE
+            SET {assignments}, updated_at=CURRENT_TIMESTAMP
+            """,
+            session["household_id"], *values,
+        )
+        await self.audit(session, "settings.plan_profile_updated", "household", session["household_id"])
+        return profile
 
     async def dashboard(self, session: dict[str, Any]) -> dict[str, Any]:
         household_id = session["household_id"]

@@ -148,12 +148,39 @@ class PersonPatchPayload(BaseModel):
     eats_meals: list[Literal["breakfast", "lunch", "dinner"]] | None = None
 
 
-class PlanPayload(BaseModel):
-    starts_on: date = Field(default_factory=date.today)
-    days: int = Field(default=3, ge=1, le=7)
+PLAN_MODES = ("economy", "balanced", "variety", "fitness", "quick")
+
+
+class PlanProfilePayload(BaseModel):
+    """Профиль планирования семьи (TZ-M8 §3.4)."""
+
+    mode: Literal[PLAN_MODES] = "balanced"  # type: ignore[valid-type]
+    default_days: int = Field(default=7, ge=1, le=14)
+    weekly_budget_kop: int | None = Field(default=None, ge=0, le=10_000_000)
     cuisines: list[str] = Field(default_factory=list)
+    cuisine_mode: Literal["prefer", "only"] = "only"
+    weekday_max_minutes: int | None = Field(default=45, ge=5, le=600)
+    weekend_max_minutes: int | None = Field(default=None, ge=5, le=600)
+    breakfast_max_minutes: int | None = Field(default=25, ge=5, le=600)
+    meals: list[Literal["breakfast", "lunch", "dinner"]] = Field(
+        default_factory=lambda: ["breakfast", "lunch", "dinner"]
+    )
+    allow_leftovers: bool = True
+    novelty: Literal["low", "medium", "high"] = "medium"
+    max_repeats_per_horizon: int = Field(default=2, ge=1, le=7)
+
+
+class PlanPayload(BaseModel):
+    """Форма плана. Незаполненные поля берутся из профиля семьи (§3.4)."""
+
+    starts_on: date = Field(default_factory=date.today)
+    days: int | None = Field(default=None, ge=1, le=14)
+    cuisines: list[str] | None = None
     budget_rub: Decimal | None = Field(default=None, ge=0, le=1_000_000)
-    price_tier: str = "balanced"
+    price_tier: str | None = None
+    mode: Literal[PLAN_MODES] | None = None  # type: ignore[valid-type]
+    meals: list[Literal["breakfast", "lunch", "dinner"]] | None = None
+    allow_leftovers: bool | None = None
 
 
 def set_auth_cookies(response: Response, session_token: str, csrf_token: str) -> None:
@@ -412,14 +439,32 @@ async def delete_inventory(item_id: uuid.UUID, repo: Repo, session: Mutating) ->
     return {"ok": True}
 
 
+#: ценовая стратегия матчера, выводимая из режима планирования (TZ-M8 §6.4)
+MODE_PRICE_TIER = {"economy": "economy"}
+
+
 @router.post("/api/plans/generate", status_code=201)
 async def generate_plan(payload: PlanPayload, repo: Repo, session: Mutating) -> dict[str, Any]:
     if session["role"] == "viewer":
         raise HTTPException(status_code=403, detail="Режим просмотра не позволяет создавать планы")
-    if payload.price_tier not in {"economy", "balanced", "premium"}:
+    # Форма перекрывает профиль семьи только на этот план и обратно не пишется
+    # (TZ-M8 §3.4): «на этот раз без обедов» не должно менять настройки.
+    profile = await repo.plan_profile(session)
+    days = payload.days or int(profile["default_days"])
+    cuisines = payload.cuisines if payload.cuisines is not None else list(profile["cuisines"])
+    mode = payload.mode or str(profile["mode"])
+    price_tier = payload.price_tier or MODE_PRICE_TIER.get(mode, "balanced")
+    meals = payload.meals if payload.meals is not None else list(profile["meals"])
+    if price_tier not in {"economy", "balanced", "premium"}:
         raise HTTPException(status_code=422, detail="Неизвестная ценовая стратегия")
-    data = await repo.planner_data(session, payload.cuisines)
-    budget_kop = int(payload.budget_rub * 100) if payload.budget_rub is not None else None
+    data = await repo.planner_data(session, cuisines)
+    if payload.budget_rub is not None:
+        budget_kop = int(payload.budget_rub * 100)
+    elif profile.get("weekly_budget_kop"):
+        # Недельный бюджет семьи растягивается на горизонт плана.
+        budget_kop = int(int(profile["weekly_budget_kop"]) * days / 7)
+    else:
+        budget_kop = None
     try:
         # K7: скоринг 500 рецептов + CP-SAT занимают до десятков секунд —
         # в отдельном потоке, иначе весь event loop (и /health) замирает.
@@ -428,23 +473,24 @@ async def generate_plan(payload: PlanPayload, repo: Repo, session: Mutating) -> 
                 build_plan,
                 household_id=str(session["household_id"]),
                 starts_on=payload.starts_on,
-                days=payload.days,
-                cuisines=payload.cuisines,
-                price_tier=payload.price_tier,
+                days=days,
+                cuisines=cuisines,
+                price_tier=price_tier,
                 budget_kop=budget_kop,
+                meals=meals,
                 **data,
             )
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     plan_id = await repo.save_plan(
-        session, payload.starts_on, payload.days, budget_kop, payload.cuisines,
-        payload.price_tier, plan
+        session, payload.starts_on, days, budget_kop, cuisines, price_tier, plan
     )
     plan["id"] = plan_id
     plan["starts_on"] = payload.starts_on
-    plan["days"] = payload.days
+    plan["days"] = days
     plan["budget_kop"] = budget_kop
+    plan["mode"] = mode
     return plan
 
 
@@ -534,6 +580,22 @@ async def patch_person(
     if not updated:
         raise HTTPException(status_code=404, detail="Человек не найден")
     return updated
+
+
+@router.get("/api/settings/plan-profile")
+async def get_plan_profile(repo: Repo, session: Session) -> dict[str, Any]:
+    """Как эта семья планирует меню (TZ-M8 §3.4)."""
+    return await repo.plan_profile(session)
+
+
+@router.put("/api/settings/plan-profile")
+async def put_plan_profile(
+    payload: PlanProfilePayload, repo: Repo, session: Mutating
+) -> dict[str, Any]:
+    try:
+        return await repo.save_plan_profile(session, payload.model_dump())
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 @router.get("/api/settings/people/{person_id}/target")
