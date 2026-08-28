@@ -19,6 +19,7 @@ try:
 except ImportError as exc:  # pragma: no cover - окружение без fastapi/httpx
     raise unittest.SkipTest(f"веб-стек недоступен: {exc}") from exc
 
+from app.web.planner import DEFAULT_APPLIANCES  # noqa: E402
 from fakes import FakeRepository, expires_in, make_client  # noqa: E402
 
 
@@ -293,11 +294,18 @@ class InventoryValidationTests(unittest.TestCase):
 
 
 class PlanGenerationTests(unittest.TestCase):
-    """B2/A2 — новый пользователь без техники обязан получить меню."""
+    """Новый пользователь обязан получить меню сразу после регистрации.
 
-    def test_b2_a2_new_user_can_generate_plan_without_appliances(self) -> None:
+    Раньше это обеспечивалось отключением фильтра техники (A2), теперь —
+    базовым набором техники у новой семьи (TZ-M8 §3.3).
+    """
+
+    def test_new_user_gets_default_appliances_and_can_generate_plan(self) -> None:
         client, repository = make_client(self)
-        self.assertEqual(repository.appliances[next(iter(repository.households))], [])
+        self.assertEqual(
+            sorted(repository.appliances[next(iter(repository.households))]),
+            sorted(DEFAULT_APPLIANCES),
+        )
         response = client.post("/api/plans/generate", json={"days": 3, "starts_on": "2026-08-17"})
         self.assertEqual(response.status_code, 201, response.text)
         self.assertEqual(len(response.json()["meals"]), 9)

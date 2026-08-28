@@ -59,7 +59,7 @@ class K1MedianImputationTests(unittest.TestCase):
             meal_types=["dinner"], cuisines=[], rules=[], inventory=[],
             starts_on=date(2026, 8, 18), synonyms=Synonyms(), normal=_normal,
             tokens=_tokens,
-            cost_hint=lambda ing: (
+            cost_hint=lambda ing, needed, unit: (
                 10_000 if str(ing.get("normalized_name", "")).startswith("продукт") else None
             ),
             meal_score=lambda recipe, meal_type: 0,

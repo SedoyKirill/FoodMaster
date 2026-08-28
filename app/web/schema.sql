@@ -311,6 +311,39 @@ CREATE TABLE IF NOT EXISTS app_core.audit_log (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- TZ-M8 §3.3: фильтр по технике больше не отключается при пустом списке,
+-- поэтому семьям, которые завелись до этого правила, выдаётся базовый набор.
+-- Отметка в audit_log пишется ровно тем, кому набор реально выдали, и делает
+-- миграцию однократной: если технику потом сознательно убрали, повторный
+-- прогон schema.sql её не вернёт.
+WITH targets AS (
+    SELECT h.id
+    FROM app_core.households h
+    WHERE NOT EXISTS (
+            SELECT 1 FROM app_core.appliances a WHERE a.household_id = h.id
+        )
+      AND NOT EXISTS (
+            SELECT 1 FROM app_core.audit_log l
+            WHERE l.household_id = h.id
+              AND l.action = 'settings.appliances_defaulted'
+        )
+), granted AS (
+    INSERT INTO app_core.appliances (household_id, appliance_code)
+    SELECT t.id, code
+    FROM targets t
+    CROSS JOIN (VALUES ('stove'), ('oven'), ('microwave'), ('fridge_freezer')) AS defaults(code)
+    ON CONFLICT DO NOTHING
+    RETURNING household_id
+)
+INSERT INTO app_core.audit_log (household_id, channel, action, entity_type, entity_id, details)
+SELECT DISTINCT household_id, 'system', 'settings.appliances_defaulted', 'household',
+       household_id::text,
+       jsonb_build_object(
+           'appliances',
+           jsonb_build_array('stove', 'oven', 'microwave', 'fridge_freezer')
+       )
+FROM granted;
+
 CREATE INDEX IF NOT EXISTS ix_people_household ON app_core.people (household_id, position);
 CREATE INDEX IF NOT EXISTS ix_inventory_household_expiry ON app_core.inventory_lots (household_id, expires_on);
 CREATE INDEX IF NOT EXISTS ix_meal_plans_household_created ON app_core.meal_plans (household_id, created_at DESC);

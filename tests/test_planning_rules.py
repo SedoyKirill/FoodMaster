@@ -131,8 +131,13 @@ class SynonymRuleTests(unittest.TestCase):
         )
         self.assertEqual(soft, {"лук"})
 
-    def test_empty_appliances_do_not_filter(self) -> None:
-        """Тест 4: пустая техника пользователя не фильтрует кандидатов."""
+    def test_appliances_filter_even_when_household_list_is_empty(self) -> None:
+        """Тест 4 (TZ-M8 T1, P8): техника фильтрует всегда.
+
+        Раньше пустой список означал «фильтр выключен», и семье без гриля
+        планировались блюда для гриля. Теперь набор техники семье выдаётся
+        при регистрации, а пустой список честно ничего не разрешает.
+        """
         recipes = [
             make_recipe(1, "Каша", "breakfast", ["крупа"]),
             make_recipe(2, "Суп", "lunch", ["картофель"]),
@@ -140,7 +145,9 @@ class SynonymRuleTests(unittest.TestCase):
         ]
         for recipe in recipes:
             recipe["appliances"] = ["oven", "blender"]
-        plan = plan_for(recipes, [], appliances=())
+        with self.assertRaises(ValueError):
+            plan_for(recipes, [], appliances=())
+        plan = plan_for(recipes, [], appliances=("oven", "blender"))
         self.assertEqual(len(plan["meals"]), 3)
 
 

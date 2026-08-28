@@ -33,6 +33,9 @@ def normalize_sql(sql: str) -> str:
     return re.sub(r"\s+", " ", str(sql)).strip()
 
 
+from app.web.planner import DEFAULT_APPLIANCES
+
+
 class _AsyncNull:
     """Асинхронный контекст-менеджер, отдающий заранее заданное значение."""
 
@@ -172,7 +175,8 @@ class FakeRepository:
         household_id = str(uuid.uuid4())
         self.households[household_id] = {"id": household_id, "name": name, "role": role}
         self.people[household_id] = [make_person(name="Я")]
-        self.appliances[household_id] = []
+        # Как в AppRepository.register (TZ-M8 §3.3): семья заводится с техникой.
+        self.appliances[household_id] = list(DEFAULT_APPLIANCES)
         self.rules[household_id] = []
         self.inventory[household_id] = []
         self.users[user_id]["household_id"] = household_id

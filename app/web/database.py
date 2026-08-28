@@ -14,8 +14,8 @@ from typing import Any
 import asyncpg
 
 from .planner import (
-    ProductMatcher, ProductMatcherCache, _base_quantity, clean_dish_title,
-    warm_product_matcher,
+    DEFAULT_APPLIANCES, ProductMatcher, ProductMatcherCache, _base_quantity,
+    clean_dish_title, warm_product_matcher,
 )
 from .security import hash_password, new_token, token_hash, validate_login, verify_password
 
@@ -165,6 +165,13 @@ class AppRepository:
                     """,
                     person_id,
                     household_id,
+                )
+                # TZ-M8 §3.3: фильтр по технике работает всегда, поэтому семья
+                # заводится с набором, который есть почти у всех, — иначе
+                # первый же план оказался бы без единого блюда.
+                await connection.executemany(
+                    "INSERT INTO app_core.appliances (household_id, appliance_code) VALUES ($1, $2)",
+                    [(household_id, code) for code in DEFAULT_APPLIANCES],
                 )
                 await self._audit(connection, household_id, user_id, "user.registered", "user", user_id)
         except asyncpg.UniqueViolationError as exc:

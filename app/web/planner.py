@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import hashlib
 import json
 import math
 import re
@@ -20,12 +19,6 @@ MEAL_KEYWORDS = {
     "breakfast": ("завтрак", "каша", "омлет", "сырник", "блин", "панкейк", "олад", "вафл", "тост"),
     "lunch": ("суп", "салат", "борщ", "щи", "обед", "рагу"),
     "dinner": ("ужин", "мяс", "рыб", "куриц", "паста", "котлет", "запекан"),
-}
-RESTRICTION_EXPANSIONS = {
-    "глютен": ("пшениц", "мука", "хлеб", "макарон", "булгур", "манк", "овсян"),
-    "лактоза": ("молок", "сливк", "сметан", "кефир", "йогурт", "творог"),
-    "орехи": ("орех", "арахис", "миндаль", "фисташ", "фундук", "кешью"),
-    "рыба": ("рыб", "лосос", "семг", "треск", "тунец", "скумбр"),
 }
 UNIT_FACTORS = {
     "kg": ("g", Decimal("1000")),
@@ -323,20 +316,6 @@ def is_recipe_clean(recipe: dict[str, Any]) -> bool:
     )
 
 
-def _hard_terms(rules: list[dict[str, Any]]) -> tuple[str, ...]:
-    result: set[str] = set()
-    for rule in rules:
-        if not rule.get("is_hard", True):
-            continue
-        term = _normal(str(rule.get("term", "")))
-        if not term:
-            continue
-        result.add(term)
-        for expanded in RESTRICTION_EXPANSIONS.get(term, ()):
-            result.add(expanded)
-    return tuple(sorted(result))
-
-
 def _recipe_allowed(
     recipe: dict[str, Any], hard_terms: tuple[str, ...], appliances: set[str]
 ) -> bool:
@@ -356,13 +335,10 @@ def _recipe_allowed(
     ).casefold()
     if any(term in ingredient_text for term in hard_terms):
         return False
-    required = set(json_list(recipe.get("appliances")))
-    if not appliances:
-        # A2: техника не указана — не фильтруем по ней. Иначе новый пользователь,
-        # у которого при регистрации нет ни одной единицы техники, не может
-        # сгенерировать ни одного меню.
-        return True
-    return required.issubset(appliances)
+    # TZ-M8 T1 (дефект P8): фильтр по технике работает всегда. Пустой список
+    # больше не значит «разрешено всё» — семье при регистрации выдаётся
+    # DEFAULT_APPLIANCES, а рецепт без требований проходит при любом наборе.
+    return set(json_list(recipe.get("appliances"))).issubset(appliances)
 
 
 def _meal_score(recipe: dict[str, Any], meal_type: str) -> int:
@@ -389,11 +365,6 @@ def _meal_score(recipe: dict[str, Any], meal_type: str) -> int:
     if recipe.get("review_status") == "ready":
         score += 6
     return score
-
-
-def _stable_tiebreak(recipe_id: int, plan_key: str) -> int:
-    digest = hashlib.sha256(f"{plan_key}:{recipe_id}".encode()).hexdigest()
-    return int(digest[:8], 16)
 
 
 def _base_quantity(quantity: Decimal | None, unit: str | None) -> tuple[Decimal | None, str | None]:
@@ -748,61 +719,51 @@ def warm_product_matcher(
     return warmed
 
 
-def _recipe_cost_hint(
-    recipe: dict[str, Any], products: list[dict[str, Any]], price_tier: str,
-    product_matcher: ProductMatcher | None = None,
-) -> int:
-    result = 0
-    for ingredient in recipe["ingredients"]:
-        name = str(ingredient.get("normalized_name") or ingredient.get("ingredient_text") or "")
-        quantity = ingredient.get("quantity_max") or ingredient.get("quantity_min")
-        base_quantity, base_unit = _base_quantity(
-            Decimal(str(quantity)) if quantity is not None else None,
-            ingredient.get("unit_code"),
-        )
-        product = (
-            product_matcher.match(name, base_unit, price_tier, base_quantity)
-            if product_matcher is not None
-            else _product_match(name, base_unit, products, price_tier, base_quantity)
-        )
-        if not product:
-            continue
-        price = int(product.get("effective_price_kop") or 0)
-        pack_quantity, pack_unit = _base_quantity(
-            Decimal(str(product.get("pack_quantity") or 0)), product.get("pack_unit")
-        )
-        if base_quantity and pack_quantity and base_unit == pack_unit:
-            result += int(price * min(Decimal("1"), base_quantity / pack_quantity))
-        else:
-            result += price
-    return result
-
-
 DEFAULT_TARGET_KCAL = {"adult": 2000, "child": 1400}
+#: Техника, которая есть почти в каждом доме (TZ-M8 §3.3). Выдаётся семье при
+#: регистрации и миграцией — тем семьям, у которых техника не заполнена: фильтр
+#: по технике работает всегда, и пустой набор иначе отсекал бы почти всё.
+DEFAULT_APPLIANCES = ("stove", "oven", "microwave", "fridge_freezer")
 #: минимум подходящих по типу приёма кандидатов, после которого неподходящие
 #: (fit=0) в слот уже не допускаются
 _MIN_SLOT_CANDIDATES = 8
 
 
 def _ingredient_cost_hint(
-    ingredient: dict[str, Any], matcher: ProductMatcher, price_tier: str
+    ingredient: dict[str, Any],
+    matcher: ProductMatcher,
+    price_tier: str,
+    needed: Decimal | None = None,
+    unit: str | None = None,
 ) -> int | None:
-    """Стоимость одного ингредиента по каталогу; None — сопоставления нет."""
+    """Стоимость ингредиента по каталогу; None — сопоставления нет.
+
+    ``needed``/``unit`` — потребность в базовых единицах уже на семью и за
+    вычетом домашних запасов (TZ-M8 T1, дефект P6). Без них считается
+    книжное количество — так работает фоновый прогрев матчера.
+
+    Товар ищется по книжному количеству: ключ мемоизации не должен зависеть
+    от размера семьи, иначе прогрев (N1) перестаёт попадать в кэш.
+    """
     name = str(ingredient.get("normalized_name") or ingredient.get("ingredient_text") or "")
     quantity = ingredient.get("quantity_max") or ingredient.get("quantity_min")
-    base_qty, base_unit = _base_quantity(
+    book_qty, book_unit = _base_quantity(
         Decimal(str(quantity)) if quantity is not None else None,
         ingredient.get("unit_code"),
     )
-    product = matcher.match(name, base_unit, price_tier, base_qty)
+    product = matcher.match(name, book_unit, price_tier, book_qty)
     if not product:
         return None
     price = int(product.get("effective_price_kop") or 0)
     pack_base, pack_unit = _base_quantity(
         Decimal(str(product.get("pack_quantity") or 0)), product.get("pack_unit")
     )
-    if base_qty and pack_base and base_unit == pack_unit:
-        return int(price * min(Decimal("1"), base_qty / pack_base))
+    required = book_qty if needed is None else needed
+    required_unit = book_unit if needed is None else unit
+    if required is not None and pack_base and required_unit == pack_unit and pack_base > 0:
+        # Пропорция пачки, без потолка в одну штуку: три килограмма картофеля
+        # стоят трёх пачек, а не одной. Целые упаковки считает TZ-M8 T7.
+        return int(price * (required / pack_base))
     return price
 
 
@@ -1005,6 +966,16 @@ def build_plan(
     plan_key = f"{household_id}:{starts_on.isoformat()}:{','.join(sorted(cuisines))}"
     product_matcher = product_matcher or ProductMatcher(products)
 
+    def _scale_of(recipe: dict[str, Any]) -> Decimal | None:
+        """Во сколько раз книжный рецепт разворачивается на эту семью.
+
+        K2/P6: и калории, и стоимость кандидата солвер должен видеть в
+        масштабе семьи — иначе дневной коридор ±20 % вырождается в «выбирай
+        калорийнее», а цена блюда остаётся «как в книге на две порции».
+        """
+        scale, _unknown = scaling_mod.recipe_scale(recipe, desired_servings)
+        return scale
+
     scores = score_candidates(
         pool,
         meal_types=meal_types,
@@ -1015,27 +986,18 @@ def build_plan(
         synonyms=synonyms_dict,
         normal=_normal,
         tokens=_tokens,
-        cost_hint=lambda ingredient: _ingredient_cost_hint(
-            ingredient, product_matcher, price_tier
+        cost_hint=lambda ingredient, needed, unit: _ingredient_cost_hint(
+            ingredient, product_matcher, price_tier, needed, unit
         ),
         meal_score=_meal_score,
         kcal_hint=_make_kcal_hint(nutrition),
+        base_quantity=_base_quantity,
+        scale_of=_scale_of,
     )
     # Оценка семьи (звёзды): любимое двигается вверх, разочаровавшее — вниз.
     for recipe_id, rating in (ratings or {}).items():
         if recipe_id in scores:
             scores[recipe_id].rating_bonus = int(rating) - 3
-
-    # K2: дневная сумма в солвере сравнивается с целью всей семьи, поэтому и
-    # ккал кандидатов приводятся к масштабу семьи, а не «как в книге на 2
-    # порции». Без этого коридор ±20% вырождался в «выбирай калорийнее».
-    for recipe in pool:
-        recipe_id = int(recipe["id"])
-        score = scores[recipe_id]
-        if score.kcal:
-            kcal_scale, _unknown = scaling_mod.recipe_scale(recipe, desired_servings)
-            if kcal_scale is not None:
-                score.kcal = int(score.kcal * kcal_scale)
 
     cost_factor = optimizer_mod.PRICE_TIER_COST_FACTOR.get(price_tier, 10)
     cuisine_set = set(cuisines)
@@ -1372,6 +1334,14 @@ def slot_alternatives(
         return []
 
     product_matcher = product_matcher or ProductMatcher(products)
+    from .planning import scaling as scaling_mod
+
+    servings = scaling_mod.desired_servings(people)
+
+    def _scale_of(recipe: dict[str, Any]) -> Decimal | None:
+        scale, _unknown = scaling_mod.recipe_scale(recipe, servings)
+        return scale
+
     scores = score_candidates(
         pool,
         meal_types=[meal_type],
@@ -1382,11 +1352,13 @@ def slot_alternatives(
         synonyms=synonyms_dict,
         normal=_normal,
         tokens=_tokens,
-        cost_hint=lambda ingredient: _ingredient_cost_hint(
-            ingredient, product_matcher, price_tier
+        cost_hint=lambda ingredient, needed, unit: _ingredient_cost_hint(
+            ingredient, product_matcher, price_tier, needed, unit
         ),
         meal_score=_meal_score,
         kcal_hint=_make_kcal_hint(nutrition),
+        base_quantity=_base_quantity,
+        scale_of=_scale_of,
     )
     for rated_id, rating in (ratings or {}).items():
         if rated_id in scores:

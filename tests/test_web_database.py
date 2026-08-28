@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import secrets
 import sys
@@ -98,6 +99,26 @@ class AffectedRowsTests(unittest.TestCase):
         import asyncio
 
         return asyncio.run(coro)
+
+
+class RegistrationDefaultsTests(unittest.TestCase):
+    """TZ-M8 §3.3: новая семья заводится с базовым набором техники.
+
+    Фильтр по технике больше не отключается при пустом списке, поэтому без
+    этого набора первый же план у нового пользователя был бы пуст.
+    """
+
+    def test_register_grants_default_appliances(self) -> None:
+        pool = FakePool()
+        repository = repository_with_pool(pool)
+        with mock.patch.object(
+            db_module.AppRepository, "create_session",
+            new=mock.AsyncMock(return_value=("session", "csrf")),
+        ):
+            asyncio.run(repository.register("hozyain", "parol-parol", "Моя семья"))
+        _sql, args = pool.first_matching("INSERT INTO app_core.appliances")
+        codes = sorted(code for _household, code in args[0])
+        self.assertEqual(codes, sorted(db_module.DEFAULT_APPLIANCES))
 
 
 class LatestPlanTests(unittest.TestCase):

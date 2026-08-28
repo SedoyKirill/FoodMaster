@@ -122,6 +122,22 @@ def recipe_matches_terms(
     return count
 
 
+def canonical_overlap(lot_canonical: str, canonical: str) -> bool:
+    """Считается ли запас тем же продуктом, что ингредиент рецепта.
+
+    Живёт здесь, а не в ``shopping``: одно и то же сравнение нужно и списку
+    покупок, и оценке кандидата (иначе «сметана 20%» дома покрывает покупку,
+    но не удешевляет блюдо в глазах солвера).
+    """
+    return bool(
+        lot_canonical
+        and (
+            lot_canonical == canonical
+            or set(lot_canonical.split()) & set(canonical.split())
+        )
+    )
+
+
 def main_ingredient(recipe: dict[str, Any], synonyms: Synonyms, normal: Any) -> str | None:
     """Главный ингредиент — самый «тяжёлый» по базовому количеству (для
     разнообразия в соседние дни)."""
@@ -187,6 +203,45 @@ def _expiring_canonicals(
     return result
 
 
+def _stock_lots(
+    inventory: list[dict[str, Any]],
+    synonyms: Synonyms,
+    normal: Any,
+    base_quantity: Any,
+) -> list[tuple[str, str | None, Decimal]]:
+    """Запасы в базовых единицах: (каноническое имя, единица, количество)."""
+    lots: list[tuple[str, str | None, Decimal]] = []
+    for lot in inventory:
+        canonical = synonyms.canonical_name(str(lot.get("name") or ""), normal)
+        if not canonical:
+            continue
+        quantity = lot.get("quantity")
+        if quantity is None:
+            continue
+        amount, unit = base_quantity(Decimal(str(quantity)), lot.get("unit_code"))
+        if amount is None or amount <= 0:
+            continue
+        lots.append((canonical, unit, amount))
+    return lots
+
+
+def stock_available(
+    lots: list[tuple[str, str | None, Decimal]], canonical: str, unit: str | None
+) -> Decimal:
+    """Сколько такого продукта лежит дома в этой единице.
+
+    Кандидаты оцениваются независимо друг от друга, поэтому запас здесь не
+    «списывается»: он показывает каждому блюду, сколько ему не придётся
+    покупать. Реальное списание FEFO делает ``shopping.build_shopping`` уже
+    по выбранному плану.
+    """
+    total = Decimal("0")
+    for lot_canonical, lot_unit, amount in lots:
+        if lot_unit == unit and canonical_overlap(lot_canonical, canonical):
+            total += amount
+    return total
+
+
 def score_candidates(
     candidates: list[dict[str, Any]],
     *,
@@ -201,20 +256,23 @@ def score_candidates(
     cost_hint: Any,
     meal_score: Any,
     kcal_hint: Any = None,
+    base_quantity: Any = None,
+    scale_of: Any = None,
 ) -> dict[int, CandidateScore]:
     """Считает оценку каждого кандидата один раз (TZ-M5R §2.2).
 
     ``normal``/``tokens``/``cost_hint``/``meal_score`` инъектируются из
     ``planner.py``, чтобы не создавать циклический импорт.
+
+    TZ-M8 T1 (дефект P6): количества приводятся к порциям семьи через
+    ``scale_of(recipe)``, и стоимость, и калории считаются уже на семью, а
+    запасы вычитаются по количеству — раньше найденный дома продукт обнулял
+    цену ингредиента целиком, сколько бы его ни требовалось.
     """
     soft_terms = soft_rule_terms(rules, synonyms, normal)
     expiring = _expiring_canonicals(inventory, starts_on, synonyms, normal)
     cuisine_set = set(cuisines)
-    inventory_canonicals = {
-        synonyms.canonical_name(str(lot.get("name") or ""), normal)
-        for lot in inventory
-    }
-    inventory_canonicals.discard("")
+    stock = _stock_lots(inventory, synonyms, normal, base_quantity) if base_quantity else []
 
     scores: dict[int, CandidateScore] = {}
     raw_costs: dict[int, tuple[int, int]] = {}  # id -> (стоимость, непокрытых)
@@ -252,6 +310,12 @@ def score_candidates(
             heuristic = meal_score(recipe, meal_type)
             score.meal_bias[meal_type] = max(-0.5, min(0.5, heuristic / 40))
 
+        # Масштаб на семью: и цена, и калории считаются для тех порций, которые
+        # реально будут приготовлены. Рецепт без порций в книге не
+        # масштабируется (scale_unknown, ``scaling.recipe_scale``).
+        scale = scale_of(recipe) if scale_of is not None else None
+        if scale is None:
+            scale = Decimal("1")
         kcal_total = Decimal("0")
         kcal_known = False
         matched_costs: list[int] = []
@@ -265,19 +329,35 @@ def score_candidates(
                 score.expiry_bonus += 1
             quantity = ingredient.get("quantity_max") or ingredient.get("quantity_min")
             quantity_decimal = Decimal(str(quantity)) if quantity is not None else None
+            unit = ingredient.get("unit_code")
+            # «По вкусу» не масштабируется: соль на четверых не становится
+            # «по вкусу ×2» (то же правило в ``scaling.scaled_quantity``).
+            if quantity_decimal is not None and not ingredient.get("is_to_taste"):
+                needed = quantity_decimal * scale
+            else:
+                needed = quantity_decimal
             # K2/N2: словоформы («масла», «муки») приводятся к канону, иначе
             # substring-справочник ккал молча промахивается. kcal_hint —
             # инъекция из planner: сначала таблица ingredient_nutrition.
             if kcal_hint is not None:
-                kcal = kcal_hint(name, canonical, quantity_decimal, ingredient.get("unit_code"))
+                kcal = kcal_hint(name, canonical, needed, unit)
             else:
-                kcal = ingredient_kcal(canonical or name, quantity_decimal, ingredient.get("unit_code"))
+                kcal = ingredient_kcal(canonical or name, needed, unit)
             if kcal is not None:
                 kcal_total += kcal
                 kcal_known = True
-            if canonical and canonical in inventory_canonicals:
-                continue  # дома есть — для оценки бесплатно (TZ §2.2)
-            item_cost = cost_hint(ingredient)
+            needed_base, unit_base = (
+                base_quantity(needed, unit) if base_quantity is not None else (None, None)
+            )
+            remaining = needed_base
+            if needed_base is not None and stock and canonical:
+                # P6: дома есть 200 мл молока, а нужно 900 — покупаются 700.
+                have = stock_available(stock, canonical, unit_base)
+                if have > 0:
+                    remaining = max(Decimal("0"), needed_base - have)
+                    if remaining <= 0:
+                        continue  # хватает запасов — эта позиция не покупается
+            item_cost = cost_hint(ingredient, remaining, unit_base)
             if item_cost is None:
                 unmatched += 1
             else:

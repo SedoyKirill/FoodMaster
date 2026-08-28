@@ -14,7 +14,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Any
 
-from .candidates import Synonyms
+from .candidates import Synonyms, canonical_overlap
 
 #: то, что есть из-под крана и не покупается — в список покупок не попадает
 PANTRY_FREE = {"вода", "кипяток", "лед", "лёд"}
@@ -78,21 +78,11 @@ def prepare_inventory(
     return prepared
 
 
-def _canonical_overlap(lot_canonical: str, canonical: str) -> bool:
-    return bool(
-        lot_canonical
-        and (
-            lot_canonical == canonical
-            or set(lot_canonical.split()) & set(canonical.split())
-        )
-    )
-
-
 def _has_stock(lots: list[dict[str, Any]], canonical: str) -> bool:
     """Есть ли продукт дома хоть в каком-то количестве (единица не важна —
     «соль по вкусу» покрывается солью в любой фасовке)."""
     return any(
-        _canonical_overlap(lot["canonical"], canonical) and lot["base_quantity"] > 0
+        canonical_overlap(lot["canonical"], canonical) and lot["base_quantity"] > 0
         for lot in lots
     )
 
@@ -106,7 +96,7 @@ def _consume_fefo(
         (
             lot
             for lot in lots
-            if lot["base_unit"] == unit and _canonical_overlap(lot["canonical"], canonical)
+            if lot["base_unit"] == unit and canonical_overlap(lot["canonical"], canonical)
         ),
         key=lambda lot: (lot.get("expires_on") is None, lot.get("expires_on") or date.max),
     )

@@ -4,10 +4,12 @@ import sys
 from datetime import date
 from decimal import Decimal
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.web.planner import (
+    DEFAULT_APPLIANCES,
     ProductMatcher,
     ProductMatcherCache,
     _food_token_key,
@@ -491,8 +493,83 @@ class ProductMatcherCacheTests(unittest.TestCase):
         self.assertGreater(plan["estimated_cost_kop"], 0)
 
 
+class FamilyCostTests(unittest.TestCase):
+    """TZ-M8 T1 (дефект P6): цена кандидата — на семью и за вычетом запасов.
+
+    Раньше солвер сравнивал «книжную» стоимость рецепта, а найденный дома
+    продукт обнулял ингредиент целиком — двести миллилитров молока в
+    холодильнике делали бесплатным литр, который нужен на четверых.
+    """
+
+    PRODUCTS = [
+        {
+            "id": 1, "name": "Молоко питьевое 3,2%", "pack_quantity": Decimal("930"),
+            "pack_unit": "ml", "effective_price_kop": 9300,
+            "category_slugs": ["moloko-syr-yaytsa"],
+        },
+    ]
+
+    @staticmethod
+    def _recipe() -> dict:
+        item = recipe(1, "Молочный суп", "dinner", "Молоко")
+        item["source_servings_min"] = Decimal("2")
+        return item
+
+    def _cost(self, people: int, inventory: list[dict] | None = None) -> int:
+        captured: dict = {}
+
+        def spy_optimize(**kwargs):
+            captured["scores"] = kwargs["scores"]
+            return {}, "greedy"
+
+        with patch("app.web.planning.optimizer.optimize", side_effect=spy_optimize):
+            build_plan(
+                household_id="household",
+                starts_on=date(2026, 8, 28),
+                days=1,
+                cuisines=[],
+                people=[
+                    {"name": f"Едок {index}", "person_type": "adult",
+                     "portion_factor": Decimal("1")}
+                    for index in range(people)
+                ],
+                appliances=[],
+                rules=[],
+                inventory=inventory or [],
+                recipes=[self._recipe()],
+                products=self.PRODUCTS,
+            )
+        return captured["scores"][1].cost_kop
+
+    def test_cost_scales_with_family_size(self) -> None:
+        """Рецепт на две порции для четверых стоит вдвое дороже."""
+        self.assertEqual(self._cost(4), 2 * self._cost(2))
+
+    def test_stock_covers_only_what_it_holds(self) -> None:
+        """Дома 200 мл из нужных 400 — покупается остаток, а не ничего."""
+        stock = [{"name": "Молоко", "quantity": Decimal("200"), "unit_code": "ml",
+                  "expires_on": None}]
+        full = self._cost(4)
+        partial = self._cost(4, stock)
+        self.assertGreater(partial, 0)
+        self.assertLess(partial, full)
+        self.assertAlmostEqual(partial, full // 2, delta=2)
+
+    def test_full_stock_makes_ingredient_free(self) -> None:
+        """Литр дома закрывает потребность целиком — ингредиент не покупается."""
+        stock = [{"name": "Молоко", "quantity": Decimal("1"), "unit_code": "l",
+                  "expires_on": None}]
+        self.assertEqual(self._cost(4, stock), 0)
+
+
 class ApplianceFilterTests(unittest.TestCase):
-    """B2/A2 — новый пользователь без указанной техники не должен быть заблокирован."""
+    """Техника — фильтр всегда (TZ-M8 T1, дефект P8).
+
+    Прежнее поведение (A2: пустой список техники отключал фильтр целиком)
+    пропускало в меню рецепты для мультиварки и гриля тем, у кого их нет.
+    Новый пользователь не остаётся заблокированным: при регистрации семья
+    получает DEFAULT_APPLIANCES.
+    """
 
     @staticmethod
     def _recipes(appliances: list[str]) -> list[dict]:
@@ -519,15 +596,26 @@ class ApplianceFilterTests(unittest.TestCase):
             products=[],
         )
 
-    def test_b2_a2_empty_appliances_disables_appliance_filter(self) -> None:
-        plan = self._plan(self._recipes(["oven", "blender"]), [])
+    def test_empty_appliances_still_filter(self) -> None:
+        """Пустая техника — не «разрешено всё»: рецепт с требованиями отсеян."""
+        with self.assertRaises(ValueError):
+            self._plan(self._recipes(["oven", "blender"]), [])
+
+    def test_recipes_without_requirements_pass_with_empty_appliances(self) -> None:
+        """Рецепт, которому ничего не нужно, проходит при любой технике."""
+        plan = self._plan(self._recipes([]), [])
         self.assertEqual(len(plan["meals"]), 9)
 
-    def test_b2_a2_declared_appliances_still_filter(self) -> None:
+    def test_default_appliances_cover_usual_recipes(self) -> None:
+        """DEFAULT_APPLIANCES из регистрации закрывают плиту и духовку."""
+        plan = self._plan(self._recipes(["oven"]), sorted(DEFAULT_APPLIANCES))
+        self.assertEqual(len(plan["meals"]), 9)
+
+    def test_declared_appliances_still_filter(self) -> None:
         with self.assertRaises(ValueError):
             self._plan(self._recipes(["oven"]), ["stove"])
 
-    def test_b2_a2_declared_appliances_accept_matching_recipes(self) -> None:
+    def test_declared_appliances_accept_matching_recipes(self) -> None:
         plan = self._plan(self._recipes(["stove"]), ["stove", "oven"])
         self.assertEqual(len(plan["meals"]), 9)
 
