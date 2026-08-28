@@ -27,24 +27,25 @@ TODAY = date(2026, 8, 18)
 PLAN_ID = str(uuid.uuid4())
 
 
-class LinkChatTests(unittest.TestCase):
-    def test_valid_token_links_chat(self) -> None:
+class LinkAccountTests(unittest.TestCase):
+    def test_valid_token_links_account(self) -> None:
         pool = FakePool()
         pool.on("fetchrow", "UPDATE app_core.one_time_tokens", {"user_id": "u-1"})
         pool.on("fetchval", "SELECT login FROM app_core.users", "vanya")
         repository = BotRepository(pool)
-        login = asyncio.run(repository.link_chat(42, "raw-token"))
+        login = asyncio.run(repository.link_user(7, "raw-token"))
         self.assertEqual(login, "vanya")
-        # Старые связи чата и пользователя удаляются перед вставкой.
+        # Старые связи личности и пользователя удаляются перед вставкой.
         delete_sql, delete_args = pool.first_matching("DELETE FROM app_core.auth_identities")
-        self.assertIn("42", delete_args)
+        self.assertIn("7", delete_args)
         insert_sql, insert_args = pool.first_matching("INSERT INTO app_core.auth_identities")
-        self.assertEqual(insert_args, ("42", "u-1"))
+        # TZ-M7 §3.1: пишем Telegram from.id, а не chat_id
+        self.assertEqual(insert_args, ("7", "u-1"))
 
     def test_expired_token_returns_none(self) -> None:
         pool = FakePool()  # fetchrow по умолчанию отдаёт None
         repository = BotRepository(pool)
-        self.assertIsNone(asyncio.run(repository.link_chat(42, "bad")))
+        self.assertIsNone(asyncio.run(repository.link_user(7, "bad")))
         self.assertEqual(pool.count_matching("INSERT INTO app_core.auth_identities"), 0)
 
 
@@ -58,11 +59,11 @@ class _StubRepository:
         self.link_result = link_result
         self.link_calls: list[tuple[int, str]] = []
 
-    async def link_chat(self, chat_id, raw_token):
-        self.link_calls.append((chat_id, raw_token))
+    async def link_user(self, user_id, raw_token):
+        self.link_calls.append((user_id, raw_token))
         return self.link_result
 
-    async def context_for_chat(self, chat_id):
+    async def context_for_user(self, user_id):
         return self.context
 
     async def latest_plan_meals(self, household_id):

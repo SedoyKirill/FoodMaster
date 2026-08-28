@@ -77,6 +77,7 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql://ration:ration@db:5432/ration}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
+      WEB_PUBLIC_URL: ${WEB_PUBLIC_URL:-http://localhost:8080}
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
@@ -98,10 +99,16 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      # Схему БД накатывает web (AppRepository.connect): бот должен стартовать
+      # после него, иначе упрётся в отсутствующие объекты TZ-M7.
+      web:
+        condition: service_healthy
     environment:
       PYTHONUNBUFFERED: "1"
       DATABASE_URL: ${DATABASE_URL:-postgresql://ration:ration@db:5432/ration}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
+      WEB_PUBLIC_URL: ${WEB_PUBLIC_URL:-http://localhost:8080}
       LENTA_TIMEZONE: ${LENTA_TIMEZONE:-Europe/Moscow}
     command: ["python", "-m", "app.telegram.bot"]
 

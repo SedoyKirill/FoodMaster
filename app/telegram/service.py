@@ -1,7 +1,12 @@
-"""Логика Telegram-бота: привязка чата, выборки, клавиатуры и тексты ответов.
+"""Логика Telegram-бота: выборки, клавиатуры и тексты ответов.
 
 Никакого сетевого кода — всё принимает пул asyncpg / AppRepository (или стабы
 в тестах) и возвращает декларативные Reply/CallbackReply для транспорта.
+
+Модуль постепенно разъезжается по TZ-M7 §2: запросы уехали в ``repository.py``,
+разбор входящего — в ``router.py``. Здесь остаётся фасад совместимости и
+легаси-каскад ``handle_message``/``handle_callback``, который в T4–T9 заменят
+сцены; после этого модуль удаляется.
 """
 
 from __future__ import annotations
@@ -14,7 +19,8 @@ from decimal import Decimal
 from typing import Any
 
 from app.web.planner import clean_dish_title
-from app.web.security import token_hash
+
+from .repository import BotRepository, bot_session
 
 MEAL_LABELS = {"breakfast": "Завтрак", "lunch": "Обед", "dinner": "Ужин"}
 
@@ -28,7 +34,7 @@ HELP_TEXT = (
 )
 
 NOT_LINKED_TEXT = (
-    "Этот чат ещё не привязан к семье.\n\n"
+    "Ваш Telegram ещё не привязан к семье.\n\n"
     "Откройте веб-приложение «Рацион» → Настройки → «Привязать Telegram», "
     "получите команду вида «/start link_…» и отправьте её мне в течение 10 минут."
 )
@@ -92,103 +98,6 @@ def parse_callback(data: str) -> tuple[str, list[str]] | None:
 def callback_verb(data: str) -> str:
     parsed = parse_callback(data or "")
     return parsed[0] if parsed else ""
-
-
-# --- запросы бота к базе ------------------------------------------------------
-
-class BotRepository:
-    """Свои запросы бота: привязка чата и лёгкие выборки для сообщений."""
-
-    def __init__(self, pool: Any) -> None:
-        self.pool = pool
-
-    async def link_chat(self, chat_id: int, raw_token: str) -> str | None:
-        """Погасить одноразовый токен и привязать чат. Возвращает login или None."""
-        async with self.pool.acquire() as connection, connection.transaction():
-            row = await connection.fetchrow(
-                """
-                UPDATE app_core.one_time_tokens
-                SET used_at = CURRENT_TIMESTAMP
-                WHERE token_hash=$1 AND purpose='telegram_link'
-                  AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP
-                RETURNING user_id
-                """,
-                token_hash(raw_token),
-            )
-            if not row:
-                return None
-            user_id = row["user_id"]
-            await connection.execute(
-                """
-                DELETE FROM app_core.auth_identities
-                WHERE provider='telegram' AND (provider_user_id=$1 OR user_id=$2)
-                """,
-                str(chat_id), user_id,
-            )
-            await connection.execute(
-                """
-                INSERT INTO app_core.auth_identities (provider, provider_user_id, user_id)
-                VALUES ('telegram', $1, $2)
-                """,
-                str(chat_id), user_id,
-            )
-            login = await connection.fetchval(
-                "SELECT login FROM app_core.users WHERE id=$1", user_id
-            )
-            return str(login or "")
-
-    async def context_for_chat(self, chat_id: int) -> dict[str, Any] | None:
-        """Пользователь и семья по чату; None — чат не привязан."""
-        row = await self.pool.fetchrow(
-            """
-            SELECT u.id AS user_id, u.login, m.household_id, m.role
-            FROM app_core.auth_identities ai
-            JOIN app_core.users u ON u.id = ai.user_id AND u.status='active'
-            JOIN app_core.household_memberships m ON m.user_id = u.id
-            WHERE ai.provider='telegram' AND ai.provider_user_id=$1
-            ORDER BY m.created_at
-            LIMIT 1
-            """,
-            str(chat_id),
-        )
-        return dict(row) if row else None
-
-    async def latest_plan_meals(self, household_id: Any) -> list[dict[str, Any]]:
-        """Блюда последнего плана семьи (весь горизонт), с id для кнопок."""
-        rows = await self.pool.fetch(
-            """
-            SELECT pm.id, pm.plan_id, pm.meal_date, pm.meal_type, pm.position,
-                   pm.recipe_id, pm.estimated_kcal, pm.estimated_protein,
-                   pm.estimated_fat, pm.estimated_carb, r.title
-            FROM app_core.plan_meals pm
-            JOIN recipe_library.recipes r ON r.id = pm.recipe_id
-            WHERE pm.plan_id = (
-                SELECT id FROM app_core.meal_plans
-                WHERE household_id=$1 ORDER BY created_at DESC LIMIT 1
-            )
-            ORDER BY pm.meal_date, pm.position
-            """,
-            household_id,
-        )
-        return [dict(row) for row in rows]
-
-    async def shopping_items(self, household_id: Any) -> list[dict[str, Any]]:
-        """Список покупок последнего плана семьи, с id для кнопок."""
-        rows = await self.pool.fetch(
-            """
-            SELECT pi.id, pi.plan_id, pi.normalized_name, pi.buy_quantity,
-                   pi.unit_code, pi.pack_count, pi.estimated_cost_kop,
-                   pi.purchased_at, pi.to_taste
-            FROM app_core.plan_ingredients pi
-            WHERE pi.plan_id = (
-                SELECT id FROM app_core.meal_plans
-                WHERE household_id=$1 ORDER BY created_at DESC LIMIT 1
-            )
-            ORDER BY pi.normalized_name
-            """,
-            household_id,
-        )
-        return [dict(row) for row in rows]
 
 
 # --- форматирование (чистые функции) -----------------------------------------
@@ -450,29 +359,32 @@ def alternatives_keyboard(
 # --- обработка входящих сообщений --------------------------------------------
 
 async def handle_message(
-    repository: BotRepository, chat_id: int, text: str, today: date
+    repository: BotRepository, user_id: int, text: str, today: date
 ) -> Reply:
-    """Ответ на текстовое сообщение. Не бросает — ошибки ловит транспорт."""
+    """Ответ на текстовое сообщение. Не бросает — ошибки ловит транспорт.
+
+    ``user_id`` — Telegram ``from.id``: личность, а не чат (TZ-M7 §3.1).
+    """
     text = (text or "").strip()
     lowered = text.lower()
 
     if lowered.startswith("/start"):
         payload = text.split(maxsplit=1)[1].strip() if " " in text else ""
         if payload.startswith("link_"):
-            login = await repository.link_chat(chat_id, payload[len("link_"):])
+            login = await repository.link_user(user_id, payload[len("link_"):])
             if login is None:
                 return Reply(
                     "Ссылка привязки не подошла: токен просрочен или уже использован.\n"
                     "Получите новую команду в веб-приложении: Настройки → «Привязать Telegram»."
                 )
-            return Reply(f"Готово! Чат привязан к аккаунту «{login}».\n\n{HELP_TEXT}")
-        context = await repository.context_for_chat(chat_id)
+            return Reply(f"Готово! Аккаунт «{login}» привязан.\n\n{HELP_TEXT}")
+        context = await repository.context_for_user(user_id)
         return Reply(HELP_TEXT if context else f"Привет!\n\n{NOT_LINKED_TEXT}")
 
     if lowered in {"/help", "помощь", "help"}:
         return Reply(HELP_TEXT)
 
-    context = await repository.context_for_chat(chat_id)
+    context = await repository.context_for_user(user_id)
     if context is None:
         return Reply(NOT_LINKED_TEXT)
 
@@ -505,24 +417,23 @@ def _stale() -> CallbackReply:
 async def handle_callback(
     app_repository: Any,
     bot_repository: BotRepository,
-    chat_id: int,
+    user_id: int,
     data: str,
     today: date,
 ) -> CallbackReply:
-    """Единая точка обработки callback_query для всех глаголов."""
+    """Единая точка обработки callback_query для всех глаголов.
+
+    ``user_id`` — Telegram ``from.id`` нажавшего (TZ-M7 §3.1).
+    """
     parsed = parse_callback(data)
     if parsed is None:
         return CallbackReply(toast="Не понял кнопку.")
     verb, parts = parsed
 
-    context = await bot_repository.context_for_chat(chat_id)
+    context = await bot_repository.context_for_user(user_id)
     if context is None:
         return CallbackReply(toast=NOT_LINKED_TEXT, show_alert=True)
-    session = {
-        "household_id": context["household_id"],
-        "user_id": context["user_id"],
-        "role": context["role"],
-    }
+    session = bot_session(context)
 
     plan_id = unpack_uuid(parts[0]) if parts else None
     if plan_id is None:

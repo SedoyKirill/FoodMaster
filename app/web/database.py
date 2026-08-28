@@ -36,6 +36,11 @@ PRODUCT_MATCHER_TTL_SECONDS = 600.0
 # Postgres и мемоизацию матчера. Иначе первая после простоя сборка меню
 # платила за них десятками секунд прямо во время клика пользователя.
 PLANNER_WARM_INTERVAL_SECONDS = 300.0
+# TZ-M7 §3.5: откуда пришло действие. Белый список, чтобы опечатка в
+# псевдосессии бота не породила третий «канал» в отчётах.
+AUDIT_CHANNELS = frozenset({"web", "telegram"})
+# Ключ advisory-лока на применение DDL: веб и бот могут стартовать разом.
+SCHEMA_LOCK_KEY = 79_160_728
 
 
 class ConflictError(Exception):
@@ -106,19 +111,43 @@ def _coerce_person_field(field: str, value: Any) -> Any:
 
 
 class AppRepository:
-    def __init__(self, database_url: str | None = None) -> None:
+    #: Порядок важен: schema_telegram.sql ссылается на users и households.
+    SCHEMA_FILES: tuple[tuple[str, str], ...] = (
+        ("app.store.lenta", "schema.sql"),
+        ("app.recipes", "schema.sql"),
+        ("app.web", "schema.sql"),
+        ("app.web", "schema_telegram.sql"),  # TZ-M7 §7
+    )
+
+    def __init__(self, database_url: str | None = None, *, channel: str = "web") -> None:
         self.database_url = database_url or os.getenv(
             "DATABASE_URL", "postgresql://ration:ration@localhost:5432/ration"
         )
         self.pool: asyncpg.Pool | None = None
         self.product_cache = ProductMatcherCache(ttl_seconds=PRODUCT_MATCHER_TTL_SECONDS)
+        #: канал для audit_log: у веба 'web', у бота 'telegram' (TZ-M7 §3.5)
+        self.audit_channel = channel if channel in AUDIT_CHANNELS else "web"
 
     async def connect(self) -> None:
         self.pool = await asyncpg.create_pool(self.database_url, min_size=2, max_size=10)
         async with self.pool.acquire() as connection:
-            for package in ("app.store.lenta", "app.recipes", "app.web"):
-                schema = files(package).joinpath("schema.sql").read_text(encoding="utf-8")
+            await self.apply_schema(connection)
+
+    @classmethod
+    async def apply_schema(cls, connection: asyncpg.Connection) -> None:
+        """Идемпотентный DDL под advisory-локом.
+
+        Веб и бот стартуют одновременно (оба зависят только от db), а
+        одновременный «CREATE TABLE IF NOT EXISTS» из двух сессий даёт
+        unique_violation в pg_type — лок это исключает.
+        """
+        await connection.execute("SELECT pg_advisory_lock($1)", SCHEMA_LOCK_KEY)
+        try:
+            for package, filename in cls.SCHEMA_FILES:
+                schema = files(package).joinpath(filename).read_text(encoding="utf-8")
                 await connection.execute(schema)
+        finally:
+            await connection.execute("SELECT pg_advisory_unlock($1)", SCHEMA_LOCK_KEY)
 
     async def close(self) -> None:
         if self.pool:
@@ -1400,10 +1429,18 @@ class AppRepository:
         details: dict[str, Any] | None = None,
     ) -> None:
         async with self.db().acquire() as connection:
-            await self._audit(connection, session["household_id"], session["user_id"], action, entity_type, entity_id, details)
+            await self._audit(
+                connection, session["household_id"], session["user_id"], action,
+                entity_type, entity_id, details, channel=session.get("channel"),
+            )
 
-    @staticmethod
+    def _resolve_channel(self, channel: str | None) -> str:
+        """Канал записи: явный → из сессии → умолчание экземпляра репозитория."""
+        value = str(channel or self.audit_channel or "web")
+        return value if value in AUDIT_CHANNELS else "web"
+
     async def _audit(
+        self,
         connection: asyncpg.Connection,
         household_id: uuid.UUID | None,
         user_id: uuid.UUID | None,
@@ -1411,14 +1448,16 @@ class AppRepository:
         entity_type: str | None = None,
         entity_id: Any | None = None,
         details: dict[str, Any] | None = None,
+        *,
+        channel: str | None = None,
     ) -> None:
         await connection.execute(
             """
             INSERT INTO app_core.audit_log (
                 household_id, user_id, channel, action, entity_type, entity_id, details
-            ) VALUES ($1,$2,'web',$3,$4,$5,$6::jsonb)
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)
             """,
-            household_id, user_id, action, entity_type,
+            household_id, user_id, self._resolve_channel(channel), action, entity_type,
             str(entity_id) if entity_id is not None else None,
             json.dumps(details or {}, ensure_ascii=False),
         )

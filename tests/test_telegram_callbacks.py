@@ -133,9 +133,17 @@ class SplitTests(unittest.TestCase):
 class _StubBotRepository:
     def __init__(self, context):
         self.context = context
+        self.context_calls: list[int] = []
 
-    async def context_for_chat(self, chat_id):
+    async def context_for_user(self, user_id):
+        self.context_calls.append(user_id)
         return self.context
+
+    async def latest_plan_meals(self, household_id):
+        return []
+
+    async def shopping_items(self, household_id):
+        return []
 
 
 class _StubAppRepository:
@@ -345,11 +353,11 @@ class BotAppTests(unittest.TestCase):
             },
         }
 
-    def _text_update(self, text, update_id=1, chat_type="private", chat_id=42):
+    def _text_update(self, text, update_id=1, chat_type="private", chat_id=42, user_id=42):
         return {
             "update_id": update_id,
             "message": {
-                "message_id": 7, "text": text, "from": {"id": 42},
+                "message_id": 7, "text": text, "from": {"id": user_id},
                 "chat": {"id": chat_id, "type": chat_type},
             },
         }
@@ -437,7 +445,11 @@ class BotAppTests(unittest.TestCase):
     def test_callback_without_message_just_acks(self) -> None:
         app_repository = _StubAppRepository(plan=_plan_payload())
         bot, client = self._make_app(app_repository)
-        update = {"update_id": 9, "callback_query": {"id": "cb-9", "data": "c|xx"}}
+        # сообщение недоступно (слишком старое) — но кто нажал, Telegram знает
+        update = {
+            "update_id": 9,
+            "callback_query": {"id": "cb-9", "data": "c|xx", "from": {"id": 42}},
+        }
         offset = asyncio.run(bot.process_updates([update]))
         self.assertEqual(offset, 10)
         self.assertEqual(client.count("ack"), 1)
@@ -472,6 +484,37 @@ class BotAppTests(unittest.TestCase):
         bot, client = self._make_app(_StubAppRepository(plan=_plan_payload()))
         asyncio.run(bot.process_updates([self._text_update("/help", 1)]))
         self.assertEqual(client.count("send"), 1)
+
+    # --- личность и лимиты (TZ-M7 §3.1, §3.5) ---------------------------------
+
+    def test_identity_comes_from_sender_not_chat(self) -> None:
+        bot_repository = _StubBotRepository(CONTEXT)
+        bot = self._make_app(_StubAppRepository(plan=_plan_payload()))[0]
+        bot.bot_repository = bot_repository
+        asyncio.run(bot.process_updates([
+            self._text_update("🛒 Покупки", 1, chat_id=42, user_id=7)
+        ]))
+        # семью ищем по нажавшему, а не по чату — иначе в группе доступ у всех
+        self.assertEqual(bot_repository.context_calls, [7])
+
+    def test_flood_gets_one_refusal(self) -> None:
+        from fakes import StubClock
+
+        from app.telegram.bot import BotApp
+        from app.telegram.router import TOO_FAST_TEXT, Router
+
+        clock = StubClock()
+        client = _FakeClient()
+        bot = BotApp(
+            client, _StubBotRepository(CONTEXT), _StubAppRepository(plan=_plan_payload()),
+            router=Router(clock=clock),
+        )
+        updates = [self._text_update("/help", index) for index in range(1, 26)]
+        asyncio.run(bot.process_updates(updates))
+        answered = [call for call in client.calls if call[0] == "send"]
+        refusals = [call for call in answered if call[1] == TOO_FAST_TEXT]
+        self.assertEqual(len(answered) - len(refusals), 20)  # 20 сообщений в минуту
+        self.assertEqual(len(refusals), 1)  # об отказе говорим один раз
 
     # --- «⏳» не висит дольше срока (приёмка §9.9) -----------------------------
 

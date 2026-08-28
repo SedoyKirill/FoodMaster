@@ -18,9 +18,11 @@ import httpx
 from app.web.database import AppRepository
 from app.web.ratelimit import RateLimiter
 
+from .repository import BotRepository
+from .router import TOO_FAST_TEXT, Actor, Incoming, Router, parse_update
 from .service import (
-    BotRepository, CallbackReply, Reply, callback_verb, handle_callback,
-    handle_message, split_for_telegram,
+    CallbackReply, Reply, callback_verb, handle_callback, handle_message,
+    split_for_telegram,
 )
 
 log = logging.getLogger("ration.telegram")
@@ -270,12 +272,16 @@ class BotApp:
         client: TelegramClient,
         bot_repository: BotRepository,
         app_repository: AppRepository,
+        *,
+        router: Router | None = None,
     ) -> None:
         self.client = client
         self.bot_repository = bot_repository
         self.app_repository = app_repository
+        self.router = router or Router()
         self.tasks: set[asyncio.Task] = set()
-        self.in_flight: set[tuple[int, str]] = set()
+        #: тот же объект, что у роутера: тесты и логика смотрят в одно место
+        self.in_flight = self.router.in_flight
         #: тяжёлая операция не должна оставлять «⏳» навсегда (TZ-M7 §9.9);
         #: атрибут, а не константа, — тесты подставляют свой лимит
         self.heavy_timeout = HEAVY_TIMEOUT_SECONDS
@@ -285,14 +291,22 @@ class BotApp:
     def _today(self):
         return datetime.now(TIMEZONE).date()
 
-    async def handle_text(self, chat_id: int, text: str) -> None:
+    async def handle_text(self, actor: Actor, text: str) -> None:
+        if not self.router.allow_text(actor):
+            refusal = self.router.refusal_text(actor)
+            if refusal is not None:
+                await self.client.send_message(actor.chat_id, refusal, MENU)
+            return
         try:
-            reply = await handle_message(self.bot_repository, chat_id, text, self._today())
+            reply = await handle_message(
+                self.bot_repository, actor.user_id, text, self._today()
+            )
         except Exception:
-            log.exception("Ошибка обработки сообщения из чата %s", chat_id)
+            log.exception("Ошибка обработки сообщения от %s", actor.user_id)
             reply = Reply("Что-то сломалось на моей стороне. Попробуйте ещё раз чуть позже.")
         await self.client.send_message(
-            chat_id, reply.text, reply.keyboard if reply.keyboard is not None else MENU
+            actor.chat_id, reply.text,
+            reply.keyboard if reply.keyboard is not None else MENU,
         )
 
     async def refuse_group(self, chat_id: int) -> None:
@@ -300,46 +314,41 @@ class BotApp:
         if self.group_notices.hit(str(chat_id)) == 0:
             await self.client.send_message(chat_id, GROUP_REFUSAL, None)
 
-    async def handle_callback_query(self, callback: dict) -> None:
-        callback_id = str(callback.get("id"))
-        data = str(callback.get("data") or "")
-        message = callback.get("message") or {}
-        chat = message.get("chat") or {}
-        chat_id = chat.get("id")
-        message_id = message.get("message_id")
-        if chat_id is None:
+    async def handle_callback_query(self, incoming: Incoming) -> None:
+        actor, data = incoming.actor, incoming.data
+        callback_id = incoming.callback_id
+        if actor.chat_id == 0:
             # сообщение слишком старое — только погасить спиннер
             await self.client.answer_callback_query(callback_id)
             return
-        if str(chat.get("type") or "private") != "private":
-            # TZ-M7 §3.1 / А2: в группе не работаем даже по нажатой кнопке
-            await self.client.answer_callback_query(callback_id, GROUP_REFUSAL, True)
+        if not self.router.allow_callback(actor):
+            await self.client.answer_callback_query(callback_id, TOO_FAST_TEXT, True)
             return
-        chat_id = int(chat_id)
         verb = callback_verb(data)
 
         if verb in HEAVY_VERBS:
-            flight_key = (chat_id, data)
-            if flight_key in self.in_flight:
-                await self.client.answer_callback_query(callback_id, "Уже работаю, секунду…")
+            refusal = self.router.acquire_heavy(actor)
+            if refusal is not None:
+                await self.client.answer_callback_query(callback_id, refusal)
                 return
-            self.in_flight.add(flight_key)
             await self.client.answer_callback_query(
                 callback_id, "Подбираю варианты…" if verb == "x" else "Меняю блюдо…"
             )
-            await self.client.send_chat_action(chat_id)
+            await self.client.send_chat_action(actor.chat_id)
             # плейсхолдер: для замены редактируем сообщение с кнопками —
             # заодно исчезает клавиатура и даблклик невозможен физически
-            placeholder_id = message_id
+            placeholder_id = actor.message_id
             placeholder_text = "⏳ Ищу альтернативы…" if verb == "x" else "⏳ Применяю замену…"
             if verb == "x":
-                placeholder_id = await self.client.send_message(chat_id, placeholder_text, None)
-            elif message_id is not None:
-                await self.client.edit_message_text(chat_id, message_id, placeholder_text)
+                placeholder_id = await self.client.send_message(
+                    actor.chat_id, placeholder_text, None
+                )
+            elif actor.message_id is not None:
+                await self.client.edit_message_text(
+                    actor.chat_id, actor.message_id, placeholder_text
+                )
 
-            task = asyncio.create_task(
-                self._run_heavy(chat_id, placeholder_id, data, flight_key)
-            )
+            task = asyncio.create_task(self._run_heavy(actor, placeholder_id, data))
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
             return
@@ -347,24 +356,26 @@ class BotApp:
         # лёгкие глаголы — inline
         try:
             result = await handle_callback(
-                self.app_repository, self.bot_repository, chat_id, data, self._today()
+                self.app_repository, self.bot_repository, actor.user_id, data, self._today()
             )
         except Exception:
-            log.exception("Ошибка callback %r из чата %s", data, chat_id)
+            log.exception("Ошибка callback %r от %s", data, actor.user_id)
             result = CallbackReply(toast="Что-то сломалось. Попробуйте ещё раз.")
         await self.client.answer_callback_query(callback_id, result.toast, result.show_alert)
         try:
-            await apply_callback_reply(self.client, chat_id, message_id, result)
+            await apply_callback_reply(self.client, actor.chat_id, actor.message_id, result)
         except httpx.HTTPError:
-            log.exception("Не удалось доставить ответ на callback в чат %s", chat_id)
+            log.exception("Не удалось доставить ответ на callback в чат %s", actor.chat_id)
 
     async def _run_heavy(
-        self, chat_id: int, placeholder_id: int | None, data: str, flight_key: tuple
+        self, actor: Actor, placeholder_id: int | None, data: str
     ) -> None:
+        chat_id = actor.chat_id
         try:
             result = await asyncio.wait_for(
                 handle_callback(
-                    self.app_repository, self.bot_repository, chat_id, data, self._today()
+                    self.app_repository, self.bot_repository, actor.user_id, data,
+                    self._today(),
                 ),
                 self.heavy_timeout,
             )
@@ -374,7 +385,7 @@ class BotApp:
                     chat_id, placeholder_id, result.toast or "Готово."
                 )
         except TimeoutError:
-            log.warning("Тяжёлая операция %r из чата %s не уложилась в срок", data, chat_id)
+            log.warning("Тяжёлая операция %r от %s не уложилась в срок", data, actor.user_id)
             if placeholder_id is not None:
                 try:
                     await self.client.edit_message_text(
@@ -384,7 +395,7 @@ class BotApp:
                 except httpx.HTTPError:
                     pass
         except Exception:
-            log.exception("Ошибка фоновой задачи %r из чата %s", data, chat_id)
+            log.exception("Ошибка фоновой задачи %r от %s", data, actor.user_id)
             if placeholder_id is not None:
                 try:
                     await self.client.edit_message_text(
@@ -393,26 +404,57 @@ class BotApp:
                 except httpx.HTTPError:
                     pass
         finally:
-            self.in_flight.discard(flight_key)
+            self.router.release_heavy(actor)
 
     async def process_updates(self, updates: list[dict]) -> int | None:
         next_offset: int | None = None
         for update in updates:
             next_offset = int(update["update_id"]) + 1
-            if "callback_query" in update:
-                await self.handle_callback_query(update["callback_query"])
+            incoming = parse_update(update)
+            if incoming is None:
                 continue
-            message = update.get("message") or {}
-            chat = message.get("chat") or {}
-            chat_id = chat.get("id")
-            text = message.get("text")
-            if chat_id is None or not text:
+            if incoming.kind == "group":
+                # TZ-M7 §3.1 / А2: в группе не работаем
+                if incoming.callback_id:
+                    await self.client.answer_callback_query(
+                        incoming.callback_id, GROUP_REFUSAL, True
+                    )
+                else:
+                    await self.refuse_group(incoming.actor.chat_id)
                 continue
-            if str(chat.get("type") or "private") != "private":
-                await self.refuse_group(int(chat_id))
+            if incoming.kind == "callback":
+                await self.handle_callback_query(incoming)
                 continue
-            await self.handle_text(int(chat_id), str(text))
+            await self.handle_text(incoming.actor, incoming.text)
         return next_offset
+
+
+#: объекты TZ-M7, без которых бот не работает; DDL накатывает web
+SCHEMA_READY_SQL = """
+    SELECT to_regclass('app_core.telegram_dialog_state') IS NOT NULL
+       AND EXISTS (
+           SELECT 1 FROM information_schema.columns
+           WHERE table_schema='app_core' AND table_name='users'
+             AND column_name='active_household_id'
+       )
+"""
+
+
+async def wait_for_schema(pool, *, attempts: int = 60, delay: float = 5.0) -> None:
+    """Дождаться, пока web накатит DDL (AppRepository.connect).
+
+    Бот сознательно не мигрирует сам: одновременный идемпотентный DDL из двух
+    процессов — лишний источник гонок. Ждём и говорим об этом внятно.
+    """
+    for attempt in range(1, attempts + 1):
+        if await pool.fetchval(SCHEMA_READY_SQL):
+            return
+        log.warning(
+            "В схеме БД нет объектов TZ-M7 (попытка %s из %s). Перезапустите web.",
+            attempt, attempts,
+        )
+        await asyncio.sleep(delay)
+    raise SystemExit("Схема БД устарела: web не накатил DDL TZ-M7. Перезапустите web.")
 
 
 async def main() -> None:
@@ -425,10 +467,12 @@ async def main() -> None:
         raise SystemExit("DATABASE_URL не задан.")
 
     pool = await asyncpg.create_pool(database_url, min_size=1, max_size=5)
+    await wait_for_schema(pool)
     bot_repository = BotRepository(pool)
     # Разделяем пул с AppRepository: схему БД накатывает веб-приложение,
     # боту второй пул и повторный прогон schema.sql не нужны.
-    app_repository = AppRepository(database_url)
+    # channel='telegram' — чтобы audit_log не помечал действия бота как 'web'.
+    app_repository = AppRepository(database_url, channel="telegram")
     app_repository.pool = pool
 
     offset: int | None = None
