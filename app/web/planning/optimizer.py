@@ -46,6 +46,12 @@ HARD_LIMITED_BASES = ("meat", "poultry", "fish")
 CUISINE_STREAK = 3
 #: доля слотов под непробованные блюда по уровню новизны (§4.5)
 NOVELTY_SHARES = {"low": 0.1, "medium": 0.3, "high": 0.6}
+#: Сколько первых дней плана держатся свободными от того, что семья ела
+#: недавно (§9.1.2). Мягкого штрафа за ротацию для этого не хватает: дешёвый
+#: завтрак перевешивает его и возвращается в меню на следующий же день.
+ROTATION_FRESH_DAYS = 3
+#: и насколько назад смотрим, решая, что блюдо «недавнее»
+ROTATION_WINDOW_DAYS = 14
 #: Что переживает ночь в холодильнике и не портится от разогрева (§6.2).
 #: Коды — из словаря разметки проекта (``scripts/load_cuisines.py``): всё, чего
 #: там нет, никогда не совпадёт и молча выключит остатки. Салат, бутерброд и
@@ -380,6 +386,7 @@ def _solve_cpsat(
     cuisine_mode: str,
     leftover_cost_share: float,
     packs: PackModel | None,
+    recently_eaten: set[int],
 ) -> Solution | None:
     try:
         from ortools.sat.python import cp_model
@@ -557,6 +564,21 @@ def _solve_cpsat(
                 repeat = model.NewBoolVar(f"cuisine_rep_{abs(hash(cuisine)) % 10**8}_{day}")
                 model.Add(sum(streak) - (CUISINE_STREAK - 1) <= repeat)
                 objective.append(weights.variety * repeat)
+
+    # Ротация первых дней (§9.1.2): то, что ели в последние две недели, не
+    # возвращается сразу. Любимое (аффинити ≥ 0.8) — исключение, оно и должно
+    # приходить раз в неделю. Правило ослабляется послотно: если незанятых
+    # историей кандидатов в слоте не осталось, пустой слот хуже повтора.
+    for day in range(min(ROTATION_FRESH_DAYS, days)):
+        for meal in meal_types:
+            slot_candidates = candidates_by_slot.get((day, meal), [])
+            banned = [
+                recipe_id for recipe_id in slot_candidates if recipe_id in recently_eaten
+            ]
+            if not banned or len(banned) == len(slot_candidates):
+                continue
+            for recipe_id in banned:
+                model.Add(x[recipe_id, day, meal] == 0)
 
     # Новизна (§4.5): и семье с историей нельзя застревать на пятнадцати
     # блюдах, и новичку нельзя выдавать сплошь непробованное.
@@ -774,6 +796,7 @@ def optimize(
     cuisine_mode: str = "only",
     leftover_cost_share: float = 1.0,
     packs: PackModel | None = None,
+    recently_eaten: set[int] | None = None,
 ) -> Solution:
     """Назначение блюд по слотам: CP-SAT, при недоступности/неудаче — жадный."""
     profile = weights or weights_for(mode)
@@ -798,6 +821,7 @@ def optimize(
         novelty=novelty,
         cuisine_mode=cuisine_mode,
         leftover_cost_share=leftover_cost_share,
+        recently_eaten=recently_eaten or set(),
     )
     solved = _solve_cpsat(**common, packs=packs)
     if solved is not None:

@@ -99,6 +99,25 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(self.history.recent_main_ingredients["картофель"], 1)
         self.assertNotIn("свёкла", self.history.recent_main_ingredients)
 
+    def test_dates_arriving_as_iso_strings_still_count(self) -> None:
+        """Репозиторий отдаёт даты строками — история их принимает.
+
+        До этого ротация молча не работала на живой базе: ``row_dict``
+        приводит даты к ISO, а история ждала ``date`` и отбрасывала всё.
+        """
+        history = build_history(
+            [{"recipe_id": 7, "meal_date": "2026-08-18", "dish_type": "soup"}],
+            date(2026, 8, 20),
+        )
+        self.assertEqual(history.days_since(7), 2)
+        self.assertGreater(history.recency_penalty(7), 0.0)
+
+    def test_broken_date_string_is_ignored_not_fatal(self) -> None:
+        history = build_history(
+            [{"recipe_id": 7, "meal_date": "позавчера"}], date(2026, 8, 20)
+        )
+        self.assertIsNone(history.days_since(7))
+
     def test_empty_history_is_harmless(self) -> None:
         empty = PlanHistory.empty()
         self.assertIsNone(empty.days_since(1))

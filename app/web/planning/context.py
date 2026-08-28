@@ -166,14 +166,31 @@ class PlanHistory:
         return max(0.0, (HISTORY_WINDOW_DAYS - days) / HISTORY_WINDOW_DAYS)
 
 
+def _as_date(value: Any) -> date | None:
+    """Дата из строки плана.
+
+    Репозиторий отдаёт строки через ``row_dict``, а тот приводит даты к ISO —
+    иначе они не сериализуются в JSON. История принимала только ``date`` и
+    молча отбрасывала всё: ротация не работала ни разу с самого T4.
+    """
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
+    return None
+
+
 def build_history(rows: list[dict[str, Any]], starts_on: date) -> PlanHistory:
     """История из строк ``plan_meals`` за окно до начала плана."""
     last_seen: dict[int, int] = {}
     dish_types: Counter = Counter()
     mains: Counter = Counter()
     for row in rows:
-        meal_date = row.get("meal_date")
-        if not isinstance(meal_date, date):
+        meal_date = _as_date(row.get("meal_date"))
+        if meal_date is None:
             continue
         days = (starts_on - meal_date).days
         if days < 0 or days > HISTORY_WINDOW_DAYS:

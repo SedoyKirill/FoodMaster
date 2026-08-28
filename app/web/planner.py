@@ -1294,6 +1294,13 @@ def build_plan(
         cuisine_mode=cuisine_mode,
         leftover_cost_share=_leftover_cost_share(servings_by_meal),
         packs=pack_model,
+        recently_eaten={
+            recipe_id
+            for recipe_id in candidate_ids
+            if (plan_history.days_since(recipe_id) or 999)
+            <= optimizer_mod.ROTATION_WINDOW_DAYS
+            and scores[recipe_id].affinity < context_mod.FAVOURITE_AFFINITY
+        },
     )
     assignment = solution.assignment
     solver_status = solution.status
