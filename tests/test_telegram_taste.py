@@ -244,6 +244,39 @@ class CardsTests(unittest.TestCase):
         self.assertEqual(repo.recorded, [])
         self.assertIsNone(result.edit)
 
+    def test_deck_alternates_between_cuisine_and_dish_pairs(self):
+        """Живая проверка: модель отдаёт по две карточки на пару подряд, и первые
+        четыре вопроса оказывались про одно и то же."""
+        repo = _TasteRepo(cards=[
+            card(1, "Помидоры на гриле", "mediterranean", "side"),
+            card(2, "Запечённый рис", "mediterranean", "side"),
+            card(3, "Паста алла Норма", "italian", "pasta"),
+            card(4, "Качо е пепе", "italian", "pasta"),
+        ])
+        dialogs = _Dialogs()
+        seen = []
+        passed = []
+        for _ in range(4):
+            reply = run_async(taste.cards_reply(repo, dialogs, OWNER, USER_ID, passed))
+            recipe_id = int(datas(reply)[0].split(":")[1])
+            seen.append(recipe_id)
+            passed.append(recipe_id)
+        self.assertEqual(seen, [1, 3, 2, 4])
+
+    def test_answered_card_does_not_pull_its_pair_forward(self):
+        """Порядок помнится в состоянии: иначе после ответа соседка по паре
+        снова оказывается первой и перемешивание ничего не даёт."""
+        repo, dialogs = _TasteRepo(cards=[
+            card(1, "Помидоры на гриле", "mediterranean", "side"),
+            card(2, "Запечённый рис", "mediterranean", "side"),
+            card(3, "Паста алла Норма", "italian", "pasta"),
+            card(4, "Качо е пепе", "italian", "pasta"),
+        ]), _Dialogs()
+        run_async(taste.begin(repo, dialogs, OWNER, USER_ID))
+        self.assertEqual(dialogs.state.data["deck"], [1, 3, 2, 4])
+        result = run_async(taste.answer(repo, dialogs, OWNER, USER_ID, ["1", "like"]))
+        self.assertIn("Паста алла Норма", result.edit.text)
+
     def test_card_fits_one_telegram_message(self):
         long_title = "Х" * 500
         repo = _TasteRepo(cards=[card(101, long_title)])
@@ -262,8 +295,8 @@ class SummaryTests(unittest.TestCase):
             "disliked_ingredients": [{"key": "рыба", "score": -0.5, "events_count": 3}],
         })
         reply = run_async(taste.summary_reply(repo, OWNER))
-        self.assertIn("Суп", reply.text)
-        self.assertIn("Грузинская", reply.text)
+        # середина фразы «любите: суп, грузинская» — подписи со строчной
+        self.assertIn("👍 Любите: суп · грузинская", reply.text)
         self.assertIn("рыба", reply.text)
         self.assertIn("Харчо", reply.text)
         self.assertIn("Треска", reply.text)
@@ -283,8 +316,8 @@ class SummaryTests(unittest.TestCase):
             "disliked_ingredients": [],
         })
         reply = run_async(taste.summary_reply(repo, OWNER))
-        self.assertIn("Суп, Салат, Стейк", reply.text)
-        self.assertNotIn("Сэндвич", reply.text)
+        self.assertIn("суп, салат, стейк", reply.text)
+        self.assertNotIn("сэндвич", reply.text)
 
     def test_summary_with_events_but_no_signal_says_so(self):
         repo = _TasteRepo(events=2, summary={

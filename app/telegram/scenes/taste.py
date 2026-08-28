@@ -102,33 +102,59 @@ def _card_keyboard(recipe_id: int) -> dict[str, Any] | None:
     ])
 
 
+def _deal(cards: list[dict[str, Any]]) -> list[int]:
+    """Порядок колоды: по одной карточке из каждой пары «кухня + тип», по кругу.
+
+    Модель отдаёт карточки пачками по две на пару, и в вебе это незаметно —
+    там сетка, видно все сразу. В чате они идут строго одна за другой, поэтому
+    без перемешивания человек, ответивший на первые четыре, рассказал бы только
+    про средиземноморские гарниры — ровно то, чего онбординг избегает.
+    """
+    groups: dict[tuple[Any, Any], list[int]] = {}
+    for card in cards:
+        key = (card.get("cuisine_code"), card.get("dish_type"))
+        groups.setdefault(key, []).append(int(card["recipe_id"]))
+    depth = max((len(items) for items in groups.values()), default=0)
+    return [items[index] for index in range(depth)
+            for items in groups.values() if index < len(items)]
+
+
 async def cards_reply(
     app_repository: Any, dialogs: Any, session: dict[str, Any], user_id: int,
-    passed: list[int] | None = None,
+    passed: list[int] | None = None, deck: list[int] | None = None,
 ) -> Reply:
-    """Следующая неотвеченная карточка. Пропущенные помним в состоянии диалога.
+    """Следующая неотвеченная карточка.
 
-    Колода перечитывается на каждый ответ: 👍/👎 уходят событием, и рецепт сам
-    выпадает из выдачи. Так экран не расходится с тем, что человек мог ответить
-    в браузере, и переживает перезапуск бота.
+    Что живёт в состоянии диалога и почему: ``passed`` — пропущенные (событием
+    ⏭ не считается, иначе карточка возвращалась бы вечно), ``deck`` — выбранный
+    порядок. Порядок приходится помнить: пересчитать его на каждом шаге нельзя,
+    после ухода карточки её соседка по паре снова оказывалась бы первой, и
+    перемешивание не давало бы ничего.
+
+    Сами карточки перечитываются каждый раз: 👍/👎 уходят событием, и рецепт
+    выпадает из выдачи сам. Так экран не расходится с тем, что человек мог
+    ответить в браузере, и переживает перезапуск бота.
     """
     if not available(app_repository):
         return unavailable_reply()
     passed = list(passed or [])
     payload = await app_repository.taste_onboarding(session)
-    cards = [
-        card for card in (payload.get("cards") or [])
-        if int(card["recipe_id"]) not in set(passed)
-    ]
-    await dialogs.save(user_id, DialogState(SCENE, "card", {"passed": passed}))
-    if not cards:
+    cards = {int(card["recipe_id"]): card for card in (payload.get("cards") or [])}
+    order = [recipe_id for recipe_id in (deck or []) if recipe_id in cards]
+    if not order:
+        order = _deal(list(cards.values()))
+    await dialogs.save(
+        user_id, DialogState(SCENE, "card", {"passed": passed, "deck": order})
+    )
+    remaining = [recipe_id for recipe_id in order if recipe_id not in set(passed)]
+    if not remaining:
         return Reply(EMPTY_DECK_TEXT, build_keyboard([
             [{"text": "📊 Сводка", "callback_data": encode_callback("n", "ts", "sum")}],
             _back_row(),
         ]))
-    card = cards[0]
+    card = cards[remaining[0]]
     return Reply(
-        _card_text(card, len(cards), int(payload.get("events_count") or 0),
+        _card_text(card, len(remaining), int(payload.get("events_count") or 0),
                    bool(payload.get("needed"))),
         _card_keyboard(int(card["recipe_id"])),
     )
@@ -137,7 +163,7 @@ async def cards_reply(
 async def begin(app_repository: Any, dialogs: Any, session: dict[str, Any],
                 user_id: int) -> Reply:
     """Команда /taste и пункт «😋 Вкусы»: колода с чистого листа."""
-    return await cards_reply(app_repository, dialogs, session, user_id, [])
+    return await cards_reply(app_repository, dialogs, session, user_id, [], [])
 
 
 async def answer(app_repository: Any, dialogs: Any, session: dict[str, Any],
@@ -148,8 +174,9 @@ async def answer(app_repository: Any, dialogs: Any, session: dict[str, Any],
     if len(parts) < 2 or not parts[0].isdigit():
         return CallbackReply(toast="Не понял кнопку.")
     recipe_id, choice = int(parts[0]), parts[1]
-    state = await dialogs.load(user_id)
-    passed = [int(value) for value in ((state.data if state else {}) or {}).get("passed", [])]
+    data = ((await dialogs.load(user_id)) or DialogState(SCENE, "card", {})).data or {}
+    passed = [int(value) for value in data.get("passed", [])]
+    deck = [int(value) for value in data.get("deck", [])]
 
     if choice == "pass":
         if recipe_id not in passed:
@@ -167,17 +194,19 @@ async def answer(app_repository: Any, dialogs: Any, session: dict[str, Any],
 
     return CallbackReply(
         toast=toast,
-        edit=await cards_reply(app_repository, dialogs, session, user_id, passed),
+        edit=await cards_reply(app_repository, dialogs, session, user_id, passed, deck),
     )
 
 
 # --- сводка --------------------------------------------------------------------
 
 def _names(items: list[dict[str, Any]], label: Any = None) -> str:
+    """Имена через запятую. Подписи справочника — со строчной: это середина фразы
+    («любите: суп, грузинская»), а не заголовок списка, как в вебе."""
     names = []
     for item in items[:SUMMARY_LIMIT]:
         key = item.get("key")
-        names.append(label(key) if label else str(key))
+        names.append(label(key).lower() if label else str(key))
     return ", ".join(name for name in names if name)
 
 
@@ -249,9 +278,10 @@ async def handle_step(context: SceneContext) -> Reply:
     """Свободного текста в сцене нет — возвращаем человека к кнопкам."""
     if context.session is None:
         return unavailable_reply()
-    passed = [int(value) for value in (context.state.data or {}).get("passed", [])]
+    data = context.state.data or {}
     reply = await cards_reply(
-        context.app_repository, context.dialogs, context.session,
-        context.actor.user_id, passed,
+        context.app_repository, context.dialogs, context.session, context.actor.user_id,
+        [int(value) for value in data.get("passed", [])],
+        [int(value) for value in data.get("deck", [])],
     )
     return Reply("Выберите кнопкой под карточкой.\n\n" + reply.text, reply.keyboard)
