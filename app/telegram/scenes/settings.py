@@ -15,6 +15,7 @@ from typing import Any
 
 from app.web.categories import APPLIANCES, RULE_TYPES
 
+from .. import notifications
 from ..callbacks import encode_callback, pack_uuid, unpack_uuid
 from ..fsm import CANCEL_BUTTON, DialogState
 from ..render import CallbackReply, Reply, build_keyboard, button_text
@@ -46,7 +47,8 @@ def menu_reply(session: dict[str, Any]) -> Reply:
          {"text": "🍳 Техника", "callback_data": encode_callback("n", "st", "appl")}],
         [{"text": "🚫 Ограничения", "callback_data": encode_callback("n", "st", "rules")},
          {"text": "🔗 Телеграм", "callback_data": encode_callback("n", "st", "tg")}],
-        [{"text": "📊 Данные", "callback_data": encode_callback("n", "st", "data")}],
+        [{"text": "🔔 Уведомления", "callback_data": encode_callback("n", "st", "notif")},
+         {"text": "📊 Данные", "callback_data": encode_callback("n", "st", "data")}],
     ]
     text = MENU_TEXT.format(
         household=session.get("household_name") or "—",
@@ -175,6 +177,33 @@ def telegram_reply(session: dict[str, Any], has_password: bool) -> Reply:
         _back_row(),
     ]
     return Reply("\n".join(lines), build_keyboard(rows))
+
+
+async def notifications_reply(bot_repository: Any, telegram_id: int) -> Reply:
+    """Тумблеры напоминаний (§6). Строки в базе появляются при первом нажатии,
+    до этого действуют умолчания из кода."""
+    stored = await bot_repository.notification_settings(telegram_id)
+    rows = []
+    lines = ["🔔 Напоминания — пишу первым, когда есть повод."]
+    for code, kind in notifications.KINDS.items():
+        enabled, hour, _last = notifications.setting_for(code, stored)
+        lines.append(f"• {kind.title} — {'в ' + str(hour) + ':00' if enabled else 'выключено'}")
+        rows.append([{
+            "text": button_text(f"{'✅' if enabled else '☐'} {kind.title}"),
+            "callback_data": encode_callback("o", "nt", code),
+        }])
+    rows.append(_back_row())
+    return Reply("\n".join(lines), build_keyboard(rows))
+
+
+async def toggle_notification(bot_repository: Any, telegram_id: int,
+                              code: str) -> CallbackReply:
+    if code not in notifications.KINDS:
+        return CallbackReply(toast="Не понял кнопку.")
+    stored = await bot_repository.notification_settings(telegram_id)
+    enabled, hour, _last = notifications.setting_for(code, stored)
+    await bot_repository.set_notification(telegram_id, code, not enabled, hour)
+    return CallbackReply(edit=await notifications_reply(bot_repository, telegram_id))
 
 
 async def data_reply(app_repository: Any, session: dict[str, Any]) -> Reply:

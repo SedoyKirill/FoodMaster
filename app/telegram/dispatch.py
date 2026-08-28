@@ -218,12 +218,20 @@ async def handle_callback(
                 edit=await plan_scene.history_reply(app_repository, session, page)
             )
         # --- библиотека рецептов (§5.7) ---------------------------------------
+        if verb == "n" and parts[:2] == ["st", "notif"]:
+            return CallbackReply(
+                edit=await settings_scene.notifications_reply(bot_repository, user_id)
+            )
         if verb == "n" and parts[:1] == ["st"]:
             result = await settings_scene.handle_navigation(
                 app_repository, dialogs, session, user_id, parts
             )
             if result is not None:
                 return result
+        if verb == "o" and parts[:1] == ["nt"]:
+            return await settings_scene.toggle_notification(
+                bot_repository, user_id, parts[1] if len(parts) > 1 else ""
+            )
         if verb == "y" and parts[:1] == ["sp"]:
             return await settings_scene.delete_person(
                 app_repository, session, parts[1] if len(parts) > 1 else ""

@@ -1762,9 +1762,15 @@ class AppRepository:
                 session["user_id"],
             )
             if row is not None:
+                telegram_id = int(row["provider_user_id"])
                 await connection.execute(
                     "DELETE FROM app_core.telegram_dialog_state WHERE user_id=$1",
-                    int(row["provider_user_id"]),
+                    telegram_id,
+                )
+                # §6: после отвязки напоминания не шлём, и настройки хранить не за чем
+                await connection.execute(
+                    "DELETE FROM app_core.telegram_notifications WHERE user_id=$1",
+                    telegram_id,
                 )
                 await self._audit(
                     connection, session["household_id"], session["user_id"],
