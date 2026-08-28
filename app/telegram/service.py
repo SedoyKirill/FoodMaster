@@ -24,7 +24,8 @@ from .render import (
     BUTTON_TEXT_LIMIT, CallbackReply, HELP_TEXT, MEAL_LABELS, NOT_LINKED_TEXT,
     Reply, STALE_TEXT, TELEGRAM_LIMIT, alternatives_keyboard, format_day,
     format_recipe, format_shopping, format_shopping_header, format_week,
-    shopping_keyboard, shopping_page, split_for_telegram, today_keyboard,
+    page_of_item, shopping_keyboard, shopping_page, split_for_telegram,
+    today_keyboard,
 )
 from .repository import BotRepository, bot_session
 
@@ -150,7 +151,7 @@ async def handle_callback(
                 return _stale()
             target["purchased_at"] = result.get("purchased_at")
             action = "Куплено" if make_purchased else "Снята отметка"
-            page = _page_of_item(items, item_id)
+            page = page_of_item(items, item_id)
             return CallbackReply(
                 toast=f"{action}: {target.get('normalized_name')}",
                 edit=Reply(
@@ -263,15 +264,3 @@ async def _turn_page(app_repository: Any, session: dict, parts: list[str]) -> Ca
             shopping_keyboard(plan_id, items, page),
         )
     )
-
-
-def _page_of_item(items: list[dict[str, Any]], item_id: Any) -> int:
-    """На какой странице чек-листа лежит позиция — чтобы после отметки
-    пользователь остался там же, где нажимал."""
-    from .render import BUTTONS_PER_PAGE, _to_buy
-
-    buyable = [item for item in _to_buy(items) if item.get("id")]
-    for index, item in enumerate(buyable):
-        if str(item.get("id")) == str(item_id):
-            return index // BUTTONS_PER_PAGE + 1
-    return 1

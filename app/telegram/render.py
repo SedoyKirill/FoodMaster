@@ -392,6 +392,19 @@ def shopping_page(items: list[dict[str, Any]], page: int = 1) -> Page:
     )
 
 
+def page_of_item(items: list[dict[str, Any]], item_id: Any) -> int:
+    """На какой странице чек-листа лежит позиция.
+
+    После отметки «куплено» пользователь должен остаться там же, где нажимал,
+    а не быть выброшенным на первую страницу.
+    """
+    buyable = [item for item in _to_buy(items) if item.get("id")]
+    for index, item in enumerate(buyable):
+        if str(item.get("id")) == str(item_id):
+            return index // BUTTONS_PER_PAGE + 1
+    return 1
+
+
 def alternatives_keyboard(
     plan_id: Any, meal_id: Any, alternatives: list[dict[str, Any]]
 ) -> dict[str, Any]:
