@@ -241,7 +241,8 @@ class HandleCallbackTests(unittest.TestCase):
         self.assertIn(("mark_purchased", str(ITEM), True), app.calls)
         self.assertIn("Куплено", result.toast)
         self.assertIsNotNone(result.edit)
-        self.assertIn("Всё куплено", result.edit.text)
+        # T6: после отметки возвращаемся в раздел магазина, а не в плоский список
+        self.assertIn("куплено 1 из 1", result.edit.text)
 
     def test_toggle_stale_item_strips_keyboard(self) -> None:
         app = _StubAppRepository(plan=_plan_payload(), mark_result=None)

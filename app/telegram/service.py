@@ -24,12 +24,13 @@ from .render import (
     BUTTON_TEXT_LIMIT, CallbackReply, HELP_TEXT, MEAL_LABELS, NOT_LINKED_TEXT,
     Reply, STALE_TEXT, TELEGRAM_LIMIT, alternatives_keyboard, build_keyboard, format_day,
     format_recipe, format_shopping, format_shopping_header, format_week,
-    page_of_item, shopping_keyboard, shopping_page, split_for_telegram,
+    shopping_keyboard, shopping_page, split_for_telegram,
     today_keyboard,
 )
 from .repository import BotRepository, bot_session
 from .scenes import auth
 from .scenes import plan as plan_scene
+from .scenes import shopping as shopping_scene
 
 __all__ = [
     "BUTTON_TEXT_LIMIT", "BotRepository", "CallbackReply", "HELP_TEXT",
@@ -109,6 +110,11 @@ async def handle_message(
             return await _active_plan_reply(app_repository, session)
         if lowered in {"/history", "история", "🗂 история"}:
             return await plan_scene.history_reply(app_repository, session)
+        if lowered in {"/shopping", "покупки", "🛒 покупки"}:
+            latest = await app_repository.latest_plan(session)
+            if latest is None:
+                return Reply("🛒 Списка покупок нет — сначала составьте меню.")
+            return shopping_scene.overview_reply(latest)
 
     if lowered in {"/week", "неделя", "план", "📅 неделя", "📅 меню", "меню"}:
         meals = await repository.latest_plan_meals(context["household_id"])
@@ -218,8 +224,16 @@ async def handle_callback(
             return CallbackReply(
                 edit=await plan_scene.history_reply(app_repository, session, page)
             )
+        # --- покупки по разделам магазина (§5.6) ------------------------------
+        if verb == "f":
+            result = await shopping_scene.handle_filter(app_repository, session, parts)
+            if result is not None:
+                return result
         if verb == "p":
-            return await _turn_page(app_repository, session, parts)
+            result = await shopping_scene.handle_page(app_repository, session, parts)
+            if result is not None:
+                return result
+            return CallbackReply(toast="Не понял кнопку.")
 
         plan_id = unpack_uuid(parts[0]) if parts else None
         if plan_id is None:
@@ -252,13 +266,12 @@ async def handle_callback(
                 return _stale()
             target["purchased_at"] = result.get("purchased_at")
             action = "Куплено" if make_purchased else "Снята отметка"
-            page = page_of_item(items, item_id)
+            # третий аргумент помнит, откуда пришли: из раздела или из
+            # сквозного списка. У кнопок, отправленных до T6, его нет.
+            marker = parts[2] if len(parts) > 2 else "c"
             return CallbackReply(
                 toast=f"{action}: {target.get('normalized_name')}",
-                edit=Reply(
-                    format_shopping_header(items, shopping_page(items, page)),
-                    shopping_keyboard(plan_id, items, page),
-                ),
+                edit=shopping_scene.item_view(plan, item_id, marker),
             )
 
         if verb == "r":
@@ -346,22 +359,3 @@ async def handle_callback(
     return CallbackReply(toast="Не понял кнопку.")
 
 
-async def _turn_page(app_repository: Any, session: dict, parts: list[str]) -> CallbackReply:
-    """Листание длинного списка (глагол ``p``): пока только чек-лист покупок."""
-    scope = parts[0] if parts else ""
-    if scope != "sh" or len(parts) < 3:
-        return CallbackReply(toast="Не понял кнопку.")
-    plan_id = unpack_uuid(parts[1])
-    page = int(parts[2]) if parts[2].isdigit() else 1
-    if plan_id is None:
-        return CallbackReply(toast="Не понял кнопку.")
-    plan = await app_repository.get_plan(session, plan_id)
-    if plan is None:
-        return _stale()
-    items = plan.get("shopping") or []
-    return CallbackReply(
-        edit=Reply(
-            format_shopping_header(items, shopping_page(items, page)),
-            shopping_keyboard(plan_id, items, page),
-        )
-    )

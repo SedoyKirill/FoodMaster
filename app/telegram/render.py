@@ -23,11 +23,11 @@ HELP_TEXT = (
     "Я — Супостат, враг голода. Показываю меню и список покупок вашей семьи.\n\n"
     "Команды:\n"
     "🍽 Сегодня — меню дня: рецепты и замена блюд по кнопкам\n"
-    "📅 Неделя — весь текущий план\n"
-    "🛒 Покупки — чек-лист: жмите на позицию, чтобы отметить купленное\n"
+    "📅 Меню — план по дням, история и сборка нового\n"
+    "🛒 Покупки — чек-лист по разделам магазина\n"
+    "/new — составить меню\n"
     "/web — вход в браузер по одноразовому коду\n"
-    "/unlink — отвязать Telegram\n\n"
-    "Планы пока составляются в веб-приложении «Рацион»."
+    "/unlink — отвязать Telegram"
 )
 
 NOT_LINKED_TEXT = (
@@ -130,13 +130,13 @@ def format_week(meals: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _quantity_text(item: dict[str, Any]) -> str:
+def quantity_text(item: dict[str, Any]) -> str:
     quantity = Decimal(str(item["buy_quantity"])).normalize()
     unit = _UNIT_LABELS.get(str(item.get("unit_code")), str(item.get("unit_code") or ""))
     return f"{quantity:f} {unit}".strip()
 
 
-def _to_buy(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def to_buy(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         item for item in items
         if item.get("buy_quantity") is not None
@@ -145,7 +145,7 @@ def _to_buy(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def format_shopping_header(items: list[dict[str, Any]], page: "Page | None" = None) -> str:
-    buyable = _to_buy(items)
+    buyable = to_buy(items)
     if not items:
         return "🛒 Списка покупок нет — сначала составьте план."
     remaining = [item for item in buyable if item.get("purchased_at") is None]
@@ -164,7 +164,7 @@ def format_shopping_header(items: list[dict[str, Any]], page: "Page | None" = No
 
 def format_shopping(items: list[dict[str, Any]]) -> str:
     """Плоский текстовый список (используется, когда кнопки не нужны)."""
-    buyable = _to_buy(items)
+    buyable = to_buy(items)
     if not items:
         return "🛒 Списка покупок нет — сначала составьте план."
     remaining = [item for item in buyable if item.get("purchased_at") is None]
@@ -180,7 +180,7 @@ def format_shopping(items: list[dict[str, Any]]) -> str:
         if cost is not None:
             total_kop += int(cost)
             cost_text = f" — {int(cost) / 100:.0f} ₽"
-        lines.append(f"• {item['normalized_name']}: {_quantity_text(item)}{pack_text}{cost_text}")
+        lines.append(f"• {item['normalized_name']}: {quantity_text(item)}{pack_text}{cost_text}")
     if total_kop:
         lines.append(f"Итого ≈{total_kop / 100:.0f} ₽")
     return "\n".join(lines)
@@ -371,14 +371,14 @@ def shopping_keyboard(
     """Чек-лист страницами по 30 позиций (раньше был срез первых 90)."""
     plan = pack_uuid(plan_id)
     current = paginate(
-        [item for item in _to_buy(items) if item.get("id")], page, BUTTONS_PER_PAGE
+        [item for item in to_buy(items) if item.get("id")], page, BUTTONS_PER_PAGE
     )
     rows = []
     for item in current.items:
         mark = "✅" if item.get("purchased_at") else "☐"
         cost = item.get("estimated_cost_kop")
         cost_text = f" — {int(cost) / 100:.0f} ₽" if cost else ""
-        text = f"{mark} {item['normalized_name']} · {_quantity_text(item)}{cost_text}"
+        text = f"{mark} {item['normalized_name']} · {quantity_text(item)}{cost_text}"
         rows.append([{
             "text": button_text(text),
             "callback_data": encode_callback("s", plan, pack_uuid(item["id"])),
@@ -390,7 +390,7 @@ def shopping_keyboard(
 def shopping_page(items: list[dict[str, Any]], page: int = 1) -> Page:
     """Та же страница, что показывает клавиатура, — для шапки сообщения."""
     return paginate(
-        [item for item in _to_buy(items) if item.get("id")], page, BUTTONS_PER_PAGE
+        [item for item in to_buy(items) if item.get("id")], page, BUTTONS_PER_PAGE
     )
 
 
@@ -400,7 +400,7 @@ def page_of_item(items: list[dict[str, Any]], item_id: Any) -> int:
     После отметки «куплено» пользователь должен остаться там же, где нажимал,
     а не быть выброшенным на первую страницу.
     """
-    buyable = [item for item in _to_buy(items) if item.get("id")]
+    buyable = [item for item in to_buy(items) if item.get("id")]
     for index, item in enumerate(buyable):
         if str(item.get("id")) == str(item_id):
             return index // BUTTONS_PER_PAGE + 1
