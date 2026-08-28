@@ -477,6 +477,9 @@ async def wait_for_schema(pool, *, attempts: int = 60, delay: float = 5.0) -> No
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    # httpx на INFO печатает полный URL запроса, а в нём — токен бота.
+    # Свои ошибки Bot API мы логируем сами (TelegramClient._call).
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise SystemExit("TELEGRAM_BOT_TOKEN не задан — боту нечем авторизоваться.")
