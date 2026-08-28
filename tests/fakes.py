@@ -153,6 +153,7 @@ class FakeRepository:
         self.planner_appliances: list[str] = []
         self.plan_profiles: dict[str, dict[str, Any]] = {}
         self.plan_history_rows: list[dict[str, Any]] = []
+        self.taste_events_rows: list[dict[str, Any]] = []
         self.planner_data_starts_on: Any = None
         self.audit: list[dict[str, Any]] = []
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
@@ -351,6 +352,85 @@ class FakeRepository:
                 }
         return None
 
+    async def record_taste_event(
+        self, session: dict[str, Any], recipe_id: int, kind: str, **kwargs: Any
+    ) -> None:
+        from app.web.planning.taste import event_value
+
+        self.taste_events_rows.append(
+            {
+                "recipe_id": int(recipe_id),
+                "kind": kind,
+                "value": event_value(kind, kwargs.get("rating")),
+                "person_id": kwargs.get("person_id"),
+                "created_at": date.today(),
+            }
+        )
+
+    async def taste_events(self, session: dict[str, Any], limit: int = 5000) -> list[dict[str, Any]]:
+        return self.taste_events_rows[:limit]
+
+    async def set_meal_status(
+        self, session: dict[str, Any], plan_id: uuid.UUID, meal_id: uuid.UUID, status: str
+    ) -> dict[str, Any] | None:
+        if session["role"] == "viewer":
+            raise PermissionError("Режим просмотра не позволяет менять план")
+        if status not in {"cooked", "skipped"}:
+            raise ValueError("Статус блюда — cooked или skipped")
+        plan = self.plans.get(str(plan_id))
+        if not plan:
+            return None
+        for meal in plan.get("meals", []):
+            if str(meal.get("id")) == str(meal_id):
+                meal["status"] = status
+                await self.record_taste_event(session, int(meal["recipe_id"]), status)
+                return {"id": meal["id"], "recipe_id": meal["recipe_id"], "status": status}
+        return None
+
+    async def taste_onboarding(self, session: dict[str, Any]) -> dict[str, Any]:
+        recipes = self.planner_recipes or [make_recipe(id=index) for index in range(1, 13)]
+        return {
+            "events_count": len(self.taste_events_rows),
+            "needed": len(self.taste_events_rows) < 10,
+            "cards": [
+                {
+                    "recipe_id": int(recipe["id"]),
+                    "title": recipe["title"],
+                    "cuisine_code": recipe.get("cuisine_code"),
+                    "dish_type": recipe.get("dish_type"),
+                    "source_page_start": recipe.get("source_page_start"),
+                }
+                for recipe in recipes[:20]
+            ],
+        }
+
+    async def save_taste_onboarding(
+        self, session: dict[str, Any], answers: list[dict[str, Any]]
+    ) -> int:
+        if session["role"] == "viewer":
+            raise PermissionError("Режим просмотра не позволяет менять настройки")
+        saved = 0
+        for answer in answers:
+            if answer.get("liked") is None:
+                continue
+            await self.record_taste_event(
+                session,
+                int(answer["recipe_id"]),
+                "onboarding_like" if answer["liked"] else "onboarding_skip",
+            )
+            saved += 1
+        return saved
+
+    async def taste_summary(self, session: dict[str, Any]) -> dict[str, Any]:
+        from datetime import date as _date
+
+        from app.web.planning.taste import TasteModel, build_metas
+
+        recipes = self.planner_recipes or [make_recipe(id=index) for index in range(1, 13)]
+        metas = build_metas(recipes)
+        model = TasteModel.fit(self.taste_events_rows, metas, _date.today())
+        return model.summary(metas)
+
     # --- данные экранов ----------------------------------------------------
 
     async def dashboard(self, session: dict[str, Any]) -> dict[str, Any]:
@@ -522,6 +602,7 @@ class FakeRepository:
             "products": self.products,
             "history": self.plan_history_rows,
             "plan_profile": await self.plan_profile(session),
+            "taste_events": self.taste_events_rows,
         }
 
     async def save_plan(
@@ -539,6 +620,8 @@ class FakeRepository:
         for item in plan["shopping"]:
             shopping.append({**item, "id": str(uuid.uuid4()), "purchased_at": None,
                              "category_slug": None})
+        for meal in plan["meals"]:
+            await self.record_taste_event(session, int(meal["recipe_id"]), "planned")
         self.plans[plan_id] = {
             "id": plan_id,
             "household_id": session["household_id"],
@@ -552,7 +635,11 @@ class FakeRepository:
             "price_tier": price_tier,
             "status": "draft",
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "meals": plan["meals"],
+            # У блюда есть id: без него PATCH статуса и замена неадресуемы.
+            "meals": [
+                {**meal, "id": str(uuid.uuid4()), "status": None}
+                for meal in plan["meals"]
+            ],
             "shopping": shopping,
             "warnings": [],
         }

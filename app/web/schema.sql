@@ -252,6 +252,55 @@ CREATE TABLE IF NOT EXISTS app_core.recipe_ratings (
     CHECK (rating BETWEEN 1 AND 5)
 );
 
+-- TZ-M8 §4: вкус семьи живёт на событиях, а не на одной звезде. Оценка,
+-- замена, «приготовили» и «пропустили» — всё это факты, которые затухают со
+-- временем и обобщаются на тип блюда, кухню и продукты.
+CREATE TABLE IF NOT EXISTS app_core.taste_events (
+    id BIGSERIAL PRIMARY KEY,
+    household_id UUID NOT NULL REFERENCES app_core.households(id) ON DELETE CASCADE,
+    person_id UUID REFERENCES app_core.people(id) ON DELETE SET NULL,
+    recipe_id BIGINT NOT NULL REFERENCES recipe_library.recipes(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    value NUMERIC NOT NULL DEFAULT 0,
+    channel TEXT NOT NULL DEFAULT 'web',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (kind IN ('rated', 'replaced_out', 'replaced_in', 'cooked', 'skipped',
+                    'planned', 'onboarding_like', 'onboarding_skip')),
+    CHECK (value BETWEEN -1 AND 1)
+);
+CREATE INDEX IF NOT EXISTS ix_taste_events_household
+    ON app_core.taste_events (household_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS app_core.taste_affinities (
+    household_id UUID NOT NULL REFERENCES app_core.households(id) ON DELETE CASCADE,
+    level TEXT NOT NULL,
+    key TEXT NOT NULL,
+    score NUMERIC NOT NULL,
+    events_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (household_id, level, key),
+    CHECK (level IN ('recipe', 'dish_type', 'cuisine', 'ingredient')),
+    CHECK (score BETWEEN -1 AND 1)
+);
+
+-- Отметка «приготовили»/«пропустили» под блюдом плана (§4.1). Отсутствие
+-- ответа событием не считается: молчание — не мнение.
+ALTER TABLE app_core.plan_meals
+    ADD COLUMN IF NOT EXISTS status TEXT;
+ALTER TABLE app_core.plan_meals DROP CONSTRAINT IF EXISTS plan_meals_status_check;
+ALTER TABLE app_core.plan_meals
+    ADD CONSTRAINT plan_meals_status_check
+    CHECK (status IS NULL OR status IN ('cooked', 'skipped'));
+
+-- Допущение А3: звёзды переезжают в события с датой последней правки.
+INSERT INTO app_core.taste_events (household_id, recipe_id, kind, value, channel, created_at)
+SELECT r.household_id, r.recipe_id, 'rated', (r.rating - 3) / 2.0, 'system', r.updated_at
+FROM app_core.recipe_ratings r
+WHERE NOT EXISTS (
+    SELECT 1 FROM app_core.taste_events e
+    WHERE e.household_id = r.household_id AND e.recipe_id = r.recipe_id AND e.kind = 'rated'
+);
+
 CREATE INDEX IF NOT EXISTS ix_plan_ingredients_plan
     ON app_core.plan_ingredients (plan_id);
 

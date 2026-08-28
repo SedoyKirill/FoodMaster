@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.web.planner import _meal_nutrition
 from app.web.planning.candidates import CandidateScore
-from app.web.planning.optimizer import W_RATING, slot_coefficient
+from app.web.planning.optimizer import W_TASTE_AFFINITY, W_UNKNOWN, slot_coefficient
 
 
 class _StubMatcher:
@@ -58,16 +58,21 @@ class MealNutritionTests(unittest.TestCase):
         self.assertEqual(result["estimated_kcal"], 400)
 
 
-class RatingBonusTests(unittest.TestCase):
-    def test_higher_rating_lowers_penalty(self) -> None:
-        loved = CandidateScore(1)
-        loved.meal_fit = {"dinner": 1.0}
-        loved.rating_bonus = 2  # 5 звёзд
-        disliked = CandidateScore(2)
-        disliked.meal_fit = {"dinner": 1.0}
-        disliked.rating_bonus = -2  # 1 звезда
-        neutral = CandidateScore(3)
-        neutral.meal_fit = {"dinner": 1.0}
+class TasteAffinityTests(unittest.TestCase):
+    """Вкус семьи в целевой функции (TZ-M8 §4): звёзды — лишь одно событие."""
+
+    @staticmethod
+    def _score(recipe_id: int, affinity: float) -> CandidateScore:
+        score = CandidateScore(recipe_id)
+        score.meal_fit = {"dinner": 1.0}
+        score.affinity = affinity
+        score.unknown = False
+        return score
+
+    def test_loved_dish_beats_neutral_and_disliked(self) -> None:
+        loved = self._score(1, 1.0)
+        neutral = self._score(2, 0.0)
+        disliked = self._score(3, -1.0)
         self.assertLess(
             slot_coefficient(loved, "dinner", 10),
             slot_coefficient(neutral, "dinner", 10),
@@ -78,7 +83,16 @@ class RatingBonusTests(unittest.TestCase):
         )
         self.assertEqual(
             slot_coefficient(neutral, "dinner", 10) - slot_coefficient(loved, "dinner", 10),
-            2 * W_RATING,
+            W_TASTE_AFFINITY,
+        )
+
+    def test_unknown_dish_is_slightly_behind_a_known_neutral_one(self) -> None:
+        known = self._score(1, 0.0)
+        unknown = self._score(2, 0.0)
+        unknown.unknown = True
+        self.assertEqual(
+            slot_coefficient(unknown, "dinner", 10) - slot_coefficient(known, "dinner", 10),
+            W_UNKNOWN,
         )
 
 

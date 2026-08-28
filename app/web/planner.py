@@ -928,6 +928,7 @@ def build_plan(
     cuisine_mode: str = "only",
     history: list[dict[str, Any]] | None = None,
     plan_profile: dict[str, Any] | None = None,
+    taste_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Фасад TZ-M5R: кандидаты → оценка → оптимизация → масштабирование → покупки.
 
@@ -944,6 +945,7 @@ def build_plan(
     from .planning import optimizer as optimizer_mod
     from .planning import profile as profile_mod
     from .planning import scaling as scaling_mod
+    from .planning import taste as taste_mod
     from .planning import shopping as shopping_mod
     from .planning.candidates import (
         MIN_READY_CANDIDATES, Synonyms, hard_rule_terms, ingredient_matches_terms,
@@ -1042,18 +1044,21 @@ def build_plan(
         base_quantity=_base_quantity,
         scale_of=_scale_of,
     )
-    # Оценка семьи (звёзды): любимое двигается вверх, разочаровавшее — вниз.
-    for recipe_id, rating in (ratings or {}).items():
-        if recipe_id in scores:
-            scores[recipe_id].rating_bonus = int(rating) - 3
+    # Вкус семьи (TZ-M8 §4): звёзды — лишь одно из событий, наравне с
+    # заменами и отметками «приготовили»/«пропустили». Обобщение на тип
+    # блюда, кухню и продукты даёт мнение даже о том, что семья не пробовала.
+    taste_metas = taste_mod.build_metas(pool)
+    taste_model = taste_mod.TasteModel.fit(taste_events or [], taste_metas, starts_on)
+    taste_known = taste_mod.known_recipes(taste_model)
 
-    # Ротация и сезон (TZ-M8 §3.6–3.7). Аффинити пока выводится из звёзд —
-    # события вкуса появятся в T5 и заменят этот прокси.
+    # Ротация и сезон (TZ-M8 §3.6–3.7).
     plan_history = context_mod.build_history(history or [], starts_on)
     for recipe in pool:
         recipe_id = int(recipe["id"])
         score = scores[recipe_id]
-        affinity = ((ratings or {}).get(recipe_id, 3) - 3) / 2
+        affinity = taste_model.family_affinity(taste_metas[recipe_id], people)
+        score.affinity = affinity
+        score.unknown = recipe_id not in taste_known
         score.recency_penalty = plan_history.recency_penalty(recipe_id, affinity)
         score.season_bonus = context_mod.season_share(
             [
@@ -1258,6 +1263,7 @@ def build_plan(
                         or plan_history.days_since(recipe_id) is not None
                     ),
                     kcal_target=profile_mod.slot_kcal_target(people, meal_type, meal_date),
+                    dish_type=score.dish_type,
                 ),
             )
             meal_nutrition = _meal_nutrition(
@@ -1539,6 +1545,7 @@ def _alternative_cards(
                     rating=ratings.get(recipe_id),
                     known=known,
                     kcal_target=kcal_target,
+                    dish_type=score.dish_type,
                 ),
             ),
             "delta_kcal": (
@@ -1603,6 +1610,7 @@ def slot_alternatives(
     nutrition: dict[str, dict[str, Any]] | None = None,
     history: list[dict[str, Any]] | None = None,
     plan_profile: dict[str, Any] | None = None,
+    taste_events: list[dict[str, Any]] | None = None,
     with_details: bool = False,
 ) -> list[dict[str, Any]]:
     """Кандидаты на один слот при зафиксированных остальных блюдах (TZ-M5R §3).
@@ -1619,6 +1627,7 @@ def slot_alternatives(
     """
     from .planning import context as context_mod
     from .planning import optimizer as optimizer_mod
+    from .planning import taste as taste_mod
     from .planning.candidates import (
         Synonyms, hard_rule_terms, ingredient_matches_terms, score_candidates,
     )
@@ -1700,9 +1709,17 @@ def slot_alternatives(
         base_quantity=_base_quantity,
         scale_of=_scale_of,
     )
-    for rated_id, rating in (ratings or {}).items():
-        if rated_id in scores:
-            scores[rated_id].rating_bonus = int(rating) - 3
+    # Вкус семьи — и в заменах: альтернативы ранжируются той же формулой,
+    # что и план (TZ-M8 §4, §6.6).
+    taste_metas = taste_mod.build_metas(scored_pool)
+    taste_model = taste_mod.TasteModel.fit(taste_events or [], taste_metas, meal_date)
+    taste_known = taste_mod.known_recipes(taste_model)
+    for recipe in scored_pool:
+        recipe_id = int(recipe["id"])
+        scores[recipe_id].affinity = taste_model.family_affinity(
+            taste_metas[recipe_id], people
+        )
+        scores[recipe_id].unknown = recipe_id not in taste_known
     cost_factor = optimizer_mod.PRICE_TIER_COST_FACTOR.get(price_tier, 10)
     ranked = sorted(
         pool,

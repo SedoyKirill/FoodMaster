@@ -25,7 +25,13 @@ W_VARIETY = 400
 W_TASTE = 500
 W_CUISINE = 200
 W_FIT = 300
-W_RATING = 400
+# TZ-M8 §4: вкус семьи заменил звёзды в целевой функции. rating_bonus из
+# данных не удалён, но в коэффициент больше не входит — оценка теперь одно из
+# событий вкуса наравне с заменами и «приготовили».
+W_TASTE_AFFINITY = 600
+# Блюдо, о котором семья ничего не знает, слегка проигрывает знакомому: без
+# этого меню новичка состояло бы из случайных находок каталога.
+W_UNKNOWN = 150
 # TZ-M8 §3.7: блюдо, которое ели вчера, должно проигрывать такому же, которого
 # не было три недели. Вес сопоставим с рейтингом: ротация важна, но не важнее
 # того, что семья действительно любит.
@@ -79,7 +85,8 @@ def slot_coefficient(
         + W_TASTE * score.dislike_penalty
         - W_WASTE * score.expiry_bonus
         - W_CUISINE * score.cuisine_bonus
-        - W_RATING * score.rating_bonus
+        - int(W_TASTE_AFFINITY * score.affinity)
+        + int(W_UNKNOWN * score.unknown)
         + int(W_RECENCY * score.recency_penalty)
         - int(W_SEASON * score.season_bonus)
         - int(W_FIT * fit)

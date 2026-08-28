@@ -27,6 +27,8 @@ MIN_CONTRIBUTION = 60
 CHEAP_DELTA_RUB = 30
 #: до скольких минут блюдо считается быстрым
 QUICK_MINUTES = 30
+#: с какого аффинити говорим «вы часто выбираете супы», а не «любимое блюдо»
+LIKED_TYPE_AFFINITY = 0.2
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,7 @@ class ExplainContext:
     rating: int | None = None
     known: bool = True
     kcal_target: int | None = None
+    dish_type: str | None = None
 
 
 def contributions(
@@ -66,7 +69,8 @@ def contributions(
         "dislike": optimizer_mod.W_TASTE * score.dislike_penalty,
         "waste": -optimizer_mod.W_WASTE * score.expiry_bonus,
         "cuisine": -optimizer_mod.W_CUISINE * score.cuisine_bonus,
-        "rating": -optimizer_mod.W_RATING * score.rating_bonus,
+        "taste": -int(optimizer_mod.W_TASTE_AFFINITY * score.affinity),
+        "unknown": int(optimizer_mod.W_UNKNOWN * score.unknown),
         "recency": int(optimizer_mod.W_RECENCY * score.recency_penalty),
         "season": -int(optimizer_mod.W_SEASON * score.season_bonus),
         "fit": -int(optimizer_mod.W_FIT * fit),
@@ -77,8 +81,13 @@ def _reason_for(term: str, score: CandidateScore, context: ExplainContext) -> Re
     """Довод «за» по названию слагаемого целевой функции."""
     if term == "waste" and context.expiring_names:
         return Reason("uses_expiring", {"ingredients": list(context.expiring_names)})
-    if term == "rating" and context.rating:
-        return Reason("favorite", {"rating": context.rating})
+    if term == "taste":
+        if context.rating:
+            return Reason("favorite", {"rating": context.rating})
+        if score.affinity >= LIKED_TYPE_AFFINITY and context.dish_type:
+            # Мнения об этом блюде нет, но вкус к его типу уже виден (§4.2).
+            return Reason("liked_type", {"dish_type": context.dish_type})
+        return Reason("favorite", {"affinity": round(score.affinity, 2)})
     if term == "season" and context.seasonal_names:
         return Reason("seasonal", {"ingredients": list(context.seasonal_names)})
     if term == "cuisine":

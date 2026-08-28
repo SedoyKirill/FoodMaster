@@ -50,10 +50,18 @@ class ExplainTests(unittest.TestCase):
 
     def test_family_rating_explains_the_choice(self) -> None:
         reasons = explain(
-            score_for(rating_bonus=2),
+            score_for(affinity=0.9),
             ExplainContext(meal_type="dinner", rating=5),
         )
         self.assertIn("favorite", self._codes(reasons))
+
+    def test_taste_for_the_dish_type_is_named_when_the_dish_is_new(self) -> None:
+        """Мнения о блюде нет, но супы семья выбирает часто (§4.2)."""
+        reasons = explain(
+            score_for(affinity=0.4),
+            ExplainContext(meal_type="dinner", dish_type="soup"),
+        )
+        self.assertIn("liked_type", self._codes(reasons))
 
     def test_cheaper_than_the_slot_median_is_reported_in_rubles(self) -> None:
         reasons = explain(
@@ -109,7 +117,7 @@ class ExplainTests(unittest.TestCase):
 
     def test_no_more_than_three_reasons(self) -> None:
         reasons = explain(
-            score_for(expiry_bonus=2, rating_bonus=2, cost_kop=5000, time_minutes=15),
+            score_for(expiry_bonus=2, affinity=0.9, cost_kop=5000, time_minutes=15),
             ExplainContext(
                 meal_type="dinner", median_cost_kop=40000, rating=5,
                 expiring_names=("сметана",), stock_names=("рис",), days_since=21,

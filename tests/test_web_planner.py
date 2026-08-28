@@ -493,6 +493,64 @@ class ProductMatcherCacheTests(unittest.TestCase):
         self.assertGreater(plan["estimated_cost_kop"], 0)
 
 
+class TasteInPlanTests(unittest.TestCase):
+    """Планировщик учится на событиях, а не только на звёздах (TZ-M8 §4)."""
+
+    @staticmethod
+    def _recipes() -> list[dict]:
+        soup = recipe(1, "Борщ украинский", "dinner")
+        soup["dish_type"] = "soup"
+        other_soup = recipe(2, "Щи из капусты", "dinner")
+        other_soup["dish_type"] = "soup"
+        # Название без «блинов» и «каш»: эвристика приёмов пищи не должна
+        # мешать проверке вкуса.
+        stew = recipe(3, "Рагу овощное", "dinner")
+        stew["dish_type"] = "stew"
+        return [soup, other_soup, stew]
+
+    @staticmethod
+    def _plan(taste_events: list[dict]) -> dict:
+        return build_plan(
+            household_id="household",
+            starts_on=date(2026, 8, 26),
+            days=1,
+            cuisines=[],
+            people=[{"name": "Взрослый", "person_type": "adult", "portion_factor": Decimal("1")}],
+            appliances=[],
+            rules=[],
+            inventory=[],
+            recipes=TasteInPlanTests._recipes(),
+            products=[],
+            meals=["dinner"],
+            taste_events=taste_events,
+        )
+
+    @staticmethod
+    def _event(recipe_id: int, kind: str, value: float) -> dict:
+        return {
+            "recipe_id": recipe_id, "kind": kind, "value": value,
+            "created_at": date(2026, 8, 20), "person_id": None,
+        }
+
+    def test_loved_dish_wins_the_slot(self) -> None:
+        events = [self._event(3, "rated", 1.0) for _ in range(3)]
+        plan = self._plan(events)
+        self.assertEqual(plan["meals"][0]["recipe_id"], 3)
+
+    def test_two_replacements_teach_the_dish_type(self) -> None:
+        """Суп-пюре заменили дважды — в следующий раз солвер ставит другое."""
+        events = [self._event(1, "replaced_out", -0.6) for _ in range(3)]
+        plan = self._plan(events)
+        self.assertNotEqual(plan["meals"][0]["recipe_id"], 1)
+
+    def test_taste_generalises_to_a_similar_dish(self) -> None:
+        """Понравился борщ — щи поднимаются выше блинов (§4.2)."""
+        events = [self._event(1, "rated", 1.0) for _ in range(4)]
+        events += [self._event(1, "cooked", 0.5) for _ in range(2)]
+        plan = self._plan(events)
+        self.assertIn(plan["meals"][0]["recipe_id"], (1, 2))
+
+
 class PlanReasonsTests(unittest.TestCase):
     """Каждое блюдо плана объясняет себя (TZ-M8 §5)."""
 

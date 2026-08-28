@@ -172,6 +172,8 @@ class CandidateScore:
         "meal_bias", "main_ingredient", "draft", "rating_bonus", "dish_type",
         # TZ-M8 §3.6–3.7: сезонность и ротация по истории семьи
         "recency_penalty", "season_bonus", "time_minutes",
+        # TZ-M8 §4: вкус семьи вместо одной звезды на рецепт
+        "affinity", "unknown",
     )
 
     def __init__(self, recipe_id: int) -> None:
@@ -195,6 +197,10 @@ class CandidateScore:
         self.season_bonus = 0.0
         #: время приготовления по книге, если оно известно
         self.time_minutes: int | None = None
+        #: вкус семьи к блюду в шкале [-1, 1]; 0 — мнения нет
+        self.affinity = 0.0
+        #: семья не имеет об этом блюде никакого мнения
+        self.unknown = True
 
 
 def _expiring_canonicals(

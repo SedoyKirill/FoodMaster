@@ -508,6 +508,81 @@ class PlanHistoryTests(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
 
 
+class TasteApiTests(unittest.TestCase):
+    """События вкуса, онбординг и сводка (TZ-M8 §4)."""
+
+    def setUp(self) -> None:
+        self.client, self.repository = make_client(self)
+        created = self.client.post(
+            "/api/plans/generate", json={"days": 1, "starts_on": "2026-08-17"}
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        self.plan = self.client.get("/api/plans/latest").json()
+
+    def test_marking_a_meal_cooked_records_a_taste_event(self) -> None:
+        meal = self.plan["meals"][0]
+        response = self.client.patch(
+            f"/api/plans/{self.plan['id']}/meals/{meal['id']}", json={"status": "cooked"}
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "cooked")
+        kinds = [event["kind"] for event in self.repository.taste_events_rows]
+        self.assertIn("cooked", kinds)
+
+    def test_unknown_status_is_rejected(self) -> None:
+        meal = self.plan["meals"][0]
+        response = self.client.patch(
+            f"/api/plans/{self.plan['id']}/meals/{meal['id']}", json={"status": "съели"}
+        )
+        self.assertEqual(response.status_code, 422)
+
+    def test_status_of_a_stranger_meal_is_404(self) -> None:
+        import uuid as uuid_module
+
+        response = self.client.patch(
+            f"/api/plans/{self.plan['id']}/meals/{uuid_module.uuid4()}",
+            json={"status": "skipped"},
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_onboarding_is_offered_to_a_family_without_history(self) -> None:
+        body = self.client.get("/api/taste/onboarding").json()
+        self.assertTrue(body["needed"])
+        self.assertTrue(body["cards"])
+
+    def test_onboarding_answers_become_events(self) -> None:
+        cards = self.client.get("/api/taste/onboarding").json()["cards"]
+        answers = [
+            {"recipe_id": cards[0]["recipe_id"], "liked": True},
+            {"recipe_id": cards[1]["recipe_id"], "liked": False},
+            {"recipe_id": cards[2]["recipe_id"], "liked": None},  # пропуск
+        ]
+        response = self.client.post("/api/taste/onboarding", json={"answers": answers})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["saved"], 2)
+        kinds = [event["kind"] for event in self.repository.taste_events_rows]
+        self.assertIn("onboarding_like", kinds)
+        self.assertIn("onboarding_skip", kinds)
+
+    def test_summary_reports_what_the_family_likes(self) -> None:
+        cards = self.client.get("/api/taste/onboarding").json()["cards"]
+        liked = cards[0]["recipe_id"]
+        self.client.post(
+            "/api/taste/onboarding",
+            json={"answers": [{"recipe_id": liked, "liked": True}]},
+        )
+        summary = self.client.get("/api/taste/summary").json()
+        self.assertEqual(summary["favourite_recipes"][0]["recipe_id"], liked)
+
+    def test_viewer_cannot_answer_onboarding(self) -> None:
+        for household in self.repository.households.values():
+            household["role"] = "viewer"
+        response = self.client.post(
+            "/api/taste/onboarding", json={"answers": [{"recipe_id": 1, "liked": True}]}
+        )
+        self.assertEqual(response.status_code, 403)
+
+
 class PlanProfileApiTests(unittest.TestCase):
     """Профиль планирования семьи (TZ-M8 §3.4)."""
 

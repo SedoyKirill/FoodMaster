@@ -15,6 +15,7 @@ import asyncpg
 
 from .planning.context import HISTORY_WINDOW_DAYS
 from .planning.profile import MEAL_TYPES, daily_target
+from .planning.taste import TasteModel, build_metas, event_value
 from .planner import (
     DEFAULT_APPLIANCES, ProductMatcher, ProductMatcherCache, _base_quantity,
     clean_dish_title, warm_product_matcher,
@@ -33,6 +34,12 @@ PLANNER_RECIPE_LIMIT = 500
 PLANNER_CUISINE_LIMIT = 300
 # Сколько альтернатив показывает «Заменить» (десять с прокруткой, TZ-фидбэк).
 MEAL_ALTERNATIVES_LIMIT = 10
+#: сколько событий вкуса читается для модели — года истории с запасом хватает
+TASTE_EVENTS_LIMIT = 5000
+#: сколько частых пар «кухня + тип блюда» показывает онбординг
+ONBOARDING_PAIRS = 10
+#: до скольких событий семья считается новой и ей предлагается онбординг
+ONBOARDING_MIN_EVENTS = 10
 PRODUCT_MATCHER_TTL_SECONDS = 600.0
 # N1: раз в 5 минут планировщик «разминается» в фоне — держит горячими кэш
 # Postgres и мемоизацию матчера. Иначе первая после простоя сборка меню
@@ -879,8 +886,44 @@ class AppRepository:
                 """,
                 session["household_id"], recipe_id, int(rating), session["user_id"],
             )
+        if rating is None:
+            # Снятие оценки убирает и её след: «передумали» — не мнение.
+            await self.db().execute(
+                """
+                DELETE FROM app_core.taste_events
+                WHERE household_id=$1 AND recipe_id=$2 AND kind='rated'
+                """,
+                session["household_id"], recipe_id,
+            )
+        else:
+            await self.record_taste_event(
+                session, recipe_id, "rated", rating=int(rating)
+            )
         await self.audit(session, "recipe.rated", "recipe", recipe_id, {"rating": rating})
         return {"recipe_id": recipe_id, "my_rating": rating}
+
+    async def record_taste_event(
+        self,
+        session: dict[str, Any],
+        recipe_id: int,
+        kind: str,
+        *,
+        rating: int | None = None,
+        person_id: uuid.UUID | None = None,
+        channel: str = "web",
+        connection: Any = None,
+    ) -> None:
+        """Факт из жизни семьи, который учит планировщик (TZ-M8 §4.1)."""
+        executor = connection or self.db()
+        await executor.execute(
+            """
+            INSERT INTO app_core.taste_events (
+                household_id, person_id, recipe_id, kind, value, channel
+            ) VALUES ($1,$2,$3,$4,$5,$6)
+            """,
+            session["household_id"], person_id, int(recipe_id), kind,
+            event_value(kind, rating), channel,
+        )
 
     async def list_products(
         self,
@@ -1215,6 +1258,7 @@ class AppRepository:
             },
             "history": await self.plan_history(session, starts_on or date.today()),
             "plan_profile": await self.plan_profile(session),
+            "taste_events": await self.taste_events(session),
         }
 
     async def ingredient_synonyms(self) -> list[dict[str, Any]]:
@@ -1279,6 +1323,12 @@ class AppRepository:
                     item["unit_code"], item["covered_from_inventory"], item["buy_quantity"],
                     item["matched_product_id"], item["pack_count"], item["estimated_cost_kop"],
                     bool(item.get("to_taste")),
+                )
+            # «Показано» — не мнение, но без него не отличить «не пробовали»
+            # от «пробовали и промолчали» (§4.1).
+            for meal in plan["meals"]:
+                await self.record_taste_event(
+                    session, int(meal["recipe_id"]), "planned", connection=connection
                 )
             await self._audit(connection, session["household_id"], session["user_id"], "meal_plan.generated", "meal_plan", plan_id, {"days": days})
         return str(plan_id)
@@ -1484,6 +1534,14 @@ class AppRepository:
                 entry.get("estimated_carb"),
                 json.dumps(entry.get("reasons") or [], ensure_ascii=False),
             )
+            # Замена — сильный сигнал вкуса: одно блюдо ушло, другое пришло
+            # (§4.1). Раньше это оставалось только в audit_log.
+            await self.record_taste_event(
+                session, int(target["recipe_id"]), "replaced_out", connection=connection
+            )
+            await self.record_taste_event(
+                session, int(entry["recipe_id"]), "replaced_in", connection=connection
+            )
             await self._audit(
                 connection, session["household_id"], session["user_id"],
                 "meal_plan.meal_replaced", "meal_plan", plan_id,
@@ -1491,6 +1549,206 @@ class AppRepository:
             )
         await self._rebuild_plan_shopping(session, plan_id)
         return await self.get_plan(session, plan_id)
+
+    async def set_meal_status(
+        self, session: dict[str, Any], plan_id: uuid.UUID, meal_id: uuid.UUID, status: str
+    ) -> dict[str, Any] | None:
+        """«Приготовили» или «пропустили» — самый честный сигнал вкуса (§4.1)."""
+        if session["role"] == "viewer":
+            raise PermissionError("Режим просмотра не позволяет менять план")
+        if status not in {"cooked", "skipped"}:
+            raise ValueError("Статус блюда — cooked или skipped")
+        row = await self.db().fetchrow(
+            """
+            UPDATE app_core.plan_meals pm
+            SET status = $4
+            FROM app_core.meal_plans mp
+            WHERE pm.id=$1 AND pm.plan_id=$2
+              AND mp.id = pm.plan_id AND mp.household_id=$3
+            RETURNING pm.id, pm.recipe_id, pm.status
+            """,
+            meal_id, plan_id, session["household_id"], status,
+        )
+        if not row:
+            return None
+        await self.record_taste_event(session, int(row["recipe_id"]), status)
+        return row_dict(row)
+
+    async def taste_events(
+        self, session: dict[str, Any], limit: int = TASTE_EVENTS_LIMIT
+    ) -> list[dict[str, Any]]:
+        """События вкуса семьи, свежие первыми."""
+        rows = await self.db().fetch(
+            """
+            SELECT recipe_id, person_id, kind, value, created_at
+            FROM app_core.taste_events
+            WHERE household_id=$1
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            session["household_id"], limit,
+        )
+        return [row_dict(row) for row in rows]
+
+    async def _taste_model(self, session: dict[str, Any]) -> tuple[Any, dict[int, Any]]:
+        """Модель вкуса и метаданные рецептов, о которых есть события."""
+        events = await self.taste_events(session)
+        recipe_ids = sorted({int(event["recipe_id"]) for event in events})
+        rows = await self.db().fetch(
+            """
+            SELECT r.id, r.dish_type, r.cuisine_code, r.cuisine_codes,
+                   COALESCE(ing.items, '[]'::jsonb) AS ingredients
+            FROM recipe_library.recipes r
+            LEFT JOIN LATERAL (
+                SELECT jsonb_agg(jsonb_build_object(
+                    'normalized_name', i.normalized_name,
+                    'quantity_min', i.quantity_min,
+                    'quantity_max', i.quantity_max
+                ) ORDER BY i.position) AS items
+                FROM recipe_library.recipe_ingredients i
+                WHERE i.recipe_id = r.id
+            ) ing ON TRUE
+            WHERE r.id = ANY($1::bigint[])
+            """,
+            recipe_ids,
+        )
+        recipes = []
+        for row in rows:
+            recipe = dict(row)
+            if isinstance(recipe["ingredients"], str):
+                recipe["ingredients"] = json.loads(recipe["ingredients"])
+            recipes.append(recipe)
+        metas = build_metas(recipes)
+        return TasteModel.fit(events, metas, date.today()), metas
+
+    async def taste_summary(self, session: dict[str, Any]) -> dict[str, Any]:
+        """Топ любимого и нелюбимого — экран «Вкусы семьи» и бот (§7)."""
+        model, metas = await self._taste_model(session)
+        summary = model.summary(metas)
+        titles = {}
+        recipe_ids = [
+            item["recipe_id"]
+            for group in ("favourite_recipes", "disliked_recipes")
+            for item in summary[group]
+        ]
+        if recipe_ids:
+            titles = {
+                int(row["id"]): clean_dish_title(row["title"])
+                for row in await self.db().fetch(
+                    "SELECT id, title FROM recipe_library.recipes WHERE id = ANY($1::bigint[])",
+                    recipe_ids,
+                )
+            }
+        for group in ("favourite_recipes", "disliked_recipes"):
+            for item in summary[group]:
+                item["title"] = titles.get(item["recipe_id"])
+        return summary
+
+    async def refresh_taste_affinities(self, session: dict[str, Any]) -> int:
+        """Пересчёт аффинити семьи; вызывается ночным джобом и после событий."""
+        model, _metas = await self._taste_model(session)
+        rows = model.rows()
+        async with self.db().acquire() as connection, connection.transaction():
+            await connection.execute(
+                "DELETE FROM app_core.taste_affinities WHERE household_id=$1",
+                session["household_id"],
+            )
+            if rows:
+                await connection.executemany(
+                    """
+                    INSERT INTO app_core.taste_affinities (
+                        household_id, level, key, score, events_count
+                    ) VALUES ($1,$2,$3,$4,$5)
+                    """,
+                    [
+                        (
+                            session["household_id"], row["level"], row["key"],
+                            Decimal(str(round(row["score"], 6))), row["events_count"],
+                        )
+                        for row in rows
+                    ],
+                )
+        return len(rows)
+
+    async def refresh_all_taste_affinities(self) -> int:
+        """Ночной пересчёт по всем семьям (§4.2)."""
+        households = await self.db().fetch("SELECT id FROM app_core.households")
+        total = 0
+        for row in households:
+            total += await self.refresh_taste_affinities({"household_id": row["id"]})
+        return total
+
+    async def taste_onboarding(self, session: dict[str, Any]) -> dict[str, Any]:
+        """Карточки холодного старта: по два блюда на частую пару кухня+тип."""
+        events = await self.db().fetchval(
+            "SELECT count(*) FROM app_core.taste_events WHERE household_id=$1",
+            session["household_id"],
+        )
+        rows = await self.db().fetch(
+            """
+            WITH pairs AS (
+                SELECT r.cuisine_code, r.dish_type, count(*) AS total
+                FROM recipe_library.recipes r
+                WHERE r.review_status = 'ready'
+                  AND r.cuisine_code IS NOT NULL AND r.dish_type IS NOT NULL
+                GROUP BY r.cuisine_code, r.dish_type
+                ORDER BY total DESC
+                LIMIT $2
+            )
+            SELECT picked.id, picked.title, picked.cuisine_code, picked.dish_type,
+                   picked.source_page_start
+            FROM pairs
+            CROSS JOIN LATERAL (
+                SELECT r.id, r.title, r.cuisine_code, r.dish_type, r.source_page_start
+                FROM recipe_library.recipes r
+                WHERE r.review_status = 'ready'
+                  AND r.cuisine_code = pairs.cuisine_code
+                  AND r.dish_type = pairs.dish_type
+                  AND NOT EXISTS (
+                      SELECT 1 FROM app_core.taste_events e
+                      WHERE e.household_id = $1 AND e.recipe_id = r.id
+                  )
+                ORDER BY md5(r.id::text || $1::text)
+                LIMIT 2
+            ) AS picked
+            """,
+            session["household_id"], ONBOARDING_PAIRS,
+        )
+        return {
+            "events_count": int(events or 0),
+            "needed": int(events or 0) < ONBOARDING_MIN_EVENTS,
+            "cards": [
+                {
+                    "recipe_id": int(row["id"]),
+                    "title": clean_dish_title(row["title"]),
+                    "cuisine_code": row["cuisine_code"],
+                    "dish_type": row["dish_type"],
+                    "source_page_start": row["source_page_start"],
+                }
+                for row in rows
+            ],
+        }
+
+    async def save_taste_onboarding(
+        self, session: dict[str, Any], answers: list[dict[str, Any]]
+    ) -> int:
+        """Ответы онбординга: 👍 и 👎; пропуск событием не считается."""
+        if session["role"] == "viewer":
+            raise PermissionError("Режим просмотра не позволяет менять настройки")
+        saved = 0
+        async with self.db().acquire() as connection, connection.transaction():
+            for answer in answers:
+                liked = answer.get("liked")
+                if liked is None:
+                    continue
+                await self.record_taste_event(
+                    session,
+                    int(answer["recipe_id"]),
+                    "onboarding_like" if liked else "onboarding_skip",
+                    connection=connection,
+                )
+                saved += 1
+        return saved
 
     async def _rebuild_plan_shopping(
         self, session: dict[str, Any], plan_id: uuid.UUID
