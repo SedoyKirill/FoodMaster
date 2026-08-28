@@ -9,12 +9,14 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
     from fastapi.testclient import TestClient
 
+    from app.web import main
     from app.web.main import create_app
 except ImportError as exc:  # pragma: no cover - окружение без fastapi/httpx
     raise unittest.SkipTest(f"веб-стек недоступен: {exc}") from exc
@@ -621,6 +623,25 @@ class PlanProfileApiTests(unittest.TestCase):
         self.assertEqual(
             self.client.get("/api/settings/plan-profile").json()["default_days"], 5
         )
+
+    def test_mode_from_the_form_reaches_the_planner(self) -> None:
+        """Режим — это веса целевой функции (§6.4), а не строчка в ответе."""
+        seen: dict[str, object] = {}
+        original = main.build_plan
+
+        def _capture(**kwargs):
+            seen.update(kwargs)
+            return original(**kwargs)
+
+        with mock.patch.object(main, "build_plan", _capture):
+            response = self.client.post(
+                "/api/plans/generate",
+                json={"days": 1, "starts_on": "2026-08-17", "mode": "economy"},
+            )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(seen["mode"], "economy")
+        # economy заодно переключает ценовую стратегию матчера товаров.
+        self.assertEqual(seen["price_tier"], "economy")
 
     def test_weekly_budget_scales_to_horizon(self) -> None:
         self.client.put("/api/settings/plan-profile", json={"weekly_budget_kop": 700000})

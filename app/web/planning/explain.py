@@ -16,8 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import optimizer as optimizer_mod
 from .candidates import CandidateScore
+from .weights import WeightProfile, weights_for
 
 #: сколько причин показывать под блюдом
 MAX_REASONS = 3
@@ -47,7 +47,8 @@ class ExplainContext:
     """Всё, что знает планировщик о блюде в этом слоте, кроме коэффициента."""
 
     meal_type: str
-    cost_factor: int = 10
+    #: веса режима семьи: те же, по которым принято решение (§6.4)
+    weights: WeightProfile = field(default_factory=lambda: weights_for("balanced"))
     median_cost_kop: int | None = None
     expiring_names: tuple[str, ...] = ()
     stock_names: tuple[str, ...] = ()
@@ -60,20 +61,21 @@ class ExplainContext:
 
 
 def contributions(
-    score: CandidateScore, meal_type: str, cost_factor: int
+    score: CandidateScore, meal_type: str, weights: WeightProfile
 ) -> dict[str, int]:
     """Слагаемые ``slot_coefficient``: отрицательное — довод «за» блюдо."""
     fit = score.meal_fit.get(meal_type, 0.0) + score.meal_bias.get(meal_type, 0.0)
     return {
-        "cost": cost_factor * (score.cost_kop // 100),
-        "dislike": optimizer_mod.W_TASTE * score.dislike_penalty,
-        "waste": -optimizer_mod.W_WASTE * score.expiry_bonus,
-        "cuisine": -optimizer_mod.W_CUISINE * score.cuisine_bonus,
-        "taste": -int(optimizer_mod.W_TASTE_AFFINITY * score.affinity),
-        "unknown": int(optimizer_mod.W_UNKNOWN * score.unknown),
-        "recency": int(optimizer_mod.W_RECENCY * score.recency_penalty),
-        "season": -int(optimizer_mod.W_SEASON * score.season_bonus),
-        "fit": -int(optimizer_mod.W_FIT * fit),
+        "cost": weights.cost * (score.cost_kop // 100),
+        "dislike": int(weights.dislike * score.dislike_penalty),
+        "waste": -weights.waste * score.expiry_bonus,
+        "cuisine": -weights.cuisine * score.cuisine_bonus,
+        "taste": -int(weights.taste * score.affinity),
+        "unknown": int(weights.unknown * score.unknown),
+        "recency": int(weights.recency * score.recency_penalty),
+        "time_unknown": weights.time_unknown if score.time_minutes is None else 0,
+        "season": -int(weights.season * score.season_bonus),
+        "fit": -int(weights.fit * fit),
     }
 
 
@@ -100,7 +102,7 @@ def explain(score: CandidateScore, context: ExplainContext) -> list[dict[str, An
     reasons: list[Reason] = []
 
     # Доводы «за» из целевой функции: берём самые сильные отрицательные вклады.
-    parts = contributions(score, context.meal_type, context.cost_factor)
+    parts = contributions(score, context.meal_type, context.weights)
     for term, value in sorted(parts.items(), key=lambda item: item[1]):
         if value > -MIN_CONTRIBUTION:
             break

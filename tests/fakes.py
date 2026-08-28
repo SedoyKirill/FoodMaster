@@ -614,6 +614,7 @@ class FakeRepository:
         cuisines: list[str],
         price_tier: str,
         plan: dict[str, Any],
+        mode: str = "balanced",
     ) -> str:
         plan_id = str(uuid.uuid4())
         shopping = []
@@ -633,6 +634,7 @@ class FakeRepository:
             "total_cost_items": plan["total_cost_items"],
             "cuisine_preferences": cuisines,
             "price_tier": price_tier,
+            "mode": mode,
             "status": "draft",
             "created_at": datetime.now(timezone.utc).isoformat(),
             # У блюда есть id: без него PATCH статуса и замена неадресуемы.

@@ -9,42 +9,16 @@ warnings, а не молча повторяет блюдо — дефект P2 �
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from typing import Any
 
 from .candidates import CandidateScore
+from .weights import WeightProfile, weights_for
 
-# Веса целевой функции (×10, чтобы дроби вроде 0.3·W_COST оставались целыми).
-# Калибровка к стоимости: 100 условных единиц ≈ 10 ₽ при «Сбалансированно» —
-# иначе цена задавила бы все вкусовые сигналы и меню состояло бы из самых
-# дешёвых блюд библиотеки (проверено на живых данных: хлеб на все обеды).
-W_COST = 10
-W_BUDGET = 500
-W_KCAL = 50
-W_WASTE = 300
-W_VARIETY = 400
-W_TASTE = 500
-W_CUISINE = 200
-W_FIT = 300
-# TZ-M8 §4: вкус семьи заменил звёзды в целевой функции. rating_bonus из
-# данных не удалён, но в коэффициент больше не входит — оценка теперь одно из
-# событий вкуса наравне с заменами и «приготовили».
-W_TASTE_AFFINITY = 600
-# Блюдо, о котором семья ничего не знает, слегка проигрывает знакомому: без
-# этого меню новичка состояло бы из случайных находок каталога.
-W_UNKNOWN = 150
-# TZ-M8 §3.7: блюдо, которое ели вчера, должно проигрывать такому же, которого
-# не было три недели. Вес сопоставим с рейтингом: ротация важна, но не важнее
-# того, что семья действительно любит.
-W_RECENCY = 400
-# Сезонность — приятный, но не решающий сигнал (§3.6).
-W_SEASON = 100
-# Пустой слот хуже любого реалистичного перерасхода бюджета: план с дырами —
-# крайняя мера при настоящей нехватке рецептов, а не способ «сэкономить».
-W_EMPTY_SLOT = 10_000_000
-
-#: множитель к W_COST по ценовой стратегии (×10: 3 / 1 / 0.3)
-PRICE_TIER_COST_FACTOR = {"economy": 30, "balanced": 10, "premium": 3}
-
+# Веса целевой функции переехали в weights.py: до M8 набор был один на всех,
+# теперь семья выбирает режим, и «экономно» отличается от «разнообразно» не
+# подсказкой в интерфейсе, а числами (TZ-M8 §6.4). Здесь остаются только
+# параметры самого решателя.
 SOLVER_TIME_LIMIT_SECONDS = 10.0
 SOLVER_WORKERS = 4
 MAX_CANDIDATES_PER_SLOT = 40
@@ -56,6 +30,19 @@ MAX_USES_PER_HORIZON = 2
 DISH_TYPE_DAYS_PER_USE = 3
 
 Slot = tuple[int, str]  # (индекс дня, meal_type)
+
+#: Коридор отклонения от цели по калориям: слот держится мягче дня — ужин
+#: бывает плотнее обеда, а вот день, вылетевший на четверть, семья замечает.
+KCAL_SLOT_TOLERANCE = 0.15
+KCAL_DAY_TOLERANCE = 0.10
+
+
+@dataclass(frozen=True)
+class SlotTarget:
+    """Цель слота по калориям и белку — сумма норм тех, кто его ест дома."""
+
+    kcal: int = 0
+    protein_g: int = 0
 
 
 def stable_tiebreak(recipe_id: int, plan_key: str) -> int:
@@ -76,22 +63,145 @@ def dish_type_cap(days: int, distinct_types: int) -> int:
 
 
 def slot_coefficient(
-    score: CandidateScore, meal_type: str, cost_factor: int
+    score: CandidateScore,
+    meal_type: str,
+    weights: WeightProfile,
+    time_limit: int | None = None,
 ) -> int:
-    """Вклад назначения блюда в целевую функцию (меньше — лучше)."""
+    """Вклад назначения блюда в целевую функцию (меньше — лучше).
+
+    Единственная формула на солвер, жадный запасной алгоритм, ранжирование
+    кандидатов и список замен (TZ-M5R §2.3, TZ-M8 §6.1). Веса приходят из
+    режима семьи; ``time_limit`` — мягкая граница времени для этого слота.
+    """
     fit = score.meal_fit.get(meal_type, 0.0) + score.meal_bias.get(meal_type, 0.0)
+    over_minutes = 0
+    if time_limit and score.time_minutes:
+        over_minutes = max(0, int(score.time_minutes) - int(time_limit))
     value = (
-        cost_factor * (score.cost_kop // 100)
-        + W_TASTE * score.dislike_penalty
-        - W_WASTE * score.expiry_bonus
-        - W_CUISINE * score.cuisine_bonus
-        - int(W_TASTE_AFFINITY * score.affinity)
-        + int(W_UNKNOWN * score.unknown)
-        + int(W_RECENCY * score.recency_penalty)
-        - int(W_SEASON * score.season_bonus)
-        - int(W_FIT * fit)
+        weights.cost * (score.cost_kop // 100)
+        + int(weights.dislike * score.dislike_penalty)
+        - weights.waste * score.expiry_bonus
+        - weights.cuisine * score.cuisine_bonus
+        - int(weights.taste * score.affinity)
+        + int(weights.unknown * score.unknown)
+        + int(weights.recency * score.recency_penalty)
+        + weights.time * (over_minutes // 15)
+        + (weights.time_unknown if score.time_minutes is None else 0)
+        - int(weights.season * score.season_bonus)
+        - int(weights.fit * fit)
     )
     return value
+
+
+def _slot_protein(
+    scores: dict[int, CandidateScore], candidates: list[int]
+) -> dict[int, int]:
+    """Белок кандидатов слота; неизвестный — медиана известных, а не ноль.
+
+    Иначе блюда без разметки КБЖУ выглядели бы «безбелковыми» и в режиме
+    «фитнес» проигрывали бы всё подряд просто потому, что о них нет данных.
+    """
+    known = sorted(
+        scores[recipe_id].protein_g
+        for recipe_id in candidates
+        if scores[recipe_id].protein_g is not None
+    )
+    if not known:
+        return {}
+    median = known[len(known) // 2]
+    return {
+        recipe_id: (
+            scores[recipe_id].protein_g
+            if scores[recipe_id].protein_g is not None
+            else median
+        )
+        for recipe_id in candidates
+    }
+
+
+def _add_kcal_terms(
+    *,
+    model: Any,
+    objective: list[Any],
+    days: int,
+    meal_types: list[str],
+    candidates_by_slot: dict[Slot, list[int]],
+    scores: dict[int, CandidateScore],
+    slot_targets: dict[Slot, SlotTarget],
+    x: dict[tuple[int, int, str], Any],
+    weights: WeightProfile,
+) -> None:
+    """Мягкие коридоры калорий: ±15 % на слот, ±10 % на день (§6.2)."""
+    for day in range(days):
+        day_terms: list[Any] = []
+        day_target = 0
+        for meal in meal_types:
+            target = slot_targets.get((day, meal))
+            if target is None or not target.kcal:
+                continue
+            slot_kcal = sum(
+                ((scores[recipe_id].kcal or 0) // 100) * x[recipe_id, day, meal]
+                for recipe_id in candidates_by_slot.get((day, meal), [])
+                if scores[recipe_id].kcal
+            )
+            if isinstance(slot_kcal, int):
+                continue  # у кандидатов слота нет оценок калорий
+            day_terms.append(slot_kcal)
+            day_target += target.kcal
+            low = int(target.kcal * (1 - KCAL_SLOT_TOLERANCE)) // 100
+            high = int(target.kcal * (1 + KCAL_SLOT_TOLERANCE)) // 100
+            over = model.NewIntVar(0, 10**6, f"kcal_over_{day}_{meal}")
+            under = model.NewIntVar(0, 10**6, f"kcal_under_{day}_{meal}")
+            model.Add(over >= slot_kcal - high)
+            model.Add(under >= low - slot_kcal)
+            objective.append(weights.kcal * (over + under))
+        if not day_terms or not day_target:
+            continue
+        low = int(day_target * (1 - KCAL_DAY_TOLERANCE)) // 100
+        high = int(day_target * (1 + KCAL_DAY_TOLERANCE)) // 100
+        over = model.NewIntVar(0, 10**6, f"kcal_over_day_{day}")
+        under = model.NewIntVar(0, 10**6, f"kcal_under_day_{day}")
+        model.Add(over >= sum(day_terms) - high)
+        model.Add(under >= low - sum(day_terms))
+        objective.append(weights.kcal * (over + under))
+
+
+def _add_protein_terms(
+    *,
+    model: Any,
+    objective: list[Any],
+    days: int,
+    meal_types: list[str],
+    candidates_by_slot: dict[Slot, list[int]],
+    scores: dict[int, CandidateScore],
+    slot_targets: dict[Slot, SlotTarget],
+    x: dict[tuple[int, int, str], Any],
+    weights: WeightProfile,
+) -> None:
+    """Недобор белка за день (§6.2): перебор белка не штрафуется."""
+    for day in range(days):
+        day_terms: list[Any] = []
+        day_target = 0
+        for meal in meal_types:
+            target = slot_targets.get((day, meal))
+            if target is None or not target.protein_g:
+                continue
+            candidates = candidates_by_slot.get((day, meal), [])
+            protein = _slot_protein(scores, candidates)
+            if not protein:
+                continue
+            day_terms.append(
+                sum(protein[recipe_id] * x[recipe_id, day, meal] for recipe_id in candidates)
+            )
+            day_target += target.protein_g
+        if not day_terms or not day_target:
+            continue
+        # Вес задан «за 10 г недобора», поэтому переменная считает десятки:
+        # 10·under ≥ дефицит даёт округление вверх без деления в модели.
+        under = model.NewIntVar(0, 10**5, f"protein_under_{day}")
+        model.Add(10 * under >= day_target - sum(day_terms))
+        objective.append(weights.protein * under)
 
 
 def _solve_cpsat(
@@ -101,8 +211,9 @@ def _solve_cpsat(
     candidates_by_slot: dict[Slot, list[int]],
     scores: dict[int, CandidateScore],
     budget_kop: int | None,
-    daily_kcal_target: int | None,
-    cost_factor: int,
+    slot_targets: dict[Slot, SlotTarget],
+    weights: WeightProfile,
+    time_limits: dict[Slot, int | None],
     time_limit_seconds: float,
 ) -> tuple[dict[Slot, int | None], str] | None:
     try:
@@ -123,12 +234,15 @@ def _solve_cpsat(
             x[recipe_id, day, meal] = variable
             slot_vars.append(variable)
             objective.append(
-                slot_coefficient(scores[recipe_id], meal, cost_factor) * variable
+                slot_coefficient(
+                    scores[recipe_id], meal, weights, time_limits.get((day, meal))
+                )
+                * variable
             )
         empty_var = model.NewBoolVar(f"empty_{day}_{meal}")
         empty[day, meal] = empty_var
         model.Add(sum(slot_vars) + empty_var == 1)
-        objective.append(W_EMPTY_SLOT * empty_var)
+        objective.append(weights.empty_slot * empty_var)
 
     recipe_ids = sorted({recipe_id for recipe_id, _, _ in x})
     usage: dict[tuple[int, int], Any] = {}
@@ -188,7 +302,7 @@ def _solve_cpsat(
             if day in day_flags and day + 1 in day_flags:
                 repeat = model.NewBoolVar(f"rep_{abs(hash(main)) % 10**8}_{day}")
                 model.Add(day_flags[day] + day_flags[day + 1] - 1 <= repeat)
-                objective.append(W_VARIETY * repeat)
+                objective.append(weights.variety * repeat)
 
     # Бюджет — мягкое ограничение (жёсткое легко даёт infeasible, TZ §2.3).
     if budget_kop is not None:
@@ -198,26 +312,33 @@ def _solve_cpsat(
         )
         over = model.NewIntVar(0, 10**7, "budget_over")
         model.Add(over >= total_cost - budget_kop // 100)
-        objective.append(W_BUDGET * over)
+        objective.append(weights.budget * over)
 
-    # Дневные калории: ±20% мягко.
-    if daily_kcal_target:
-        low = int(daily_kcal_target * 0.8) // 100
-        high = int(daily_kcal_target * 1.2) // 100
-        for day in range(days):
-            day_kcal = sum(
-                ((scores[recipe_id].kcal or 0) // 100) * x[recipe_id, day, meal]
-                for meal in meal_types
-                for recipe_id in candidates_by_slot.get((day, meal), [])
-                if scores[recipe_id].kcal
-            )
-            if isinstance(day_kcal, int):
-                continue  # у кандидатов дня нет оценок калорий
-            over = model.NewIntVar(0, 10**6, f"kcal_over_{day}")
-            under = model.NewIntVar(0, 10**6, f"kcal_under_{day}")
-            model.Add(over >= day_kcal - high)
-            model.Add(under >= low - day_kcal)
-            objective.append(W_KCAL * (over + under))
+    # Калории по слоту и по дню (TZ-M8 §6.2). Раньше цель была одна на семью
+    # и на день: ужин на троих и завтрак на одного оценивались одинаково, и
+    # «день сошёлся» мог означать «обед вдвое, ужин пустой».
+    _add_kcal_terms(
+        model=model,
+        objective=objective,
+        days=days,
+        meal_types=meal_types,
+        candidates_by_slot=candidates_by_slot,
+        scores=scores,
+        slot_targets=slot_targets,
+        x=x,
+        weights=weights,
+    )
+    _add_protein_terms(
+        model=model,
+        objective=objective,
+        days=days,
+        meal_types=meal_types,
+        candidates_by_slot=candidates_by_slot,
+        scores=scores,
+        slot_targets=slot_targets,
+        x=x,
+        weights=weights,
+    )
 
     model.Minimize(sum(objective))
     solver = cp_model.CpSolver()
@@ -247,7 +368,8 @@ def _solve_greedy(
     meal_types: list[str],
     candidates_by_slot: dict[Slot, list[int]],
     scores: dict[int, CandidateScore],
-    cost_factor: int,
+    weights: WeightProfile,
+    time_limits: dict[Slot, int | None],
     plan_key: str,
 ) -> tuple[dict[Slot, int | None], str]:
     """Детерминированный fallback: те же жёсткие ограничения, локальный выбор.
@@ -287,13 +409,15 @@ def _solve_greedy(
                     (meal, score.dish_type), 0
                 ) >= dish_type_caps[meal]:
                     continue
-                penalty = slot_coefficient(score, meal, cost_factor)
+                penalty = slot_coefficient(
+                    score, meal, weights, time_limits.get((day, meal))
+                )
                 main = score.main_ingredient
                 if main and (
                     main in main_by_day[day]
                     or (day > 0 and main in main_by_day[day - 1])
                 ):
-                    penalty += W_VARIETY
+                    penalty += weights.variety
                 candidate = (penalty, stable_tiebreak(recipe_id, f"{plan_key}:{day}:{meal}"), recipe_id)
                 if best is None or candidate < best:
                     best = candidate
@@ -321,13 +445,17 @@ def optimize(
     candidates_by_slot: dict[Slot, list[int]],
     scores: dict[int, CandidateScore],
     budget_kop: int | None = None,
-    daily_kcal_target: int | None = None,
-    price_tier: str = "balanced",
+    slot_targets: dict[Slot, SlotTarget] | None = None,
+    mode: str | None = None,
+    weights: WeightProfile | None = None,
+    time_limits: dict[Slot, int | None] | None = None,
     plan_key: str = "",
     time_limit_seconds: float = SOLVER_TIME_LIMIT_SECONDS,
 ) -> tuple[dict[Slot, int | None], str]:
     """Назначение блюд по слотам: CP-SAT, при недоступности/неудаче — жадный."""
-    cost_factor = PRICE_TIER_COST_FACTOR.get(price_tier, 10)
+    profile = weights or weights_for(mode)
+    targets = slot_targets or {}
+    limits = time_limits or {}
     trimmed = {
         slot: candidates[:MAX_CANDIDATES_PER_SLOT]
         for slot, candidates in candidates_by_slot.items()
@@ -338,8 +466,9 @@ def optimize(
         candidates_by_slot=trimmed,
         scores=scores,
         budget_kop=budget_kop,
-        daily_kcal_target=daily_kcal_target,
-        cost_factor=cost_factor,
+        slot_targets=targets,
+        weights=profile,
+        time_limits=limits,
         time_limit_seconds=time_limit_seconds,
     )
     if solved is not None:
@@ -349,6 +478,7 @@ def optimize(
         meal_types=meal_types,
         candidates_by_slot=trimmed,
         scores=scores,
-        cost_factor=cost_factor,
+        weights=profile,
+        time_limits=limits,
         plan_key=plan_key,
     )

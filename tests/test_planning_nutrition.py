@@ -9,7 +9,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.web.planner import _meal_nutrition
 from app.web.planning.candidates import CandidateScore
-from app.web.planning.optimizer import W_TASTE_AFFINITY, W_UNKNOWN, slot_coefficient
+from app.web.planning.optimizer import slot_coefficient
+from app.web.planning.weights import weights_for
 
 
 class _StubMatcher:
@@ -70,29 +71,33 @@ class TasteAffinityTests(unittest.TestCase):
         return score
 
     def test_loved_dish_beats_neutral_and_disliked(self) -> None:
+        weights = weights_for("balanced")
         loved = self._score(1, 1.0)
         neutral = self._score(2, 0.0)
         disliked = self._score(3, -1.0)
         self.assertLess(
-            slot_coefficient(loved, "dinner", 10),
-            slot_coefficient(neutral, "dinner", 10),
+            slot_coefficient(loved, "dinner", weights),
+            slot_coefficient(neutral, "dinner", weights),
         )
         self.assertGreater(
-            slot_coefficient(disliked, "dinner", 10),
-            slot_coefficient(neutral, "dinner", 10),
+            slot_coefficient(disliked, "dinner", weights),
+            slot_coefficient(neutral, "dinner", weights),
         )
         self.assertEqual(
-            slot_coefficient(neutral, "dinner", 10) - slot_coefficient(loved, "dinner", 10),
-            W_TASTE_AFFINITY,
+            slot_coefficient(neutral, "dinner", weights)
+            - slot_coefficient(loved, "dinner", weights),
+            weights.taste,
         )
 
     def test_unknown_dish_is_slightly_behind_a_known_neutral_one(self) -> None:
+        weights = weights_for("balanced")
         known = self._score(1, 0.0)
         unknown = self._score(2, 0.0)
         unknown.unknown = True
         self.assertEqual(
-            slot_coefficient(unknown, "dinner", 10) - slot_coefficient(known, "dinner", 10),
-            W_UNKNOWN,
+            slot_coefficient(unknown, "dinner", weights)
+            - slot_coefficient(known, "dinner", weights),
+            weights.unknown,
         )
 
 

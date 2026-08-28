@@ -877,33 +877,26 @@ def _meal_nutrition(
     }
 
 
-def _make_kcal_hint(nutrition: dict[str, dict[str, Any]] | None):
-    """Ккал ингредиента для скоринга: таблица Haiku → substring-справочник."""
+def _make_macros_hint(nutrition: dict[str, dict[str, Any]] | None):
+    """КБЖУ ингредиента для скоринга: таблица Haiku → substring-справочник.
+
+    Возвращает четвёрку (ккал, Б, Ж, У): белок кандидата входит в целевую
+    функцию (TZ-M8 §6.2), поэтому одних калорий солверу больше не хватает.
+    Substring-справочник знает только калории — БЖУ там честно None.
+    """
 
     def _hint(
         name: str, canonical: str, quantity: Decimal | None, unit: str | None
-    ) -> Decimal | None:
+    ) -> tuple[Decimal | None, Decimal | None, Decimal | None, Decimal | None]:
         if nutrition:
             row = nutrition.get(canonical) or nutrition.get(name.strip().lower())
             if row is not None:
                 result = nutrition_from_row(row, name, quantity, unit)
                 if result is not None:
-                    return result[0]
-        return ingredient_kcal(canonical or name, quantity, unit)
+                    return result
+        return ingredient_kcal(canonical or name, quantity, unit), None, None, None
 
     return _hint
-
-
-def _daily_kcal_target(people: list[dict[str, Any]]) -> int:
-    """Дневная цель семьи: target_kcal людей (B3), без цели — честные константы."""
-    total = 0
-    for person in people:
-        target = person.get("target_kcal")
-        if target:
-            total += int(target)
-        else:
-            total += DEFAULT_TARGET_KCAL.get(str(person.get("person_type") or "adult"), 2000)
-    return total
 
 
 def build_plan(
@@ -918,7 +911,7 @@ def build_plan(
     inventory: list[dict[str, Any]],
     recipes: list[dict[str, Any]],
     products: list[dict[str, Any]],
-    price_tier: str = "balanced",
+    price_tier: str | None = None,
     product_matcher: ProductMatcher | None = None,
     budget_kop: int | None = None,
     synonyms: Any = None,
@@ -929,6 +922,7 @@ def build_plan(
     history: list[dict[str, Any]] | None = None,
     plan_profile: dict[str, Any] | None = None,
     taste_events: list[dict[str, Any]] | None = None,
+    mode: str | None = None,
 ) -> dict[str, Any]:
     """Фасад TZ-M5R: кандидаты → оценка → оптимизация → масштабирование → покупки.
 
@@ -938,6 +932,8 @@ def build_plan(
     (мягкое предпочтение: кухня даёт бонус, но не отсекает кандидатов).
     ``history`` — блюда семьи за три недели (ротация, TZ-M8 §3.7),
     ``plan_profile`` — лимиты времени и прочие настройки семьи (§3.4).
+    ``mode`` — режим планирования (§6.4): он задаёт веса целевой функции и,
+    если ``price_tier`` не передан явно, ценовую стратегию матчера товаров.
     """
     from .planning import candidates as candidates_mod
     from .planning import context as context_mod
@@ -947,6 +943,8 @@ def build_plan(
     from .planning import scaling as scaling_mod
     from .planning import taste as taste_mod
     from .planning import shopping as shopping_mod
+    from .planning import features as features_mod
+    from .planning import weights as weights_mod
     from .planning.candidates import (
         MIN_READY_CANDIDATES, Synonyms, hard_rule_terms, ingredient_matches_terms,
         score_candidates,
@@ -958,6 +956,11 @@ def build_plan(
         synonyms_dict = Synonyms.from_rows(synonyms or [])
 
     available_appliances = set(appliances)
+    # Режим планирования (§6.4) — единственный источник весов; ценовая
+    # стратегия матчера выводится из него, но явный price_tier сильнее.
+    plan_mode = mode or (plan_profile or {}).get("mode")
+    weights = weights_mod.weights_for(plan_mode)
+    price_tier = price_tier or weights_mod.price_tier_for(plan_mode)
 
     # TZ-M8 §3.1–3.2: слот принадлежит тем, кто ест его дома. Приём, который
     # дома не ест никто, не планируется вовсе; жёсткое правило действует на
@@ -1040,7 +1043,7 @@ def build_plan(
             ingredient, product_matcher, price_tier, needed, unit
         ),
         meal_score=_meal_score,
-        kcal_hint=_make_kcal_hint(nutrition),
+        macros_hint=_make_macros_hint(nutrition),
         base_quantity=_base_quantity,
         scale_of=_scale_of,
     )
@@ -1070,13 +1073,14 @@ def build_plan(
         if recipe.get("time_total_minutes") is not None:
             score.time_minutes = int(recipe["time_total_minutes"])
 
-    cost_factor = optimizer_mod.PRICE_TIER_COST_FACTOR.get(price_tier, 10)
+    features_mod.attach_bases(scores, pool, synonyms_dict, _normal)
     cuisine_set = set(cuisines)
     matches_cuisine = {
         int(recipe["id"]): cuisine_matches(recipe, cuisine_set) for recipe in pool
     }
     needed_distinct = _min_distinct_for_horizon(days)
     candidates_by_slot: dict[tuple[int, str], list[int]] = {}
+    slot_time_limits: dict[tuple[int, str], int | None] = {}
     slot_warnings: list[str] = []
     profile = plan_profile or {}
     cooking_minutes = {
@@ -1116,7 +1120,7 @@ def build_plan(
             (int(recipe["id"]) for recipe in eligible),
             key=lambda recipe_id: (
                 scores[recipe_id].meal_fit.get(meal_type, 0.0) <= 0,
-                optimizer_mod.slot_coefficient(scores[recipe_id], meal_type, cost_factor),
+                optimizer_mod.slot_coefficient(scores[recipe_id], meal_type, weights),
                 optimizer_mod.stable_tiebreak(recipe_id, f"{plan_key}:{meal_type}"),
             ),
         )
@@ -1161,18 +1165,35 @@ def build_plan(
         for day in range(days):
             context = context_mod.day_context(starts_on + timedelta(days=day))
             limit = context_mod.slot_time_limit(meal_type, context, profile)
+            slot_time_limits[day, meal_type] = limit
             candidates_by_slot[day, meal_type] = _fit_time_limit(
                 slot_list, limit, cooking_minutes, slot_warnings, context, meal_type
             )
 
+    # Цели слота — суммы норм тех, кто ест этот приём дома (§6.2). Норма
+    # считается на дату слота, а не на первый день плана: у ребёнка внутри
+    # двухнедельного горизонта может смениться возрастная группа.
+    slot_targets = {
+        (day, meal_type): optimizer_mod.SlotTarget(
+            kcal=profile_mod.slot_kcal_target(
+                people, meal_type, starts_on + timedelta(days=day)
+            ),
+            protein_g=profile_mod.slot_protein_target(
+                people, meal_type, starts_on + timedelta(days=day)
+            ),
+        )
+        for day in range(days)
+        for meal_type in meal_types
+    }
     assignment, solver_status = optimizer_mod.optimize(
         days=days,
         meal_types=meal_types,
         candidates_by_slot=candidates_by_slot,
         scores=scores,
         budget_kop=budget_kop,
-        daily_kcal_target=_daily_kcal_target(people),
-        price_tier=price_tier,
+        slot_targets=slot_targets,
+        weights=weights,
+        time_limits=slot_time_limits,
         plan_key=plan_key,
     )
 
@@ -1242,7 +1263,7 @@ def build_plan(
                 score,
                 explain_mod.ExplainContext(
                     meal_type=meal_type,
-                    cost_factor=cost_factor,
+                    weights=weights,
                     median_cost_kop=median_cost_by_slot.get((day_index, meal_type)),
                     expiring_names=tuple(
                         name for name in ingredient_names if name in expiring_names
@@ -1508,7 +1529,7 @@ def _alternative_cards(
     current: dict[str, Any] | None,
     meal_type: str,
     meal_date: date,
-    cost_factor: int,
+    weights: Any,
     people: list[dict[str, Any]],
     ratings: dict[int, int],
     history: Any,
@@ -1539,7 +1560,7 @@ def _alternative_cards(
                 score,
                 explain_mod.ExplainContext(
                     meal_type=meal_type,
-                    cost_factor=cost_factor,
+                    weights=weights,
                     median_cost_kop=median_cost,
                     days_since=history.days_since(recipe_id),
                     rating=ratings.get(recipe_id),
@@ -1602,7 +1623,7 @@ def slot_alternatives(
     inventory: list[dict[str, Any]],
     recipes: list[dict[str, Any]],
     products: list[dict[str, Any]],
-    price_tier: str = "balanced",
+    price_tier: str | None = None,
     product_matcher: ProductMatcher | None = None,
     synonyms: Any = None,
     ratings: dict[int, int] | None = None,
@@ -1612,6 +1633,7 @@ def slot_alternatives(
     plan_profile: dict[str, Any] | None = None,
     taste_events: list[dict[str, Any]] | None = None,
     with_details: bool = False,
+    mode: str | None = None,
 ) -> list[dict[str, Any]]:
     """Кандидаты на один слот при зафиксированных остальных блюдах (TZ-M5R §3).
 
@@ -1628,6 +1650,7 @@ def slot_alternatives(
     from .planning import context as context_mod
     from .planning import optimizer as optimizer_mod
     from .planning import taste as taste_mod
+    from .planning import weights as weights_mod
     from .planning.candidates import (
         Synonyms, hard_rule_terms, ingredient_matches_terms, score_candidates,
     )
@@ -1635,6 +1658,11 @@ def slot_alternatives(
     synonyms_dict = synonyms if isinstance(synonyms, Synonyms) else Synonyms.from_rows(synonyms or [])
     banned = hard_rule_terms(rules, synonyms_dict, _normal)
     available_appliances = set(appliances)
+    # Замены ранжируются той же формулой и теми же весами, что и план:
+    # иначе «лучшая альтернатива» была бы лучшей по другому критерию.
+    plan_mode = mode or (plan_profile or {}).get("mode")
+    weights = weights_mod.weights_for(plan_mode)
+    price_tier = price_tier or weights_mod.price_tier_for(plan_mode)
 
     blocked_ids: set[int] = set()
     use_count: dict[int, int] = {}
@@ -1705,7 +1733,7 @@ def slot_alternatives(
             ingredient, product_matcher, price_tier, needed, unit
         ),
         meal_score=_meal_score,
-        kcal_hint=_make_kcal_hint(nutrition),
+        macros_hint=_make_macros_hint(nutrition),
         base_quantity=_base_quantity,
         scale_of=_scale_of,
     )
@@ -1720,13 +1748,12 @@ def slot_alternatives(
             taste_metas[recipe_id], people
         )
         scores[recipe_id].unknown = recipe_id not in taste_known
-    cost_factor = optimizer_mod.PRICE_TIER_COST_FACTOR.get(price_tier, 10)
     ranked = sorted(
         pool,
         key=lambda recipe: (
             scores[int(recipe["id"])].meal_fit.get(meal_type, 0.0) <= 0,
             optimizer_mod.slot_coefficient(
-                scores[int(recipe["id"])], meal_type, cost_factor
+                scores[int(recipe["id"])], meal_type, weights
             ),
             optimizer_mod.stable_tiebreak(int(recipe["id"]), f"replace:{meal_type}"),
         ),
@@ -1767,7 +1794,7 @@ def slot_alternatives(
         current=current_recipe,
         meal_type=meal_type,
         meal_date=meal_date,
-        cost_factor=cost_factor,
+        weights=weights,
         people=people,
         ratings=ratings or {},
         history=context_mod.build_history(history or [], meal_date),

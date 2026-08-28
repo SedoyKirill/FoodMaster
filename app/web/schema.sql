@@ -155,6 +155,12 @@ CREATE TABLE IF NOT EXISTS app_core.meal_plans (
 ALTER TABLE app_core.meal_plans
     ADD COLUMN IF NOT EXISTS price_tier TEXT NOT NULL DEFAULT 'balanced';
 
+-- TZ-M8 §6.4: режим, которым план собран. Нужен не для отчёта: замена блюда
+-- ранжируется теми же весами, что и сам план, а профиль семьи мог с тех пор
+-- поменяться («на этот раз экономно» не должно потом стать «сбалансированно»).
+ALTER TABLE app_core.meal_plans
+    ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'balanced';
+
 -- TZ-M8 §3.4: как эта семья планирует. Раньше кухни, бюджет и стратегия
 -- вводились заново при каждой генерации; теперь они хранятся, а поля формы
 -- переопределяют профиль только на текущий план.
@@ -308,12 +314,16 @@ CREATE INDEX IF NOT EXISTS ix_plan_ingredients_plan
 -- каноническому продукту (агрегация покупок И ограничения); kind='group' —
 -- продукт к аллергенной группе (только ограничения: «мука»→глютен не должна
 -- переименовывать муку в списке покупок).
+-- TZ-M8 §6.1: kind='protein_base' — продукт к белковой базе блюда
+-- (мясо/птица/рыба/яйца/молочное/бобовые/овощи) для разнообразия ужинов.
+-- Отдельный домен, а не 'group': аллергенные группы и белковые базы режут
+-- продукты по-разному, и «сыр» одновременно лактоза и молочная база.
 CREATE TABLE IF NOT EXISTS app_core.ingredient_synonyms (
     term TEXT NOT NULL,
     canonical TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT 'form',
     PRIMARY KEY (term, kind),
-    CHECK (kind IN ('form', 'group'))
+    CHECK (kind IN ('form', 'group', 'protein_base'))
 );
 
 INSERT INTO app_core.ingredient_synonyms (term, canonical, kind) VALUES
@@ -407,7 +417,53 @@ INSERT INTO app_core.ingredient_synonyms (term, canonical, kind) VALUES
     ('мидии', 'морепродукты', 'group'),
     ('гребешки', 'морепродукты', 'group'),
     ('яйцо', 'яйцо', 'group'),
-    ('мед', 'мед', 'group')
+    ('мед', 'мед', 'group'),
+    -- TZ-M8 §6.1: белковая база блюда. Список короткий намеренно: базу даёт
+    -- самый тяжёлый ингредиент, а он у горячего блюда почти всегда отсюда.
+    ('говядина', 'meat', 'protein_base'),
+    ('свинина', 'meat', 'protein_base'),
+    ('баранина', 'meat', 'protein_base'),
+    ('телятина', 'meat', 'protein_base'),
+    ('фарш', 'meat', 'protein_base'),
+    ('мясо', 'meat', 'protein_base'),
+    ('бекон', 'meat', 'protein_base'),
+    ('ветчина', 'meat', 'protein_base'),
+    ('колбаса', 'meat', 'protein_base'),
+    ('сосиски', 'meat', 'protein_base'),
+    ('печень', 'meat', 'protein_base'),
+    ('курица', 'poultry', 'protein_base'),
+    ('куриный', 'poultry', 'protein_base'),
+    ('индейка', 'poultry', 'protein_base'),
+    ('утка', 'poultry', 'protein_base'),
+    ('филе', 'poultry', 'protein_base'),
+    ('рыба', 'fish', 'protein_base'),
+    ('лосось', 'fish', 'protein_base'),
+    ('семга', 'fish', 'protein_base'),
+    ('треска', 'fish', 'protein_base'),
+    ('тунец', 'fish', 'protein_base'),
+    ('скумбрия', 'fish', 'protein_base'),
+    ('сельдь', 'fish', 'protein_base'),
+    ('форель', 'fish', 'protein_base'),
+    ('минтай', 'fish', 'protein_base'),
+    ('горбуша', 'fish', 'protein_base'),
+    ('креветки', 'fish', 'protein_base'),
+    ('кальмар', 'fish', 'protein_base'),
+    ('мидии', 'fish', 'protein_base'),
+    ('яйцо', 'eggs', 'protein_base'),
+    ('яйца', 'eggs', 'protein_base'),
+    ('молоко', 'dairy', 'protein_base'),
+    ('творог', 'dairy', 'protein_base'),
+    ('сыр', 'dairy', 'protein_base'),
+    ('сметана', 'dairy', 'protein_base'),
+    ('сливки', 'dairy', 'protein_base'),
+    ('кефир', 'dairy', 'protein_base'),
+    ('йогурт', 'dairy', 'protein_base'),
+    ('фасоль', 'legumes', 'protein_base'),
+    ('горох', 'legumes', 'protein_base'),
+    ('нут', 'legumes', 'protein_base'),
+    ('чечевица', 'legumes', 'protein_base'),
+    ('соя', 'legumes', 'protein_base'),
+    ('тофу', 'legumes', 'protein_base')
 ON CONFLICT (term, kind) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS app_core.auth_identities (

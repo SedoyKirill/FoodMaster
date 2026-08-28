@@ -25,6 +25,7 @@ from .database import (
     PLANNER_WARM_INTERVAL_SECONDS, AppRepository, AuthenticationError, ConflictError,
 )
 from .planner import build_plan
+from .planning.weights import price_tier_for
 from .ratelimit import RateLimiter
 
 
@@ -444,10 +445,6 @@ async def delete_inventory(item_id: uuid.UUID, repo: Repo, session: Mutating) ->
     return {"ok": True}
 
 
-#: ценовая стратегия матчера, выводимая из режима планирования (TZ-M8 §6.4)
-MODE_PRICE_TIER = {"economy": "economy"}
-
-
 @router.post("/api/plans/generate", status_code=201)
 async def generate_plan(payload: PlanPayload, repo: Repo, session: Mutating) -> dict[str, Any]:
     if session["role"] == "viewer":
@@ -458,7 +455,7 @@ async def generate_plan(payload: PlanPayload, repo: Repo, session: Mutating) -> 
     days = payload.days or int(profile["default_days"])
     cuisines = payload.cuisines if payload.cuisines is not None else list(profile["cuisines"])
     mode = payload.mode or str(profile["mode"])
-    price_tier = payload.price_tier or MODE_PRICE_TIER.get(mode, "balanced")
+    price_tier = payload.price_tier or price_tier_for(mode)
     meals = payload.meals if payload.meals is not None else list(profile["meals"])
     if price_tier not in {"economy", "balanced", "premium"}:
         raise HTTPException(status_code=422, detail="Неизвестная ценовая стратегия")
@@ -481,6 +478,7 @@ async def generate_plan(payload: PlanPayload, repo: Repo, session: Mutating) -> 
                 days=days,
                 cuisines=cuisines,
                 price_tier=price_tier,
+                mode=mode,
                 budget_kop=budget_kop,
                 meals=meals,
                 cuisine_mode=str(profile["cuisine_mode"]),
@@ -490,7 +488,7 @@ async def generate_plan(payload: PlanPayload, repo: Repo, session: Mutating) -> 
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     plan_id = await repo.save_plan(
-        session, payload.starts_on, days, budget_kop, cuisines, price_tier, plan
+        session, payload.starts_on, days, budget_kop, cuisines, price_tier, plan, mode
     )
     plan["id"] = plan_id
     plan["starts_on"] = payload.starts_on

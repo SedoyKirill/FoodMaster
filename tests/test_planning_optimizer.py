@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from app.web.planner import build_plan
 from app.web.planning import optimizer
 from app.web.planning.candidates import CandidateScore
+from app.web.planning.weights import weights_for
 
 try:
     from ortools.sat.python import cp_model  # noqa: F401
@@ -21,13 +22,28 @@ except ImportError:
     HAS_ORTOOLS = False
 
 
-def score(recipe_id, *, cost=0, kcal=None, fit=1.0, cuisine=0, dislike=0, main=None):
+def score(
+    recipe_id,
+    *,
+    cost=0,
+    kcal=None,
+    fit=1.0,
+    cuisine=0,
+    dislike=0,
+    main=None,
+    protein=None,
+    unknown=False,
+    recency=0.0,
+):
     item = CandidateScore(recipe_id)
     item.cost_kop = cost
     item.kcal = kcal
     item.cuisine_bonus = cuisine
     item.dislike_penalty = dislike
     item.main_ingredient = main
+    item.protein_g = protein
+    item.unknown = unknown
+    item.recency_penalty = recency
     item.meal_fit = {"breakfast": fit, "lunch": fit, "dinner": fit}
     return item
 
@@ -81,7 +97,8 @@ class RepetitionTests(unittest.TestCase):
             meal_types=MEALS,
             candidates_by_slot={(d, m): sorted(self.scores) for d in range(7) for m in MEALS},
             scores=self.scores,
-            cost_factor=10,
+            weights=weights_for("balanced"),
+            time_limits={},
             plan_key="test",
         )
         self.assertEqual(status, "greedy")
@@ -165,7 +182,7 @@ class ToyOptimalityTests(unittest.TestCase):
         slots = {(0, "dinner"): [1, 2, 3]}
         assignment, _ = optimizer.optimize(
             days=1, meal_types=["dinner"], candidates_by_slot=slots,
-            scores=scores, price_tier="economy", plan_key="toy",
+            scores=scores, mode="economy", plan_key="toy",
         )
         self.assertEqual(assignment[0, "dinner"], 2)
 
@@ -181,6 +198,59 @@ class ToyOptimalityTests(unittest.TestCase):
             scores=scores, plan_key="toy",
         )
         self.assertEqual(assignment[0, "dinner"], 2)
+
+
+@unittest.skipUnless(HAS_ORTOOLS, "ortools не установлен")
+class ModeTests(unittest.TestCase):
+    """TZ-M8 §6.4: режим семьи — это другие числа, а не подсказка в форме."""
+
+    @staticmethod
+    def _dinner(scores, **kwargs):
+        assignment, _ = optimizer.optimize(
+            days=1,
+            meal_types=["dinner"],
+            candidates_by_slot={(0, "dinner"): sorted(scores)},
+            scores=scores,
+            plan_key="mode",
+            **kwargs,
+        )
+        return assignment[0, "dinner"]
+
+    def test_variety_prefers_the_untried_dish_economy_the_familiar_one(self) -> None:
+        """Знакомое блюдо ели вчера; новое — дороже и без мнения семьи."""
+        scores = {
+            1: score(1, cost=20000, recency=1.0),
+            2: score(2, cost=22000, unknown=True),
+        }
+        self.assertEqual(self._dinner(scores, mode="variety"), 2)
+        self.assertEqual(self._dinner(scores, mode="economy"), 1)
+
+    def test_slot_kcal_target_beats_the_family_sum(self) -> None:
+        """Цель считается по едокам слота: завтрак на одного — не день на троих."""
+        scores = {1: score(1, cost=20000, kcal=600), 2: score(2, cost=20000, kcal=2000)}
+        chosen = self._dinner(
+            scores, slot_targets={(0, "dinner"): optimizer.SlotTarget(kcal=600)}
+        )
+        self.assertEqual(chosen, 1)
+
+    def test_fitness_pays_for_protein_economy_does_not(self) -> None:
+        scores = {
+            1: score(1, cost=25000, protein=40),
+            2: score(2, cost=20000, protein=5),
+        }
+        targets = {(0, "dinner"): optimizer.SlotTarget(protein_g=40)}
+        self.assertEqual(self._dinner(scores, mode="fitness", slot_targets=targets), 1)
+        self.assertEqual(self._dinner(scores, mode="economy", slot_targets=targets), 2)
+
+    def test_unknown_protein_is_imputed_not_counted_as_zero(self) -> None:
+        """Блюдо без разметки КБЖУ не должно проигрывать из-за отсутствия данных."""
+        scores = {1: score(1, cost=20000, protein=40), 2: score(2, cost=19000)}
+        chosen = self._dinner(
+            scores,
+            mode="fitness",
+            slot_targets={(0, "dinner"): optimizer.SlotTarget(protein_g=40)},
+        )
+        self.assertEqual(chosen, 2)
 
 
 class FallbackTests(unittest.TestCase):
@@ -202,7 +272,8 @@ class FallbackTests(unittest.TestCase):
         slots = {(d, m): [1] for d in range(2) for m in MEALS}
         assignment, _ = optimizer._solve_greedy(
             days=2, meal_types=MEALS, candidates_by_slot=slots,
-            scores=scores, cost_factor=10, plan_key="scarce",
+            scores=scores, weights=weights_for("balanced"), time_limits={},
+            plan_key="scarce",
         )
         filled = [v for v in assignment.values() if v is not None]
         self.assertEqual(len(filled), 1)  # день 2 соседний — повтор запрещён

@@ -12,6 +12,7 @@ from app.web.planning.candidates import CandidateScore  # noqa: E402
 from app.web.planning.explain import (  # noqa: E402
     MAX_REASONS, ExplainContext, contributions, explain, main_reason,
 )
+from app.web.planning.weights import weights_for  # noqa: E402
 
 
 def score_for(**fields) -> CandidateScore:
@@ -28,11 +29,11 @@ class ContributionTests(unittest.TestCase):
     """Причины считаются по тем же весам, что и само решение."""
 
     def test_expiring_stock_shows_as_negative_contribution(self) -> None:
-        parts = contributions(score_for(expiry_bonus=2), "dinner", 10)
+        parts = contributions(score_for(expiry_bonus=2), "dinner", weights_for("balanced"))
         self.assertLess(parts["waste"], 0)
 
     def test_recent_dish_contributes_against_itself(self) -> None:
-        parts = contributions(score_for(recency_penalty=1.0), "dinner", 10)
+        parts = contributions(score_for(recency_penalty=1.0), "dinner", weights_for("balanced"))
         self.assertGreater(parts["recency"], 0)
 
 

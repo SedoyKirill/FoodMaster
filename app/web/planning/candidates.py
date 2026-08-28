@@ -1,10 +1,11 @@
 """Кандидаты и оценка блюд (TZ-M5R §2.1–2.2).
 
-Синонимы приходят из ``app_core.ingredient_synonyms`` разделёнными на два
+Синонимы приходят из ``app_core.ingredient_synonyms`` разделёнными на три
 словаря: ``forms`` (словоформа → канонический продукт, используется и в
-агрегации покупок, и в ограничениях) и ``groups`` (канонический продукт →
-аллергенная группа, только ограничения). Никаких substring-эвристик:
-правило матчит ингредиент только через словарь или точное совпадение токена.
+агрегации покупок, и в ограничениях), ``groups`` (канонический продукт →
+аллергенная группа, только ограничения) и ``bases`` (продукт → белковая база
+блюда, TZ-M8 §6.1). Никаких substring-эвристик: правило матчит ингредиент
+только через словарь или точное совпадение токена.
 """
 
 from __future__ import annotations
@@ -23,30 +24,32 @@ MIN_READY_CANDIDATES = 60
 
 
 class Synonyms:
-    """Словарь синонимов с двумя доменами: словоформы и аллергенные группы."""
+    """Словарь синонимов: словоформы, аллергенные группы и белковые базы."""
 
     def __init__(
         self,
         forms: dict[str, str] | None = None,
         groups: dict[str, str] | None = None,
+        bases: dict[str, str] | None = None,
     ) -> None:
         self.forms = forms or {}
         self.groups = groups or {}
+        #: продукт → белковая база блюда (TZ-M8 §6.1)
+        self.bases = bases or {}
 
     @classmethod
     def from_rows(cls, rows: list[dict[str, Any]]) -> "Synonyms":
         forms: dict[str, str] = {}
         groups: dict[str, str] = {}
+        bases: dict[str, str] = {}
+        by_kind = {"group": groups, "protein_base": bases}
         for row in rows:
             term = str(row.get("term") or "").strip().casefold()
             canonical = str(row.get("canonical") or "").strip().casefold()
             if not term or not canonical:
                 continue
-            if row.get("kind") == "group":
-                groups[term] = canonical
-            else:
-                forms[term] = canonical
-        return cls(forms, groups)
+            by_kind.get(str(row.get("kind")), forms)[term] = canonical
+        return cls(forms, groups, bases)
 
     def canonical_token(self, token: str) -> str:
         return self.forms.get(token, token)
@@ -174,6 +177,8 @@ class CandidateScore:
         "recency_penalty", "season_bonus", "time_minutes",
         # TZ-M8 §4: вкус семьи вместо одной звезды на рецепт
         "affinity", "unknown",
+        # TZ-M8 §6.1: БЖУ на семью и белковая база блюда
+        "protein_g", "fat_g", "carb_g", "protein_base",
     )
 
     def __init__(self, recipe_id: int) -> None:
@@ -201,6 +206,12 @@ class CandidateScore:
         self.affinity = 0.0
         #: семья не имеет об этом блюде никакого мнения
         self.unknown = True
+        #: белок блюда на семью, граммы; None — оценить не по чему
+        self.protein_g: int | None = None
+        self.fat_g: int | None = None
+        self.carb_g: int | None = None
+        #: белковая база блюда (features.PROTEIN_BASES)
+        self.protein_base: str = "veg"
 
 
 def _expiring_canonicals(
@@ -269,7 +280,7 @@ def score_candidates(
     tokens: Any,
     cost_hint: Any,
     meal_score: Any,
-    kcal_hint: Any = None,
+    macros_hint: Any = None,
     base_quantity: Any = None,
     scale_of: Any = None,
 ) -> dict[int, CandidateScore]:
@@ -342,6 +353,8 @@ def score_candidates(
             scale = Decimal("1")
         kcal_total = Decimal("0")
         kcal_known = False
+        macros_total = {"protein": Decimal("0"), "fat": Decimal("0"), "carb": Decimal("0")}
+        macros_known = False
         matched_costs: list[int] = []
         unmatched = 0
         for ingredient in recipe.get("ingredients", []):
@@ -361,15 +374,22 @@ def score_candidates(
             else:
                 needed = quantity_decimal
             # K2/N2: словоформы («масла», «муки») приводятся к канону, иначе
-            # substring-справочник ккал молча промахивается. kcal_hint —
+            # substring-справочник ккал молча промахивается. macros_hint —
             # инъекция из planner: сначала таблица ingredient_nutrition.
-            if kcal_hint is not None:
-                kcal = kcal_hint(name, canonical, needed, unit)
+            # TZ-M8 §6.2: белок кандидата нужен целевой функции, поэтому
+            # подсказка отдаёт не одни калории, а КБЖУ.
+            if macros_hint is not None:
+                kcal, protein, fat, carb = macros_hint(name, canonical, needed, unit)
             else:
                 kcal = ingredient_kcal(canonical or name, needed, unit)
+                protein = fat = carb = None
             if kcal is not None:
                 kcal_total += kcal
                 kcal_known = True
+            for key, value in (("protein", protein), ("fat", fat), ("carb", carb)):
+                if value is not None:
+                    macros_total[key] += value
+                    macros_known = True
             needed_base, unit_base = (
                 base_quantity(needed, unit) if base_quantity is not None else (None, None)
             )
@@ -388,6 +408,10 @@ def score_candidates(
                 matched_costs.append(item_cost)
         if kcal_known:
             score.kcal = int(kcal_total)
+        if macros_known:
+            score.protein_g = int(macros_total["protein"])
+            score.fat_g = int(macros_total["fat"])
+            score.carb_g = int(macros_total["carb"])
         raw_costs[recipe_id] = (sum(matched_costs), unmatched)
         all_item_costs.extend(matched_costs)
         if unmatched:

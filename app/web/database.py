@@ -1276,6 +1276,7 @@ class AppRepository:
         cuisines: list[str],
         price_tier: str,
         plan: dict[str, Any],
+        mode: str = "balanced",
     ) -> str:
         plan_id = uuid.uuid4()
         async with self.db().acquire() as connection, connection.transaction():
@@ -1284,14 +1285,15 @@ class AppRepository:
                 INSERT INTO app_core.meal_plans (
                     id, household_id, starts_on, days, budget_kop, estimated_cost_kop,
                     matched_cost_items, total_cost_items, cuisine_preferences,
-                    price_tier, created_by, solver_status, plan_warnings
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13::jsonb)
+                    price_tier, created_by, solver_status, plan_warnings, mode
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,$12,$13::jsonb,$14)
                 """,
                 plan_id, session["household_id"], starts_on, days, budget_kop,
                 plan["estimated_cost_kop"], plan["matched_cost_items"], plan["total_cost_items"],
                 json.dumps(cuisines, ensure_ascii=False), price_tier, session["user_id"],
                 plan.get("solver_status"),
                 json.dumps(plan.get("warnings") or [], ensure_ascii=False),
+                mode,
             )
             for position, meal in enumerate(plan["meals"], 1):
                 await connection.execute(
@@ -1433,7 +1435,8 @@ class AppRepository:
         if session["role"] == "viewer":
             raise PermissionError("Режим просмотра не позволяет менять план")
         header = await self.db().fetchrow(
-            "SELECT id, price_tier, cuisine_preferences FROM app_core.meal_plans WHERE id=$1 AND household_id=$2",
+            "SELECT id, price_tier, mode, cuisine_preferences FROM app_core.meal_plans "
+            "WHERE id=$1 AND household_id=$2",
             plan_id, session["household_id"],
         )
         if not header:
@@ -1461,6 +1464,7 @@ class AppRepository:
                 ],
                 cuisines=cuisines,
                 price_tier=header["price_tier"],
+                mode=header["mode"],
                 limit=MEAL_ALTERNATIVES_LIMIT if new_recipe_id is None else 1000,
                 with_details=True,
                 **{

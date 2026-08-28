@@ -425,7 +425,8 @@ class MealReplacementTests(unittest.TestCase):
     def _alternatives(self) -> list[dict]:
         pool = FakePool()
         pool.on("fetchrow", "FROM app_core.meal_plans", {
-            "id": self.PLAN_ID, "price_tier": "balanced", "cuisine_preferences": "[]",
+            "id": self.PLAN_ID, "price_tier": "balanced", "mode": "balanced",
+            "cuisine_preferences": "[]",
         })
         pool.on("fetch", "FROM app_core.plan_meals", [{
             "id": self.MEAL_ID, "meal_date": date(2026, 8, 20), "meal_type": "lunch",
