@@ -112,6 +112,27 @@ ALTER TABLE recipe_library.recipes
     -- (soup/salad/steak/…) для фильтров и планировщика.
     ADD COLUMN IF NOT EXISTS dish_type TEXT;
 
+-- TZ-M8 (решение владельца 28.08.2026): кухня остаётся жёстким фильтром, а
+-- значит должна быть у каждого рецепта — и не одна. Блюдо честно бывает
+-- сразу русским и восточноевропейским, а универсальная выпечка не
+-- принадлежит ни одной кухне и получает код 'universal', который проходит
+-- любой фильтр. cuisine_code остаётся главным кодом для совместимости.
+ALTER TABLE recipe_library.recipes
+    ADD COLUMN IF NOT EXISTS cuisine_codes JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+UPDATE recipe_library.recipes
+SET cuisine_codes = jsonb_build_array(cuisine_code)
+WHERE cuisine_codes = '[]'::jsonb AND cuisine_code IS NOT NULL;
+
+-- До волны мультиразметки блюдо без кухни считается универсальным: иначе
+-- жёсткий фильтр молча выкинул бы четверть библиотеки.
+UPDATE recipe_library.recipes
+SET cuisine_codes = '["universal"]'::jsonb
+WHERE cuisine_codes = '[]'::jsonb;
+
+CREATE INDEX IF NOT EXISTS ix_recipes_cuisine_codes
+    ON recipe_library.recipes USING GIN (cuisine_codes);
+
 -- Справочник КБЖУ ингредиентов на 100 г (разметка Haiku-волнами,
 -- загрузка scripts/load_nutrition.py). piece_mass_g — масса одной штуки.
 CREATE TABLE IF NOT EXISTS recipe_library.ingredient_nutrition (

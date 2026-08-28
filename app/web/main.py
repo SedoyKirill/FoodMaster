@@ -478,6 +478,7 @@ async def generate_plan(payload: PlanPayload, repo: Repo, session: Mutating) -> 
                 price_tier=price_tier,
                 budget_kop=budget_kop,
                 meals=meals,
+                cuisine_mode=str(profile["cuisine_mode"]),
                 **data,
             )
         )

@@ -387,7 +387,8 @@ class CuisinePoolTests(unittest.TestCase):
         repository = repository_with_pool(pool)
         run_async(repository.planner_recipe_pool(["asian"]))
         sql, args = pool.first_matching("FROM recipe_library.recipes r")
-        self.assertIn("cuisine_code = ANY", sql)
+        # У рецепта несколько кухонь (TZ-M8): окно добирает по пересечению.
+        self.assertIn("jsonb_exists_any(r.cuisine_codes", sql)
         self.assertIn(["asian"], args)
 
     def test_planner_data_passes_cuisines_to_the_pool(self) -> None:

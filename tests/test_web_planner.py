@@ -493,6 +493,92 @@ class ProductMatcherCacheTests(unittest.TestCase):
         self.assertGreater(plan["estimated_cost_kop"], 0)
 
 
+class MultiCuisineTests(unittest.TestCase):
+    """У рецепта несколько кухонь, «universal» проходит любой фильтр (TZ-M8).
+
+    Владелец оставил кухню жёстким фильтром, поэтому кухня должна быть у
+    каждого рецепта: борщ честно и русский, и восточноевропейский, а
+    универсальная выпечка не притворяется ничьей.
+    """
+
+    @staticmethod
+    def _recipe(recipe_id: int, meal: str, codes: list[str] | None, title: str) -> dict:
+        item = recipe(recipe_id, title, meal)
+        item["cuisine_code"] = codes[0] if codes else None
+        item["cuisine_codes"] = codes or []
+        return item
+
+    def _plan(self, recipes: list[dict], cuisines: list[str], mode: str = "only") -> dict:
+        return build_plan(
+            household_id="household",
+            starts_on=date(2026, 8, 28),
+            days=1,
+            cuisines=cuisines,
+            people=[{"name": "Взрослый", "person_type": "adult", "portion_factor": Decimal("1")}],
+            appliances=[],
+            rules=[],
+            inventory=[],
+            recipes=recipes,
+            products=[],
+            cuisine_mode=mode,
+            meals=["dinner"],
+        )
+
+    def test_second_cuisine_of_a_recipe_counts(self) -> None:
+        """Борщ с двумя кухнями попадает в выбор «восточноевропейская»."""
+        recipes = [
+            self._recipe(1, "dinner", ["russian", "east_european"], "Борщ"),
+            self._recipe(2, "dinner", ["italian"], "Паста карбонара"),
+        ]
+        plan = self._plan(recipes, ["east_european"])
+        self.assertEqual(plan["meals"][0]["title"], "Борщ")
+        self.assertNotIn("cuisine_fallback", plan["meals"][0]["warnings"])
+
+    def test_universal_recipe_passes_any_hard_filter(self) -> None:
+        recipes = [self._recipe(1, "dinner", ["universal"], "Овощное рагу")]
+        plan = self._plan(recipes, ["japanese"])
+        self.assertEqual(plan["meals"][0]["title"], "Овощное рагу")
+        self.assertNotIn("cuisine_fallback", plan["meals"][0]["warnings"])
+
+    def test_recipe_without_codes_is_treated_as_universal(self) -> None:
+        """Разметка ещё не дошла до рецепта — он не выпадает из пула."""
+        recipes = [self._recipe(1, "dinner", None, "Овсяная каша")]
+        plan = self._plan(recipes, ["georgian"])
+        self.assertEqual(len(plan["meals"]), 1)
+
+    def test_foreign_cuisine_is_marked_when_it_is_the_only_option(self) -> None:
+        recipes = [self._recipe(1, "dinner", ["italian"], "Паста карбонара")]
+        plan = self._plan(recipes, ["japanese"])
+        self.assertIn("cuisine_fallback", plan["meals"][0]["warnings"])
+
+    def _slot_candidates(self, recipes: list[dict], mode: str) -> list[int]:
+        captured: dict = {}
+
+        def spy_optimize(**kwargs):
+            captured["slots"] = kwargs["candidates_by_slot"]
+            return {}, "greedy"
+
+        with patch("app.web.planning.optimizer.optimize", side_effect=spy_optimize):
+            self._plan(recipes, ["japanese"], mode=mode)
+        return captured["slots"][0, "dinner"]
+
+    def test_only_mode_hides_other_cuisines_from_the_solver(self) -> None:
+        """Жёсткий режим: пока японских блюд хватает, других солвер не видит."""
+        recipes = [
+            self._recipe(1, "dinner", ["italian"], "Паста карбонара"),
+            self._recipe(2, "dinner", ["japanese"], "Мисо суп"),
+        ]
+        self.assertEqual(self._slot_candidates(recipes, "only"), [2])
+
+    def test_prefer_mode_keeps_other_cuisines_as_candidates(self) -> None:
+        """Мягкий режим: чужая кухня остаётся в пуле, просто без бонуса."""
+        recipes = [
+            self._recipe(1, "dinner", ["italian"], "Паста карбонара"),
+            self._recipe(2, "dinner", ["japanese"], "Мисо суп"),
+        ]
+        self.assertEqual(sorted(self._slot_candidates(recipes, "prefer")), [1, 2])
+
+
 class FamilyCostTests(unittest.TestCase):
     """TZ-M8 T1 (дефект P6): цена кандидата — на семью и за вычетом запасов.
 

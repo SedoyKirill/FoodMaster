@@ -654,7 +654,8 @@ class AppRepository:
             """
             SELECT r.id, r.title, r.source_page_start, r.source_page_end,
                    r.source_servings_min, r.source_servings_max, r.source_yield_text,
-                   r.cuisine_code, r.dish_type, r.meal_types, r.diet_tags, r.appliances,
+                   r.cuisine_code, r.cuisine_codes, r.dish_type, r.meal_types,
+                   r.diet_tags, r.appliances,
                    r.review_status, r.ingredient_count, r.step_count,
                    r.time_total_minutes, r.extraction_confidence,
                    ARRAY(
@@ -668,7 +669,7 @@ class AppRepository:
             FROM recipe_library.recipes r
             WHERE r.review_status <> 'rejected'
               AND ($1 = '' OR r.title ILIKE '%' || $1 || '%')
-              AND ($2 = '' OR r.cuisine_code=$2)
+              AND ($2 = '' OR jsonb_exists(r.cuisine_codes, $2))
               AND ($3 = '' OR r.meal_types ? $3 OR r.meal_types='[]'::jsonb)
               AND ($4 = FALSE OR r.review_status = 'ready')
               AND ($7 = '' OR r.dish_type=$7)
@@ -711,9 +712,11 @@ class AppRepository:
         """
         cuisines = await self.db().fetch(
             """
-            SELECT DISTINCT cuisine_code FROM recipe_library.recipes
-            WHERE review_status <> 'rejected' AND cuisine_code IS NOT NULL
-            ORDER BY cuisine_code
+            SELECT DISTINCT code AS cuisine_code
+            FROM recipe_library.recipes r,
+                 LATERAL jsonb_array_elements_text(r.cuisine_codes) AS code
+            WHERE r.review_status <> 'rejected'
+            ORDER BY code
             """
         )
         meal_types = await self.db().fetch(
@@ -773,7 +776,7 @@ class AppRepository:
             """
             SELECT r.id, r.title, r.source_page_start, r.source_page_end,
                    r.source_servings_min, r.source_servings_max, r.source_yield_text,
-                   r.cuisine_code, r.meal_types, r.diet_tags, r.appliances,
+                   r.cuisine_code, r.cuisine_codes, r.meal_types, r.diet_tags, r.appliances,
                    r.review_status, r.review_reasons, r.ingredient_count, r.step_count,
                    r.time_total_minutes, r.extraction_confidence
             FROM recipe_library.recipes r
@@ -1060,8 +1063,8 @@ class AppRepository:
             """
             WITH picked AS (
                 SELECT r.id, r.title, r.source_page_start, r.source_servings_min,
-                       r.cuisine_code, r.meal_types, r.appliances, r.review_status,
-                       r.extraction_confidence, r.dish_type, r.diet_tags
+                       r.cuisine_code, r.cuisine_codes, r.meal_types, r.appliances,
+                       r.review_status, r.extraction_confidence, r.dish_type, r.diet_tags
                 FROM recipe_library.recipes r
                 WHERE r.review_status IN ('ready', 'needs_review')
                   AND r.ingredient_count >= 3
@@ -1072,13 +1075,13 @@ class AppRepository:
             )
             , cuisine_picked AS (
                 SELECT r.id, r.title, r.source_page_start, r.source_servings_min,
-                       r.cuisine_code, r.meal_types, r.appliances, r.review_status,
-                       r.extraction_confidence, r.dish_type, r.diet_tags
+                       r.cuisine_code, r.cuisine_codes, r.meal_types, r.appliances,
+                       r.review_status, r.extraction_confidence, r.dish_type, r.diet_tags
                 FROM recipe_library.recipes r
                 WHERE r.review_status IN ('ready', 'needs_review')
                   AND r.ingredient_count >= 3
                   AND r.step_count >= 1
-                  AND r.cuisine_code = ANY($2::text[])
+                  AND jsonb_exists_any(r.cuisine_codes, $2::text[])
                   AND r.id NOT IN (SELECT id FROM picked)
                 ORDER BY (r.review_status = 'ready') DESC,
                          r.extraction_confidence DESC NULLS LAST, r.id

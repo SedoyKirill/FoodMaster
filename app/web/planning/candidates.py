@@ -281,7 +281,17 @@ def score_candidates(
         recipe_id = int(recipe["id"])
         score = CandidateScore(recipe_id)
         score.draft = recipe.get("review_status") != "ready"
-        score.cuisine_bonus = 1 if cuisine_set and recipe.get("cuisine_code") in cuisine_set else 0
+        # У рецепта может быть несколько кухонь (TZ-M8): бонус даёт любое
+        # пересечение с выбором семьи; 'universal' бонуса не даёт — он лишь
+        # не мешает блюду попасть в пул.
+        score.cuisine_bonus = (
+            1
+            if cuisine_set
+            and {str(code) for code in json_list(recipe.get("cuisine_codes"))
+                 or ([recipe["cuisine_code"]] if recipe.get("cuisine_code") else [])}
+            & cuisine_set
+            else 0
+        )
         score.dislike_penalty = recipe_matches_terms(recipe, soft_terms, synonyms, normal)
         score.main_ingredient = main_ingredient(recipe, synonyms, normal)
         # Тип блюда нужен оптимизатору: без него три завтрака подряд —

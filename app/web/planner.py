@@ -189,6 +189,12 @@ DESSERT_TITLE_WORDS = ("десерт", "кекс", "парфе", "печенье
 LATIN_WORD_RE = re.compile(r"[a-z]{3,}", re.IGNORECASE)
 
 
+#: Код блюда, которое не принадлежит ни одной кухне (универсальная выпечка,
+#: смузи, детское питание). Проходит любой жёсткий фильтр по кухне: иначе
+#: выбор «итальянская» выкинул бы из пула овсянку и омлет.
+UNIVERSAL_CUISINE = "universal"
+
+
 def json_list(value: Any) -> list[Any]:
     if value is None:
         return []
@@ -919,11 +925,14 @@ def build_plan(
     ratings: dict[int, int] | None = None,
     nutrition: dict[str, dict[str, Any]] | None = None,
     meals: list[str] | None = None,
+    cuisine_mode: str = "only",
 ) -> dict[str, Any]:
     """Фасад TZ-M5R: кандидаты → оценка → оптимизация → масштабирование → покупки.
 
     ``meals`` — какие приёмы планировать вообще (профиль семьи, TZ-M8 §3.4):
     семья, которая завтракает по дороге, не должна получать завтраки.
+    ``cuisine_mode`` — ``only`` (жёсткий фильтр, по умолчанию) или ``prefer``
+    (мягкое предпочтение: кухня даёт бонус, но не отсекает кандидатов).
     """
     from .planning import optimizer as optimizer_mod
     from .planning import profile as profile_mod
@@ -1033,7 +1042,9 @@ def build_plan(
 
     cost_factor = optimizer_mod.PRICE_TIER_COST_FACTOR.get(price_tier, 10)
     cuisine_set = set(cuisines)
-    cuisine_of = {int(recipe["id"]): recipe.get("cuisine_code") for recipe in pool}
+    matches_cuisine = {
+        int(recipe["id"]): cuisine_matches(recipe, cuisine_set) for recipe in pool
+    }
     needed_distinct = _min_distinct_for_horizon(days)
     candidates_by_slot: dict[tuple[int, str], list[int]] = {}
     slot_warnings: list[str] = []
@@ -1094,8 +1105,10 @@ def build_plan(
         # на горизонт, солвер других и не видит. Если не хватает (в библиотеке
         # четыре азиатских завтрака на все дни), слот дополняется остальными —
         # блюдо не своей кухни получит пометку cuisine_fallback.
-        if cuisine_set:
-            preferred = _cuisine_preferred(slot_list, cuisine_of.get, cuisine_set)
+        if cuisine_set and cuisine_mode != "prefer":
+            preferred = [
+                recipe_id for recipe_id in slot_list if matches_cuisine.get(recipe_id)
+            ]
             if len(preferred) >= needed_distinct:
                 slot_list = preferred
             elif preferred:
@@ -1140,7 +1153,7 @@ def build_plan(
                 meal_warnings.append("scale_unknown")
             if score.draft:
                 meal_warnings.append("draft")
-            if cuisine_set and selected.get("cuisine_code") not in cuisine_set:
+            if cuisine_set and not cuisine_matches(selected, cuisine_set):
                 meal_warnings.append("cuisine_fallback")
             for ingredient in selected.get("ingredients", []):
                 meal_ingredients.append(
@@ -1304,11 +1317,20 @@ def _diversify_by_dish_type(recipes: list[dict[str, Any]]) -> list[dict[str, Any
     return result
 
 
-def _cuisine_preferred(
-    candidates: list[Any], cuisine_of: Any, cuisine_set: set[str]
-) -> list[Any]:
-    """Кандидаты выбранных кухонь, порядок сохраняется."""
-    return [item for item in candidates if cuisine_of(item) in cuisine_set]
+def recipe_cuisines(recipe: dict[str, Any]) -> set[str]:
+    """Кухни рецепта. Одна колонка-код осталась для совместимости (TZ-M8)."""
+    codes = {str(code) for code in json_list(recipe.get("cuisine_codes")) if code}
+    if not codes and recipe.get("cuisine_code"):
+        codes = {str(recipe["cuisine_code"])}
+    return codes or {UNIVERSAL_CUISINE}
+
+
+def cuisine_matches(recipe: dict[str, Any], selected: set[str]) -> bool:
+    """Подходит ли блюдо под выбранные кухни (пустой выбор — подходит всё)."""
+    if not selected:
+        return True
+    codes = recipe_cuisines(recipe)
+    return bool(codes & selected) or UNIVERSAL_CUISINE in codes
 
 
 def _min_distinct_for_horizon(days: int) -> int:
@@ -1452,9 +1474,7 @@ def slot_alternatives(
     # своих не хватило на весь список.
     cuisine_set = set(cuisines)
     if cuisine_set:
-        preferred = _cuisine_preferred(
-            ranked, lambda recipe: recipe.get("cuisine_code"), cuisine_set
-        )
+        preferred = [recipe for recipe in ranked if cuisine_matches(recipe, cuisine_set)]
         if preferred:
             preferred_ids = {int(recipe["id"]) for recipe in preferred}
             rest = [recipe for recipe in ranked if int(recipe["id"]) not in preferred_ids]
