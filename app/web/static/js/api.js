@@ -106,9 +106,21 @@ export const api = {
   markPurchased: (planId, itemId, purchased) =>
     request(`/api/plans/${planId}/items/${itemId}`, { method: "PATCH", body: { purchased } }),
 
+  setMealStatus: (planId, mealId, status) =>
+    request(`/api/plans/${planId}/meals/${mealId}`, { method: "PATCH", body: { status } }),
+
   saveSettings: (payload) => request("/api/settings", { method: "PUT", body: payload }),
   patchPerson: (id, changes) =>
     request(`/api/settings/people/${id}`, { method: "PATCH", body: changes }),
+  personTarget: (id) => request(`/api/settings/people/${id}/target`),
+  planProfile: () => request("/api/settings/plan-profile"),
+  savePlanProfile: (payload) =>
+    request("/api/settings/plan-profile", { method: "PUT", body: payload }),
+
+  tasteOnboarding: () => request("/api/taste/onboarding"),
+  saveTasteOnboarding: (answers) =>
+    request("/api/taste/onboarding", { method: "POST", body: { answers } }),
+  tasteSummary: () => request("/api/taste/summary"),
 
   telegramToken: () => request("/api/telegram/link-token", { method: "POST" }),
 };

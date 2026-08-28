@@ -121,6 +121,55 @@ export const PRICE_TIERS = {
   premium: "Премиально",
 };
 
+/* Режимы планирования (TZ-M8 §6.4): за каждым — свой набор весов целевой
+ * функции, поэтому подпись объясняет, чем семья жертвует. */
+export const PLAN_MODES = {
+  balanced: "Сбалансированно",
+  economy: "Экономно",
+  variety: "Разнообразно",
+  fitness: "Фитнес",
+  quick: "Быстро",
+};
+
+export const PLAN_MODE_HINTS = {
+  balanced: "Цена, вкус и разнообразие в равных долях",
+  economy: "Дешевле; чаще повторы и остатки в дело",
+  variety: "Меньше повторов; цена отходит на второй план",
+  fitness: "Держит калории и белок каждого дня",
+  quick: "Короткое время готовки важнее цены",
+};
+
+export const NOVELTY_LEVELS = {
+  low: "Проверенное",
+  medium: "Поровну",
+  high: "Больше нового",
+};
+
+export const ACTIVITY_LEVELS = {
+  low: "Сидячая",
+  moderate: "Обычная",
+  high: "Высокая",
+};
+
+export const GOALS = {
+  maintain: "Держать вес",
+  lose: "Снижать",
+  gain: "Набирать",
+};
+
+export const SEXES = { female: "Женский", male: "Мужской" };
+
+export const TARGET_SOURCES = {
+  manual: "задано вручную",
+  formula: "по росту, весу и возрасту",
+  default: "среднее значение — заполните мерки",
+};
+
+export const CUISINE_MODES = {
+  only: "Только выбранные кухни",
+  prefer: "Предпочитать выбранные",
+};
+
 /* Разделы каталога «Ленты». Слаг несёт числовой идентификатор раздела,
  * человекочитаемого имени в схеме нет — отсюда этот словарь. */
 export const CATEGORY_LABELS = {
@@ -182,6 +231,48 @@ export function categoryLabel(slug) {
   // Новый раздел каталога: показываем слаг без числового хвоста, а не «—».
   const words = String(slug).replace(/-\d+$/, "").split("-").join(" ");
   return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+export function planModeLabel(code) {
+  return label(PLAN_MODES, code, "Сбалансированно");
+}
+
+/* «Почему это блюдо» (TZ-M8 §5): в базе лежат коды с параметрами, текст
+ * собирается здесь. В runtime нет ни LLM, ни генератора формулировок —
+ * ровно поэтому список причин конечен и переводится одним словарём. */
+const REASON_TEXTS = {
+  favorite: (reason) =>
+    reason.rating
+      ? `Вы ставили ${"★".repeat(Math.round(reason.rating))}`
+      : "Любимое блюдо семьи",
+  liked_type: (reason) => {
+    const dish = dishLabel(reason.dish_type);
+    return dish ? `Вы часто выбираете: ${dish.toLowerCase()}` : "В вашем вкусе";
+  },
+  uses_expiring: (reason) => `Использует то, что скоро испортится: ${listOf(reason.ingredients)}`,
+  uses_stock: (reason) => `Из того, что есть дома: ${listOf(reason.ingredients)}`,
+  shares_pack: (reason) =>
+    `Одна пачка (${reason.ingredient}) на это блюдо и блюдо № ${reason.other_meal}`,
+  cheap_today: (reason) => `На ${number(reason.delta_rub)} ₽ дешевле среднего по слоту`,
+  quick: (reason) => `${reason.minutes} минут — быстрое блюдо`,
+  seasonal: (reason) => `Сейчас сезон: ${listOf(reason.ingredients)}`,
+  new_for_you: () => "Новое для вас — попробуйте",
+  kcal_fit: (reason) => `Попадает в норму: ≈ ${number(reason.kcal)} ккал`,
+  rotation: (reason) => `Не готовили уже ${countWord(reason.days, "день", "дня", "дней")}`,
+  leftover: (reason) => `Остаток блюда № ${reason.source_meal} — готовить не нужно`,
+  cuisine_match: () => "Из выбранной вами кухни",
+  fits_meal: (reason) => `Подходит для приёма «${mealLabel(reason.meal_type).toLowerCase()}»`,
+};
+
+function listOf(values) {
+  return [values].flat().filter(Boolean).join(", ");
+}
+
+/** Человеческий текст причины или null для незнакомого кода. */
+export function reasonText(reason) {
+  if (!reason || !reason.code) return null;
+  const build = REASON_TEXTS[reason.code];
+  return build ? build(reason) : null;
 }
 
 /** Копейки → «1 240 ₽». Возвращает null, когда цены нет. */

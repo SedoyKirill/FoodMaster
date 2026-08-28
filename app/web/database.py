@@ -1856,7 +1856,7 @@ class AppRepository:
             SELECT pm.id, pm.meal_date, pm.meal_type, pm.recipe_id, pm.scale,
                    pm.servings, pm.estimated_kcal, pm.warnings, pm.reasons,
                    pm.estimated_protein, pm.estimated_fat, pm.estimated_carb,
-                   pm.leftover_of,
+                   pm.leftover_of, pm.status,
                    r.title, r.cuisine_code, r.review_status, r.source_page_start
             FROM app_core.plan_meals pm
             JOIN recipe_library.recipes r ON r.id=pm.recipe_id

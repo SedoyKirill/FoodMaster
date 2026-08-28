@@ -16,6 +16,7 @@ import * as recipes from "./views/recipes.js";
 import * as inventory from "./views/inventory.js";
 import * as products from "./views/products.js";
 import * as settings from "./views/settings.js";
+import * as taste from "./views/taste.js";
 import * as auth from "./views/auth.js";
 
 const VIEW_BY_PATH = {
@@ -25,6 +26,7 @@ const VIEW_BY_PATH = {
   "#/inventory": "inventory",
   "#/products": "products",
   "#/settings": "settings",
+  "#/taste": "taste",
 };
 
 function showView(name) {
@@ -81,6 +83,7 @@ function defineRoutes() {
   ));
   router.define("#/inventory", guard("inventory", () => inventory.enter()));
   router.define("#/products", guard("products", (_params, query) => products.enter(query)));
+  router.define("#/taste", guard("taste", () => taste.enter()));
   router.define("#/settings", guard("settings", () => settings.enter()));
 }
 
@@ -154,6 +157,7 @@ async function boot() {
   inventory.init();
   products.init();
   settings.init();
+  taste.init();
   dashboard.init();
   auth.init(async () => {
     store.set("me", await api.me());
