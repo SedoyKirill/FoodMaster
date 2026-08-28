@@ -74,6 +74,10 @@ export const api = {
   me: () => request("/api/me"),
   register: (payload) => request("/api/auth/register", { method: "POST", body: payload }),
   login: (payload) => request("/api/auth/login", { method: "POST", body: payload }),
+  telegramLogin: (code) =>
+    request("/api/auth/telegram-login", { method: "POST", body: { code } }),
+  setPassword: (password) =>
+    request("/api/auth/set-password", { method: "POST", body: { password } }),
   logout: () => request("/api/auth/logout", { method: "POST" }),
 
   dashboard: () => request("/api/dashboard"),
@@ -111,6 +115,7 @@ export const api = {
     request(`/api/settings/people/${id}`, { method: "PATCH", body: changes }),
 
   telegramToken: () => request("/api/telegram/link-token", { method: "POST" }),
+  telegramUnlink: () => request("/api/telegram/link", { method: "DELETE" }),
 };
 
 /** Отложенный вызов с отменой предыдущего — для живого поиска. */

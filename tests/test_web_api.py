@@ -6,6 +6,7 @@ TZ-TESTS §3.3. Проверяется обвязка: коды ответов, 
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import unittest
@@ -561,6 +562,85 @@ class ProductListTests(unittest.TestCase):
         self.assertEqual(page["total"], 5)
         self.assertEqual(len(page["items"]), 2)
         self.assertTrue(page["has_more"])
+
+
+class TelegramAccountTests(unittest.TestCase):
+    """TZ-M7 §3.3–3.4: вход по коду из бота, пароль постфактум, отвязка."""
+
+    def test_code_from_bot_opens_a_session(self) -> None:
+        repository = FakeRepository()
+        make_client(self, repository=repository)
+        code = asyncio.run(repository.web_login_code(next(iter(repository.users))))
+
+        fresh = TestClient(create_app(repository))
+        self.assertEqual(fresh.get("/api/me").status_code, 401)
+        response = fresh.post("/api/auth/telegram-login", json={"code": code})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(fresh.get("/api/me").status_code, 200)
+
+    def test_code_works_only_once(self) -> None:
+        repository = FakeRepository()
+        make_client(self, repository=repository)
+        code = asyncio.run(repository.web_login_code(next(iter(repository.users))))
+        client = TestClient(create_app(repository))
+        self.assertEqual(client.post("/api/auth/telegram-login", json={"code": code}).status_code, 200)
+        second = TestClient(create_app(repository)).post(
+            "/api/auth/telegram-login", json={"code": code}
+        )
+        self.assertEqual(second.status_code, 401)
+
+    def test_wrong_code_is_401_not_500(self) -> None:
+        client = TestClient(create_app(FakeRepository()))
+        self.assertEqual(
+            client.post("/api/auth/telegram-login", json={"code": "000000"}).status_code, 401
+        )
+
+    def test_code_guessing_is_rate_limited(self) -> None:
+        """Код всего шестизначный — лимит и есть основная защита от перебора."""
+        client = TestClient(create_app(FakeRepository()))
+        codes = [client.post("/api/auth/telegram-login", json={"code": f"{i:06d}"})
+                 for i in range(12)]
+        statuses = [response.status_code for response in codes]
+        self.assertIn(429, statuses)
+        limited = codes[statuses.index(429)]
+        self.assertTrue(limited.headers.get("Retry-After"))
+
+    def test_set_password_requires_csrf(self) -> None:
+        client, _ = make_client(self)
+        del client.headers["X-CSRF-Token"]
+        self.assertEqual(
+            client.post("/api/auth/set-password", json={"password": "новыйпароль"}).status_code,
+            403,
+        )
+
+    def test_set_password_is_recorded(self) -> None:
+        client, repository = make_client(self)
+        self.assertTrue(client.get("/api/me").json()["user"]["has_password"])
+        response = client.post("/api/auth/set-password", json={"password": "другойпароль"})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("set_password", [name for name, _ in repository.calls])
+
+    def test_short_password_is_422(self) -> None:
+        client, _ = make_client(self)
+        response = client.post("/api/auth/set-password", json={"password": "1234"})
+        self.assertEqual(response.status_code, 422)
+
+    def test_unlink_removes_link(self) -> None:
+        client, repository = make_client(self)
+        user_id = client.get("/api/me").json()["user"]["id"]
+        repository.telegram_links["88112250"] = user_id
+        self.assertTrue(client.get("/api/me").json()["telegram_linked"])
+        self.assertEqual(client.delete("/api/telegram/link").status_code, 200)
+        self.assertFalse(client.get("/api/me").json()["telegram_linked"])
+
+    def test_unlink_without_link_is_404(self) -> None:
+        client, _ = make_client(self)
+        self.assertEqual(client.delete("/api/telegram/link").status_code, 404)
+
+    def test_unlink_requires_csrf(self) -> None:
+        client, _ = make_client(self)
+        del client.headers["X-CSRF-Token"]
+        self.assertEqual(client.delete("/api/telegram/link").status_code, 403)
 
 
 if __name__ == "__main__":

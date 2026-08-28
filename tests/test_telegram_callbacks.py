@@ -9,10 +9,13 @@ from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from app.telegram.service import (
-    CallbackReply, Reply, STALE_TEXT, alternatives_keyboard, encode_callback,
-    format_recipe, handle_callback, pack_uuid, parse_callback, shopping_keyboard,
-    split_for_telegram, today_keyboard, unpack_uuid,
+from app.telegram.callbacks import (
+    encode_callback, pack_uuid, parse_callback, unpack_uuid,
+)
+from app.telegram.dispatch import handle_callback
+from app.telegram.render import (
+    CallbackReply, Reply, STALE_TEXT, alternatives_keyboard, format_recipe,
+    split_for_telegram, today_keyboard,
 )
 
 TODAY = date(2026, 8, 18)
@@ -40,28 +43,30 @@ class CodecTests(unittest.TestCase):
         self.assertIsNone(parse_callback("мусор"))
         self.assertEqual(parse_callback("s|a|b"), ("s", ["a", "b"]))
 
+    def test_encode_uses_colon_separator(self) -> None:
+        # ТЗ §4.3: формат <verb>:<args>
+        self.assertEqual(encode_callback("d", "abc", 3), "d:abc:3")
+
+    def test_parse_accepts_legacy_pipe(self) -> None:
+        """Кнопки, отправленные до перехода на «:», остались в чатах людей."""
+        self.assertEqual(parse_callback("v|abc|def|7"), ("v", ["abc", "def", "7"]))
+        self.assertEqual(parse_callback("v:abc:def:7"), ("v", ["abc", "def", "7"]))
+
+    def test_verb_without_arguments_is_valid(self) -> None:
+        self.assertEqual(parse_callback("n"), ("n", []))
+
+    def test_encode_raises_when_too_long(self) -> None:
+        # раньше это был assert — под python -O он исчезал вместе с проверкой
+        with self.assertRaises(ValueError):
+            encode_callback("v", "я" * 40)
+
+    def test_all_verbs_from_spec_are_known(self) -> None:
+        from app.telegram.callbacks import VERBS
+
+        self.assertEqual(set(VERBS), set("srxvcdpkgwifonty"))
+
 
 class KeyboardTests(unittest.TestCase):
-    def test_shopping_keyboard_marks_and_parses_back(self) -> None:
-        items = [
-            {"id": str(ITEM), "normalized_name": "молоко", "buy_quantity": "930",
-             "unit_code": "ml", "estimated_cost_kop": 9900, "purchased_at": None},
-            {"id": str(uuid.uuid4()), "normalized_name": "оченьдлинноеназваниепродукта" * 4,
-             "buy_quantity": "1", "unit_code": "piece", "estimated_cost_kop": None,
-             "purchased_at": "2026-08-18"},
-            {"id": str(uuid.uuid4()), "normalized_name": "не покупать",
-             "buy_quantity": "0", "unit_code": "g", "estimated_cost_kop": None,
-             "purchased_at": None},
-        ]
-        keyboard = shopping_keyboard(PLAN, items)
-        rows = keyboard["inline_keyboard"]
-        self.assertEqual(len(rows), 2)  # buy_quantity=0 не показывается
-        self.assertTrue(rows[0][0]["text"].startswith("☐"))
-        self.assertTrue(rows[1][0]["text"].startswith("✅"))  # купленное — можно снять
-        self.assertLessEqual(len(rows[1][0]["text"]), 60)
-        verb, parts = parse_callback(rows[0][0]["callback_data"])
-        self.assertEqual(verb, "s")
-        self.assertEqual(unpack_uuid(parts[1]), ITEM)
 
     def test_today_keyboard_row_per_meal(self) -> None:
         meals = [
@@ -73,16 +78,17 @@ class KeyboardTests(unittest.TestCase):
         self.assertEqual(parse_callback(rows[0][0]["callback_data"])[0], "r")
         self.assertEqual(parse_callback(rows[0][1]["callback_data"])[0], "x")
 
-    def test_alternatives_keyboard_caps_and_cancels(self) -> None:
+    def test_alternatives_keyboard_shows_all_and_cancels(self) -> None:
         alternatives = [
             {"recipe_id": index, "title": f"Блюдо {index}", "source_page_start": 10 + index,
              "draft": index == 2}
             for index in range(1, 5)
         ]
         rows = alternatives_keyboard(PLAN, MEAL, alternatives)["inline_keyboard"]
-        self.assertEqual(len(rows), 4)  # 3 варианта + отмена
+        # раньше бот резал до трёх, хотя репозиторий отдаёт десять
+        self.assertEqual(len(rows), len(alternatives) + 1)
         self.assertIn("(черновик)", rows[1][0]["text"])
-        self.assertEqual(parse_callback(rows[3][0]["callback_data"])[0], "c")
+        self.assertEqual(parse_callback(rows[-1][0]["callback_data"])[0], "c")
 
 
 class FormatRecipeTests(unittest.TestCase):
@@ -133,9 +139,17 @@ class SplitTests(unittest.TestCase):
 class _StubBotRepository:
     def __init__(self, context):
         self.context = context
+        self.context_calls: list[int] = []
 
-    async def context_for_chat(self, chat_id):
+    async def context_for_user(self, user_id):
+        self.context_calls.append(user_id)
         return self.context
+
+    async def latest_plan_meals(self, household_id):
+        return []
+
+    async def shopping_items(self, household_id):
+        return []
 
 
 class _StubAppRepository:
@@ -210,7 +224,8 @@ class HandleCallbackTests(unittest.TestCase):
         self.assertIn(("mark_purchased", str(ITEM), True), app.calls)
         self.assertIn("Куплено", result.toast)
         self.assertIsNotNone(result.edit)
-        self.assertIn("Всё куплено", result.edit.text)
+        # T6: после отметки возвращаемся в раздел магазина, а не в плоский список
+        self.assertIn("куплено 1 из 1", result.edit.text)
 
     def test_toggle_stale_item_strips_keyboard(self) -> None:
         app = _StubAppRepository(plan=_plan_payload(), mark_result=None)
@@ -335,12 +350,22 @@ class BotAppTests(unittest.TestCase):
         client = _FakeClient()
         return BotApp(client, _StubBotRepository(CONTEXT), app_repository), client
 
-    def _callback_update(self, data, update_id=1):
+    def _callback_update(self, data, update_id=1, chat_type="private"):
         return {
             "update_id": update_id,
             "callback_query": {
                 "id": f"cb-{update_id}", "data": data,
-                "message": {"message_id": 55, "chat": {"id": 42}},
+                "from": {"id": 42},
+                "message": {"message_id": 55, "chat": {"id": 42, "type": chat_type}},
+            },
+        }
+
+    def _text_update(self, text, update_id=1, chat_type="private", chat_id=42, user_id=42):
+        return {
+            "update_id": update_id,
+            "message": {
+                "message_id": 7, "text": text, "from": {"id": user_id},
+                "chat": {"id": chat_id, "type": chat_type},
             },
         }
 
@@ -427,10 +452,97 @@ class BotAppTests(unittest.TestCase):
     def test_callback_without_message_just_acks(self) -> None:
         app_repository = _StubAppRepository(plan=_plan_payload())
         bot, client = self._make_app(app_repository)
-        update = {"update_id": 9, "callback_query": {"id": "cb-9", "data": "c|xx"}}
+        # сообщение недоступно (слишком старое) — но кто нажал, Telegram знает
+        update = {
+            "update_id": 9,
+            "callback_query": {"id": "cb-9", "data": "c|xx", "from": {"id": 42}},
+        }
         offset = asyncio.run(bot.process_updates([update]))
         self.assertEqual(offset, 10)
         self.assertEqual(client.count("ack"), 1)
+
+    # --- только личные чаты (TZ-M7 §3.1 / А2) ---------------------------------
+
+    def test_group_message_gets_single_refusal(self) -> None:
+        from app.telegram.bot import GROUP_REFUSAL
+
+        bot, client = self._make_app(_StubAppRepository(plan=_plan_payload()))
+        asyncio.run(bot.process_updates([
+            self._text_update("🍽 Сегодня", 1, chat_type="supergroup", chat_id=-100),
+            self._text_update("🛒 Покупки", 2, chat_type="supergroup", chat_id=-100),
+        ]))
+        refusals = [call for call in client.calls if call[0] == "send" and call[1] == GROUP_REFUSAL]
+        self.assertEqual(len(refusals), 1)  # одна фраза на чат, а не на сообщение
+        self.assertEqual(client.count("send"), 1)  # меню группе не показывали
+
+    def test_group_callback_only_alerts(self) -> None:
+        from app.telegram.bot import GROUP_REFUSAL
+
+        app_repository = _StubAppRepository(plan=_plan_payload())
+        bot, client = self._make_app(app_repository)
+        data = encode_callback("s", pack_uuid(PLAN), pack_uuid(ITEM))
+        asyncio.run(bot.process_updates([
+            self._callback_update(data, 1, chat_type="group")
+        ]))
+        self.assertTrue(any(call[0] == "ack" and call[2] == GROUP_REFUSAL for call in client.calls))
+        self.assertEqual(app_repository.calls, [])  # к данным семьи не ходили
+
+    def test_private_message_still_works(self) -> None:
+        bot, client = self._make_app(_StubAppRepository(plan=_plan_payload()))
+        asyncio.run(bot.process_updates([self._text_update("/help", 1)]))
+        self.assertEqual(client.count("send"), 1)
+
+    # --- личность и лимиты (TZ-M7 §3.1, §3.5) ---------------------------------
+
+    def test_identity_comes_from_sender_not_chat(self) -> None:
+        bot_repository = _StubBotRepository(CONTEXT)
+        bot = self._make_app(_StubAppRepository(plan=_plan_payload()))[0]
+        bot.bot_repository = bot_repository
+        asyncio.run(bot.process_updates([
+            self._text_update("🛒 Покупки", 1, chat_id=42, user_id=7)
+        ]))
+        # семью ищем по нажавшему, а не по чату — иначе в группе доступ у всех
+        self.assertEqual(bot_repository.context_calls, [7])
+
+    def test_flood_gets_one_refusal(self) -> None:
+        from fakes import StubClock
+
+        from app.telegram.bot import BotApp
+        from app.telegram.router import TOO_FAST_TEXT, Router
+
+        clock = StubClock()
+        client = _FakeClient()
+        bot = BotApp(
+            client, _StubBotRepository(CONTEXT), _StubAppRepository(plan=_plan_payload()),
+            router=Router(clock=clock),
+        )
+        updates = [self._text_update("/help", index) for index in range(1, 26)]
+        asyncio.run(bot.process_updates(updates))
+        answered = [call for call in client.calls if call[0] == "send"]
+        refusals = [call for call in answered if call[1] == TOO_FAST_TEXT]
+        self.assertEqual(len(answered) - len(refusals), 20)  # 20 сообщений в минуту
+        self.assertEqual(len(refusals), 1)  # об отказе говорим один раз
+
+    # --- «⏳» не висит дольше срока (приёмка §9.9) -----------------------------
+
+    def test_heavy_timeout_replaces_placeholder(self) -> None:
+        class HangingRepo(_StubAppRepository):
+            async def replace_meal(self, session, plan_id, meal_id, recipe_id=None):
+                await asyncio.Event().wait()  # никогда не завершится
+
+        bot, client = self._make_app(HangingRepo(plan=_plan_payload()))
+        bot.heavy_timeout = 0.01
+        update = self._callback_update(encode_callback("x", pack_uuid(PLAN), pack_uuid(MEAL)))
+
+        async def scenario():
+            await bot.process_updates([update])
+            await asyncio.gather(*bot.tasks, return_exceptions=True)
+
+        asyncio.run(scenario())
+        self.assertTrue(
+            any(call[0] == "edit" and "Не успел" in call[2] for call in client.calls)
+        )
+        self.assertEqual(bot.in_flight, set())
 
 
 if __name__ == "__main__":

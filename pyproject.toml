@@ -36,6 +36,7 @@ include = ["app*"]
 # а плоский `static/*` не подхватил бы css/, js/, js/views/ и fonts/.
 "app.web" = [
     "schema.sql",
+    "schema_telegram.sql",
     "static/*",
     "static/css/*",
     "static/js/*",

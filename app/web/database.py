@@ -13,8 +13,9 @@ from typing import Any
 
 import asyncpg
 
+from .payloads import PRICE_TIERS, UNKNOWN_TIER_TEXT
 from .planner import (
-    ProductMatcher, ProductMatcherCache, _base_quantity, clean_dish_title,
+    ProductMatcher, ProductMatcherCache, _base_quantity, build_plan, clean_dish_title,
     warm_product_matcher,
 )
 from .security import hash_password, new_token, token_hash, validate_login, verify_password
@@ -36,6 +37,13 @@ PRODUCT_MATCHER_TTL_SECONDS = 600.0
 # Postgres и мемоизацию матчера. Иначе первая после простоя сборка меню
 # платила за них десятками секунд прямо во время клика пользователя.
 PLANNER_WARM_INTERVAL_SECONDS = 300.0
+# TZ-M7 §3.5: откуда пришло действие. Белый список, чтобы опечатка в
+# псевдосессии бота не породила третий «канал» в отчётах.
+AUDIT_CHANNELS = frozenset({"web", "telegram"})
+# Ключ advisory-лока на применение DDL: веб и бот могут стартовать разом.
+SCHEMA_LOCK_KEY = 79_160_728
+# TZ-M7 §3.3: код входа в веб живёт недолго — его диктуют вслух и набирают руками.
+WEB_LOGIN_CODE_TTL = timedelta(minutes=5)
 
 
 class ConflictError(Exception):
@@ -106,19 +114,43 @@ def _coerce_person_field(field: str, value: Any) -> Any:
 
 
 class AppRepository:
-    def __init__(self, database_url: str | None = None) -> None:
+    #: Порядок важен: schema_telegram.sql ссылается на users и households.
+    SCHEMA_FILES: tuple[tuple[str, str], ...] = (
+        ("app.store.lenta", "schema.sql"),
+        ("app.recipes", "schema.sql"),
+        ("app.web", "schema.sql"),
+        ("app.web", "schema_telegram.sql"),  # TZ-M7 §7
+    )
+
+    def __init__(self, database_url: str | None = None, *, channel: str = "web") -> None:
         self.database_url = database_url or os.getenv(
             "DATABASE_URL", "postgresql://ration:ration@localhost:5432/ration"
         )
         self.pool: asyncpg.Pool | None = None
         self.product_cache = ProductMatcherCache(ttl_seconds=PRODUCT_MATCHER_TTL_SECONDS)
+        #: канал для audit_log: у веба 'web', у бота 'telegram' (TZ-M7 §3.5)
+        self.audit_channel = channel if channel in AUDIT_CHANNELS else "web"
 
     async def connect(self) -> None:
         self.pool = await asyncpg.create_pool(self.database_url, min_size=2, max_size=10)
         async with self.pool.acquire() as connection:
-            for package in ("app.store.lenta", "app.recipes", "app.web"):
-                schema = files(package).joinpath("schema.sql").read_text(encoding="utf-8")
+            await self.apply_schema(connection)
+
+    @classmethod
+    async def apply_schema(cls, connection: asyncpg.Connection) -> None:
+        """Идемпотентный DDL под advisory-локом.
+
+        Веб и бот стартуют одновременно (оба зависят только от db), а
+        одновременный «CREATE TABLE IF NOT EXISTS» из двух сессий даёт
+        unique_violation в pg_type — лок это исключает.
+        """
+        await connection.execute("SELECT pg_advisory_lock($1)", SCHEMA_LOCK_KEY)
+        try:
+            for package, filename in cls.SCHEMA_FILES:
+                schema = files(package).joinpath(filename).read_text(encoding="utf-8")
                 await connection.execute(schema)
+        finally:
+            await connection.execute("SELECT pg_advisory_unlock($1)", SCHEMA_LOCK_KEY)
 
     async def close(self) -> None:
         if self.pool:
@@ -129,9 +161,27 @@ class AppRepository:
             raise RuntimeError("Database is not connected")
         return self.pool
 
-    async def register(self, login: str, password: str, household_name: str) -> tuple[str, str]:
+    async def register_account(
+        self,
+        login: str,
+        password: str | None,
+        household_name: str,
+        *,
+        telegram_user_id: int | None = None,
+        channel: str | None = None,
+    ) -> uuid.UUID:
+        """Новый аккаунт вместе с семьёй; возвращает id пользователя.
+
+        ``password=None`` — аккаунт из Telegram (TZ-M7 §3.2, А1): строки в
+        ``password_credentials`` нет, войти по паролю нельзя, пока владелец не
+        задаст его в вебе.
+
+        ``telegram_user_id`` — привязать Telegram сразу, в той же транзакции:
+        иначе сбой между «создали аккаунт» и «привязали» оставил бы человеку
+        аккаунт, в который он не может войти ни одним способом.
+        """
         normalized_login = validate_login(login)
-        password_hash = hash_password(password)
+        password_hash = hash_password(password) if password is not None else None
         user_id = uuid.uuid4()
         household_id = uuid.uuid4()
         person_id = uuid.uuid4()
@@ -142,11 +192,12 @@ class AppRepository:
                     user_id,
                     normalized_login,
                 )
-                await connection.execute(
-                    "INSERT INTO app_core.password_credentials (user_id, password_hash) VALUES ($1, $2)",
-                    user_id,
-                    password_hash,
-                )
+                if password_hash is not None:
+                    await connection.execute(
+                        "INSERT INTO app_core.password_credentials (user_id, password_hash) VALUES ($1, $2)",
+                        user_id,
+                        password_hash,
+                    )
                 await connection.execute(
                     "INSERT INTO app_core.households (id, name, created_by) VALUES ($1, $2, $3)",
                     household_id,
@@ -166,9 +217,26 @@ class AppRepository:
                     person_id,
                     household_id,
                 )
-                await self._audit(connection, household_id, user_id, "user.registered", "user", user_id)
+                if telegram_user_id is not None:
+                    await connection.execute(
+                        """
+                        INSERT INTO app_core.auth_identities (provider, provider_user_id, user_id)
+                        VALUES ('telegram', $1, $2)
+                        """,
+                        str(telegram_user_id),
+                        user_id,
+                    )
+                await self._audit(
+                    connection, household_id, user_id, "user.registered", "user", user_id,
+                    channel=channel,
+                )
         except asyncpg.UniqueViolationError as exc:
             raise ConflictError("Такой логин уже зарегистрирован") from exc
+        return user_id
+
+    async def register(self, login: str, password: str, household_name: str) -> tuple[str, str]:
+        """Регистрация из веба: аккаунт с паролем и сразу сессия."""
+        user_id = await self.register_account(login, password, household_name)
         return await self.create_session(user_id)
 
     async def login(self, login: str, password: str) -> tuple[str, str]:
@@ -279,8 +347,18 @@ class AppRepository:
             "SELECT provider_user_id FROM app_core.auth_identities WHERE provider='telegram' AND user_id=$1",
             session["user_id"],
         )
+        # TZ-M7 §3.3: у аккаунта из бота пароля нет. Интерфейс должен предложить
+        # его задать и предупредить перед отвязкой, иначе войти будет нечем.
+        has_password = await self.db().fetchval(
+            "SELECT 1 FROM app_core.password_credentials WHERE user_id=$1",
+            session["user_id"],
+        )
         return {
-            "user": {"id": str(session["user_id"]), "login": session["login"]},
+            "user": {
+                "id": str(session["user_id"]),
+                "login": session["login"],
+                "has_password": has_password is not None,
+            },
             "household": {
                 "id": str(household_id),
                 "name": session["household_name"],
@@ -405,6 +483,129 @@ class AppRepository:
             return None
         await self.audit(session, "settings.person_updated", "person", person_id)
         return row_dict(row)
+
+    # --- точечные правки настроек (TZ-M7 §5.10) --------------------------------
+    # Бот меняет по одному полю за раз, поэтому полный save_settings ему не
+    # годится: он требует прислать людей, технику и правила целиком, а значит
+    # любая гонка двух каналов затирала бы чужие изменения.
+
+    def _require_admin(self, session: dict[str, Any]) -> None:
+        if session.get("role") not in {"owner", "admin"}:
+            raise PermissionError("Недостаточно прав для изменения настроек")
+
+    async def rename_household(self, session: dict[str, Any], name: str) -> str:
+        self._require_admin(session)
+        name = (name or "").strip()
+        if not 1 <= len(name) <= 100:
+            raise ValueError("Название семьи: от 1 до 100 символов")
+        await self.db().execute(
+            "UPDATE app_core.households SET name=$2, updated_at=CURRENT_TIMESTAMP WHERE id=$1",
+            session["household_id"], name,
+        )
+        await self.audit(session, "settings.household_renamed", "household",
+                         session["household_id"], {"name": name})
+        return name
+
+    async def update_appliances(self, session: dict[str, Any], codes: list[str]) -> list[str]:
+        """Полный набор техники: это тринадцать тумблеров, менять их по одному
+        нечем — но людей и правила такая замена уже не задевает."""
+        self._require_admin(session)
+        unique = sorted({str(code).strip() for code in codes if str(code).strip()})
+        async with self.db().acquire() as connection, connection.transaction():
+            await connection.execute(
+                "DELETE FROM app_core.appliances WHERE household_id=$1",
+                session["household_id"],
+            )
+            if unique:
+                await connection.executemany(
+                    "INSERT INTO app_core.appliances (household_id, appliance_code) VALUES ($1,$2)",
+                    [(session["household_id"], code) for code in unique],
+                )
+            await self._audit(
+                connection, session["household_id"], session["user_id"],
+                "settings.appliances_updated", "household", session["household_id"],
+                {"codes": unique}, channel=session.get("channel"),
+            )
+        return unique
+
+    async def add_person(self, session: dict[str, Any], person: dict[str, Any]) -> dict[str, Any]:
+        self._require_admin(session)
+        name = str(person.get("name") or "").strip()
+        if not 1 <= len(name) <= 80:
+            raise ValueError("Имя: от 1 до 80 символов")
+        person_id = uuid.uuid4()
+        row = await self.db().fetchrow(
+            """
+            INSERT INTO app_core.people (
+                id, household_id, name, person_type, target_kcal, portion_factor, position
+            )
+            SELECT $1, $2, $3, $4, $5, $6,
+                   COALESCE(MAX(p.position), 0) + 1
+            FROM app_core.people p WHERE p.household_id = $2
+            RETURNING id, name, person_type, target_kcal, portion_factor, position
+            """,
+            person_id, session["household_id"], name,
+            _coerce_person_field("person_type", person.get("person_type")),
+            _coerce_person_field("target_kcal", person.get("target_kcal")),
+            _coerce_person_field("portion_factor", person.get("portion_factor", 1)),
+        )
+        await self.audit(session, "settings.person_added", "person", person_id, {"name": name})
+        return row_dict(row)
+
+    async def delete_person(self, session: dict[str, Any], person_id: uuid.UUID) -> bool:
+        """Последнего человека убрать нельзя: без едоков планировать нечего."""
+        self._require_admin(session)
+        async with self.db().acquire() as connection, connection.transaction():
+            total = await connection.fetchval(
+                "SELECT count(*) FROM app_core.people WHERE household_id=$1",
+                session["household_id"],
+            )
+            if int(total or 0) <= 1:
+                raise ValueError("В семье должен остаться хотя бы один человек")
+            status = await connection.execute(
+                "DELETE FROM app_core.people WHERE id=$1 AND household_id=$2",
+                person_id, session["household_id"],
+            )
+            if affected_rows(status) != 1:
+                return False
+            await self._audit(
+                connection, session["household_id"], session["user_id"],
+                "settings.person_removed", "person", person_id,
+                channel=session.get("channel"),
+            )
+        return True
+
+    async def add_dietary_rule(
+        self, session: dict[str, Any], rule: dict[str, Any]
+    ) -> dict[str, Any]:
+        self._require_admin(session)
+        term = str(rule.get("term") or "").strip()
+        if not 1 <= len(term) <= 100:
+            raise ValueError("Продукт: от 1 до 100 символов")
+        rule_id = uuid.uuid4()
+        row = await self.db().fetchrow(
+            """
+            INSERT INTO app_core.dietary_rules (id, household_id, rule_type, term, is_hard)
+            VALUES ($1,$2,$3,$4,$5)
+            RETURNING id, rule_type, term, is_hard
+            """,
+            rule_id, session["household_id"],
+            str(rule.get("rule_type") or "exclude"), term,
+            bool(rule.get("is_hard", True)),
+        )
+        await self.audit(session, "settings.rule_added", "dietary_rule", rule_id, {"term": term})
+        return row_dict(row)
+
+    async def delete_dietary_rule(self, session: dict[str, Any], rule_id: uuid.UUID) -> bool:
+        self._require_admin(session)
+        status = await self.db().execute(
+            "DELETE FROM app_core.dietary_rules WHERE id=$1 AND household_id=$2",
+            rule_id, session["household_id"],
+        )
+        if affected_rows(status) != 1:
+            return False
+        await self.audit(session, "settings.rule_removed", "dietary_rule", rule_id)
+        return True
 
     async def dashboard(self, session: dict[str, Any]) -> dict[str, Any]:
         household_id = session["household_id"]
@@ -698,7 +899,7 @@ class AppRepository:
         rows = await self.db().fetch(
             f"""
             SELECT p.id, p.name, p.brand, p.pack_text, p.pack_quantity, p.pack_unit,
-                   p.kcal_100, p.protein_100, p.fat_100, p.carb_100,
+                   p.kcal_100, p.protein_100, p.fat_100, p.carb_100, p.url,
                    ph.regular_price_kop, ph.loyalty_price_kop, ph.promo_price_kop,
                    ph.discount_percent,
                    COALESCE(NULLIF(ph.promo_price_kop,0), NULLIF(ph.loyalty_price_kop,0), ph.regular_price_kop) AS effective_price_kop,
@@ -895,14 +1096,33 @@ class AppRepository:
             LEFT JOIN LATERAL (
                 SELECT jsonb_agg(jsonb_build_object(
                     'ingredient_text', i.ingredient_text,
-                    'normalized_name', i.normalized_name,
+                    -- Унифицированное имя из справочника (волна Haiku):
+                    -- «масло сливочное», «butter» и «сливочного масла» —
+                    -- одна позиция. Догадки ниже 0.7 не подставляются,
+                    -- исходное имя остаётся запасным вариантом.
+                    'normalized_name', COALESCE(
+                        NULLIF(c.canonical_name, ''), i.normalized_name
+                    ),
+                    'source_name', i.normalized_name,
+                    'base_name', c.base_name,
                     'quantity_min', i.quantity_min,
                     'quantity_max', i.quantity_max,
                     'unit_code', i.unit_code,
                     'is_to_taste', i.is_to_taste
                 ) ORDER BY i.position) AS items
                 FROM recipe_library.recipe_ingredients i
+                LEFT JOIN recipe_library.ingredient_canonical c
+                       ON c.raw_name = i.normalized_name
+                      AND c.is_ingredient
+                      AND COALESCE(c.confidence, 0) >= 0.7
                 WHERE i.recipe_id = p.id
+                  -- Мусор из книг («правильно резать лук 122») в покупки
+                  -- не попадает.
+                  AND NOT EXISTS (
+                        SELECT 1 FROM recipe_library.ingredient_canonical x
+                        WHERE x.raw_name = i.normalized_name
+                          AND NOT x.is_ingredient
+                  )
             ) ing ON TRUE
             """,
             PLANNER_RECIPE_LIMIT,
@@ -982,6 +1202,78 @@ class AppRepository:
             "SELECT term, canonical, kind FROM app_core.ingredient_synonyms"
         )
         return [row_dict(row) for row in rows]
+
+    async def add_to_plan(
+        self,
+        session: dict[str, Any],
+        plan_id: uuid.UUID,
+        meal_date: date,
+        meal_type: str,
+        recipe_id: int,
+    ) -> dict[str, Any] | None:
+        """Поставить конкретный рецепт в слот плана (TZ-M7 §5.7).
+
+        Обёртка над ``replace_meal``: та же проверка допустимости для слота и
+        та же пересборка списка покупок — разница только в том, что слот
+        задан датой и приёмом пищи, а не идентификатором блюда.
+        """
+        meal_id = await self.db().fetchval(
+            """
+            SELECT pm.id
+            FROM app_core.plan_meals pm
+            JOIN app_core.meal_plans p ON p.id = pm.plan_id AND p.household_id = $1
+            WHERE pm.plan_id = $2 AND pm.meal_date = $3 AND pm.meal_type = $4
+            """,
+            session["household_id"], plan_id, meal_date, meal_type,
+        )
+        if meal_id is None:
+            return None
+        return await self.replace_meal(session, plan_id, meal_id, int(recipe_id))
+
+    async def create_plan(
+        self,
+        session: dict[str, Any],
+        *,
+        starts_on: date,
+        days: int,
+        budget_kop: int | None = None,
+        cuisines: list[str] | None = None,
+        price_tier: str = "balanced",
+    ) -> dict[str, Any]:
+        """Собрать и сохранить план: сырьё → решатель → БД → готовый payload.
+
+        Живёт в слое данных, а не в HTTP-обработчике, потому что то же самое
+        делает бот (TZ-M7 §2: веб и бот вызывают один слой). ``ValueError`` —
+        нечего ставить в слоты, ``PermissionError`` — роль только смотрит.
+        """
+        if session.get("role") == "viewer":
+            raise PermissionError("Режим просмотра не позволяет создавать планы")
+        if price_tier not in PRICE_TIERS:
+            raise ValueError(UNKNOWN_TIER_TEXT)
+        cuisines = list(cuisines or [])
+        data = await self.planner_data(session, cuisines)
+        # K7: скоринг 500 рецептов и CP-SAT занимают до десятков секунд —
+        # в отдельном потоке, иначе замирает весь event loop (и /health).
+        plan = await asyncio.to_thread(
+            functools.partial(
+                build_plan,
+                household_id=str(session["household_id"]),
+                starts_on=starts_on,
+                days=days,
+                cuisines=cuisines,
+                price_tier=price_tier,
+                budget_kop=budget_kop,
+                **data,
+            )
+        )
+        plan_id = await self.save_plan(
+            session, starts_on, days, budget_kop, cuisines, price_tier, plan
+        )
+        plan["id"] = plan_id
+        plan["starts_on"] = starts_on
+        plan["days"] = days
+        plan["budget_kop"] = budget_kop
+        return plan
 
     async def save_plan(
         self,
@@ -1171,6 +1463,9 @@ class AppRepository:
                 cuisines=cuisines,
                 price_tier=header["price_tier"],
                 limit=MEAL_ALTERNATIVES_LIMIT if new_recipe_id is None else 1000,
+                # выбранное вручную блюдо проверяем по жёстким ограничениям,
+                # а не по ранжированию слота (TZ-M7 §5.7)
+                keep_ids=() if new_recipe_id is None else (int(new_recipe_id),),
                 **{
                     key: data[key]
                     for key in (
@@ -1391,6 +1686,102 @@ class AppRepository:
         )
         return raw_token
 
+    async def web_login_code(self, user_id: Any) -> str:
+        """Одноразовый код входа в веб для владельца Telegram-аккаунта (§3.3).
+
+        Шесть цифр, а не длинный токен: код придётся набирать руками с телефона.
+        Перебор закрыт с трёх сторон — код живёт 5 минут, гасится при первом
+        применении, а эндпоинт входа ограничен по частоте.
+        """
+        expires_at = datetime.now(UTC) + WEB_LOGIN_CODE_TTL
+        # Коллизия шестизначного кода маловероятна, но token_hash — первичный
+        # ключ, поэтому пробуем несколько раз, а не падаем.
+        for _ in range(10):
+            code = f"{secrets.randbelow(1_000_000):06d}"
+            try:
+                await self.db().execute(
+                    """
+                    INSERT INTO app_core.one_time_tokens (token_hash, user_id, purpose, expires_at)
+                    VALUES ($1,$2,'web_login',$3)
+                    """,
+                    token_hash(code), user_id, expires_at,
+                )
+            except asyncpg.UniqueViolationError:
+                continue
+            return code
+        raise RuntimeError("Не удалось выдать код входа")
+
+    async def telegram_login(self, code: str) -> tuple[str, str]:
+        """Обменять код из бота на сессию веба. Ошибка — та же, что у входа."""
+        row = await self.db().fetchrow(
+            """
+            UPDATE app_core.one_time_tokens
+            SET used_at = CURRENT_TIMESTAMP
+            WHERE token_hash=$1 AND purpose='web_login'
+              AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP
+            RETURNING user_id
+            """,
+            token_hash((code or "").strip()),
+        )
+        if not row:
+            raise AuthenticationError("Код не подошёл: он просрочен или уже использован")
+        status = await self.db().fetchval(
+            "SELECT status FROM app_core.users WHERE id=$1", row["user_id"]
+        )
+        if status != "active":
+            raise AuthenticationError("Аккаунт недоступен")
+        return await self.create_session(row["user_id"])
+
+    async def has_password(self, user_id: Any) -> bool:
+        """Есть ли у аккаунта пароль: без него отвязка Telegram запирает вход."""
+        return await self.db().fetchval(
+            "SELECT 1 FROM app_core.password_credentials WHERE user_id=$1", user_id
+        ) is not None
+
+    async def set_password(self, session: dict[str, Any], password: str) -> None:
+        """Задать или сменить пароль (§3.3, шаг 4) — для аккаунтов из бота."""
+        password_hash = hash_password(password)
+        await self.db().execute(
+            """
+            INSERT INTO app_core.password_credentials (user_id, password_hash)
+            VALUES ($1,$2)
+            ON CONFLICT (user_id) DO UPDATE
+            SET password_hash=EXCLUDED.password_hash, changed_at=CURRENT_TIMESTAMP
+            """,
+            session["user_id"], password_hash,
+        )
+        await self.audit(session, "auth.password_set", "user", session["user_id"])
+
+    async def unlink_telegram(self, session: dict[str, Any]) -> bool:
+        """Отвязать Telegram (§3.4). Незавершённый диалог тоже стирается —
+        это персональные данные, которым незачем переживать отвязку."""
+        async with self.db().acquire() as connection, connection.transaction():
+            row = await connection.fetchrow(
+                """
+                DELETE FROM app_core.auth_identities
+                WHERE provider='telegram' AND user_id=$1
+                RETURNING provider_user_id
+                """,
+                session["user_id"],
+            )
+            if row is not None:
+                telegram_id = int(row["provider_user_id"])
+                await connection.execute(
+                    "DELETE FROM app_core.telegram_dialog_state WHERE user_id=$1",
+                    telegram_id,
+                )
+                # §6: после отвязки напоминания не шлём, и настройки хранить не за чем
+                await connection.execute(
+                    "DELETE FROM app_core.telegram_notifications WHERE user_id=$1",
+                    telegram_id,
+                )
+                await self._audit(
+                    connection, session["household_id"], session["user_id"],
+                    "auth.telegram_unlinked", "user", session["user_id"],
+                    channel=session.get("channel"),
+                )
+        return row is not None
+
     async def audit(
         self,
         session: dict[str, Any],
@@ -1400,10 +1791,18 @@ class AppRepository:
         details: dict[str, Any] | None = None,
     ) -> None:
         async with self.db().acquire() as connection:
-            await self._audit(connection, session["household_id"], session["user_id"], action, entity_type, entity_id, details)
+            await self._audit(
+                connection, session["household_id"], session["user_id"], action,
+                entity_type, entity_id, details, channel=session.get("channel"),
+            )
 
-    @staticmethod
+    def _resolve_channel(self, channel: str | None) -> str:
+        """Канал записи: явный → из сессии → умолчание экземпляра репозитория."""
+        value = str(channel or self.audit_channel or "web")
+        return value if value in AUDIT_CHANNELS else "web"
+
     async def _audit(
+        self,
         connection: asyncpg.Connection,
         household_id: uuid.UUID | None,
         user_id: uuid.UUID | None,
@@ -1411,14 +1810,16 @@ class AppRepository:
         entity_type: str | None = None,
         entity_id: Any | None = None,
         details: dict[str, Any] | None = None,
+        *,
+        channel: str | None = None,
     ) -> None:
         await connection.execute(
             """
             INSERT INTO app_core.audit_log (
                 household_id, user_id, channel, action, entity_type, entity_id, details
-            ) VALUES ($1,$2,'web',$3,$4,$5,$6::jsonb)
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)
             """,
-            household_id, user_id, action, entity_type,
+            household_id, user_id, self._resolve_channel(channel), action, entity_type,
             str(entity_id) if entity_id is not None else None,
             json.dumps(details or {}, ensure_ascii=False),
         )

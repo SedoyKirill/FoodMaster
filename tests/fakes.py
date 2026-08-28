@@ -152,6 +152,9 @@ class FakeRepository:
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
         self.warm_calls = 0
         self.planner_data_cuisines: list[str] = []
+        # TZ-M7 §3.3–3.4: коды входа в веб и привязки Telegram
+        self.web_login_codes: dict[str, str] = {}
+        self.telegram_links: dict[str, str] = {}
 
     # --- служебное ---------------------------------------------------------
 
@@ -242,7 +245,11 @@ class FakeRepository:
     async def get_profile(self, session: dict[str, Any]) -> dict[str, Any]:
         household_id = session["household_id"]
         return {
-            "user": {"id": session["user_id"], "login": session["login"]},
+            "user": {
+                "id": session["user_id"],
+                "login": session["login"],
+                "has_password": bool(self.users[session["user_id"]].get("password")),
+            },
             "household": {
                 "id": household_id,
                 "name": session["household_name"],
@@ -251,7 +258,7 @@ class FakeRepository:
             "people": self.people[household_id],
             "appliances": self.appliances[household_id],
             "dietary_rules": self.rules[household_id],
-            "telegram_linked": False,
+            "telegram_linked": session["user_id"] in self.telegram_links.values(),
         }
 
     async def save_settings(
@@ -467,6 +474,39 @@ class FakeRepository:
             "products": self.products,
         }
 
+    async def create_plan(
+        self,
+        session: dict[str, Any],
+        *,
+        starts_on: date,
+        days: int,
+        budget_kop: int | None = None,
+        cuisines: list[str] | None = None,
+        price_tier: str = "balanced",
+    ) -> dict[str, Any]:
+        """Как AppRepository.create_plan: сырьё → build_plan → сохранение."""
+        from app.web.database import PRICE_TIERS, UNKNOWN_TIER_TEXT
+        from app.web.planner import build_plan
+
+        if session.get("role") == "viewer":
+            raise PermissionError("Режим просмотра не позволяет создавать планы")
+        if price_tier not in PRICE_TIERS:
+            raise ValueError(UNKNOWN_TIER_TEXT)
+        cuisines = list(cuisines or [])
+        data = await self.planner_data(session, cuisines)
+        plan = build_plan(
+            household_id=str(session["household_id"]), starts_on=starts_on, days=days,
+            cuisines=cuisines, price_tier=price_tier, budget_kop=budget_kop, **data,
+        )
+        plan_id = await self.save_plan(
+            session, starts_on, days, budget_kop, cuisines, price_tier, plan
+        )
+        plan["id"] = plan_id
+        plan["starts_on"] = starts_on
+        plan["days"] = days
+        plan["budget_kop"] = budget_kop
+        return plan
+
     async def save_plan(
         self,
         session: dict[str, Any],
@@ -560,6 +600,41 @@ class FakeRepository:
     async def telegram_link_token(self, session: dict[str, Any]) -> str:
         del session
         return secrets.token_urlsafe(16)
+
+    # --- аккаунт из бота (TZ-M7 §3.3–3.4) ---------------------------------
+
+    async def web_login_code(self, user_id: Any) -> str:
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        self.web_login_codes[code] = str(user_id)
+        return code
+
+    async def telegram_login(self, code: str) -> tuple[str, str]:
+        from app.web.database import AuthenticationError
+
+        self._record("telegram_login", code)
+        user_id = self.web_login_codes.pop((code or "").strip(), None)
+        if user_id is None:
+            raise AuthenticationError("Код не подошёл: он просрочен или уже использован")
+        return self._create_session(user_id)
+
+    async def has_password(self, user_id: Any) -> bool:
+        return bool(self.users[str(user_id)].get("password"))
+
+    async def set_password(self, session: dict[str, Any], password: str) -> None:
+        self._record("set_password", session["user_id"])
+        if not 8 <= len(password) <= 200:
+            raise ValueError("Пароль должен содержать от 8 до 200 символов")
+        self.users[str(session["user_id"])]["password"] = password
+
+    async def unlink_telegram(self, session: dict[str, Any]) -> bool:
+        self._record("unlink_telegram", session["user_id"])
+        linked = [
+            key for key, value in self.telegram_links.items()
+            if value == str(session["user_id"])
+        ]
+        for key in linked:
+            self.telegram_links.pop(key)
+        return bool(linked)
 
 
 def make_client(test_case: unittest.TestCase, *, role: str = "owner",

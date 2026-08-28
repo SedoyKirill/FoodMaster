@@ -10,6 +10,7 @@
 
 import { api } from "../api.js";
 import { register } from "../actions.js";
+import * as dialog from "../dialog.js";
 import * as format from "../format.js";
 import * as theme from "../theme.js";
 import * as toast from "../toast.js";
@@ -202,6 +203,21 @@ export function enter() {
   renderAppliances(me.appliances);
   renderTheme();
   renderData();
+  renderAccount(me);
+}
+
+function renderAccount(me) {
+  const linked = Boolean(me.telegram_linked);
+  const hasPassword = Boolean(me.user.has_password);
+  document.getElementById("telegram-status").textContent = linked
+    ? `Привязан к аккаунту «${me.user.login}».`
+    : "Бот подключается одноразовой командой; без токена он выключен.";
+  document.getElementById("telegram-unlink").hidden = !linked;
+  document.getElementById("telegram-link").hidden = linked;
+  // TZ-M7 §3.4: аккаунт из бота без пароля после отвязки станет недоступен
+  document.getElementById("account-status").textContent = hasPassword
+    ? "Пароль задан — можно входить и без Telegram."
+    : "Пароля нет: аккаунт заведён из бота, вход в браузер идёт по коду (/web).";
 }
 
 export function init() {
@@ -287,6 +303,45 @@ export function init() {
       node.hidden = false;
     } catch (error) {
       toast.ok(humanError(error));
+    }
+  });
+
+  document.getElementById("telegram-unlink").addEventListener("click", async () => {
+    const me = store.get("me");
+    const confirmed = await dialog.confirm({
+      title: "Отвязать Telegram?",
+      text: me?.user?.has_password
+        ? "Бот перестанет присылать меню. Данные семьи останутся на месте."
+        : "У аккаунта нет пароля — после отвязки войти будет нечем. Сначала задайте пароль ниже.",
+      confirmLabel: "Отвязать",
+    });
+    if (!confirmed) return;
+    try {
+      await api.telegramUnlink();
+      store.set("me", await api.me());
+      enter();
+      toast.ok("Telegram отвязан");
+    } catch (error) {
+      document.getElementById("telegram-error").textContent = humanError(error);
+    }
+  });
+
+  document.getElementById("account-save-password").addEventListener("click", async () => {
+    const input = document.getElementById("account-password");
+    const error = document.getElementById("account-password-error");
+    error.textContent = "";
+    if (input.value.length < 8) {
+      error.textContent = "Пароль: не менее 8 символов.";
+      return;
+    }
+    try {
+      await api.setPassword(input.value);
+      input.value = "";
+      store.set("me", await api.me());
+      enter();
+      toast.ok("Пароль сохранён");
+    } catch (requestError) {
+      error.textContent = humanError(requestError);
     }
   });
 }

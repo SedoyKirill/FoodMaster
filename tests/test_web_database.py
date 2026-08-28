@@ -698,5 +698,117 @@ class RowDictTests(unittest.TestCase):
         self.assertEqual(converted["name"], "Молоко")
 
 
+class CreatePlanTests(unittest.TestCase):
+    """Сборка плана живёт в слое данных: её зовут и веб, и бот (TZ-M7 §2)."""
+
+    def test_viewer_is_rejected_before_any_query(self) -> None:
+        pool = FakePool()
+        repository = repository_with_pool(pool)
+        with self.assertRaises(PermissionError):
+            run_async(repository.create_plan(
+                session(role="viewer"), starts_on=date(2026, 9, 1), days=3
+            ))
+        self.assertEqual(pool.calls, [])
+
+    def test_unknown_tier_is_rejected_before_any_query(self) -> None:
+        pool = FakePool()
+        repository = repository_with_pool(pool)
+        with self.assertRaises(ValueError):
+            run_async(repository.create_plan(
+                session(), starts_on=date(2026, 9, 1), days=3, price_tier="золотой"
+            ))
+        self.assertEqual(pool.calls, [])
+
+
+class TelegramAccountSqlTests(unittest.TestCase):
+    """TZ-M7 §3.2–3.4: аккаунт без пароля, код входа, отвязка."""
+
+    def test_account_from_bot_has_no_password_row(self) -> None:
+        pool = FakePool()
+        repository = repository_with_pool(pool)
+        run_async(repository.register_account("tg7", None, "Моя семья", telegram_user_id=7))
+        self.assertEqual(pool.count_matching("INSERT INTO app_core.password_credentials"), 0)
+        # привязка идёт в той же транзакции, что и создание аккаунта
+        _, args = pool.first_matching("INSERT INTO app_core.auth_identities")
+        self.assertEqual(args[0], "7")
+
+    def test_account_from_web_keeps_password_row(self) -> None:
+        pool = FakePool()
+        repository = repository_with_pool(pool)
+        run_async(repository.register_account("hozyain", "parol12345", "Моя семья"))
+        self.assertEqual(pool.count_matching("INSERT INTO app_core.password_credentials"), 1)
+        self.assertEqual(pool.count_matching("INSERT INTO app_core.auth_identities"), 0)
+
+    def test_registration_from_bot_is_audited_as_telegram(self) -> None:
+        pool = FakePool()
+        repository = repository_with_pool(pool)
+        run_async(repository.register_account(
+            "tg7", None, "Моя семья", telegram_user_id=7, channel="telegram"
+        ))
+        _, args = pool.first_matching("INSERT INTO app_core.audit_log")
+        self.assertIn("telegram", args)
+
+    def test_web_login_code_is_six_digits_and_short_lived(self) -> None:
+        pool = FakePool()
+        repository = repository_with_pool(pool)
+        code = run_async(repository.web_login_code(USER))
+        self.assertRegex(code, r"^\d{6}$")
+        sql, args = pool.first_matching("INSERT INTO app_core.one_time_tokens")
+        self.assertIn("'web_login'", sql)
+        # в базе лежит хеш, а не сам код
+        self.assertNotIn(code, [str(arg) for arg in args])
+
+    def test_login_code_is_burned_and_checked_for_expiry(self) -> None:
+        pool = FakePool()
+        pool.on("fetchrow", "UPDATE app_core.one_time_tokens", {"user_id": USER})
+        pool.on("fetchval", "SELECT status FROM app_core.users", "active")
+        repository = repository_with_pool(pool)
+        run_async(repository.telegram_login("123456"))
+        sql, _ = pool.first_matching("UPDATE app_core.one_time_tokens")
+        self.assertIn("used_at IS NULL", sql)
+        self.assertIn("expires_at > CURRENT_TIMESTAMP", sql)
+        self.assertIn("purpose='web_login'", sql)
+
+    def test_unknown_code_raises_authentication_error(self) -> None:
+        from app.web.database import AuthenticationError
+
+        repository = repository_with_pool(FakePool())  # fetchrow отдаёт None
+        with self.assertRaises(AuthenticationError):
+            run_async(repository.telegram_login("000000"))
+
+    def test_blocked_account_cannot_enter_by_code(self) -> None:
+        from app.web.database import AuthenticationError
+
+        pool = FakePool()
+        pool.on("fetchrow", "UPDATE app_core.one_time_tokens", {"user_id": USER})
+        pool.on("fetchval", "SELECT status FROM app_core.users", "blocked")
+        with self.assertRaises(AuthenticationError):
+            run_async(repository_with_pool(pool).telegram_login("123456"))
+
+    def test_set_password_upserts(self) -> None:
+        pool = FakePool()
+        run_async(repository_with_pool(pool).set_password(session(), "novyyparol"))
+        sql, _ = pool.first_matching("INSERT INTO app_core.password_credentials")
+        self.assertIn("ON CONFLICT (user_id) DO UPDATE", sql)
+
+    def test_unlink_clears_dialog_state(self) -> None:
+        pool = FakePool()
+        pool.on("fetchrow", "DELETE FROM app_core.auth_identities", {"provider_user_id": "88112250"})
+        self.assertTrue(run_async(repository_with_pool(pool).unlink_telegram(session())))
+        _, args = pool.first_matching("DELETE FROM app_core.telegram_dialog_state")
+        self.assertEqual(args, (88112250,))
+
+    def test_unlink_without_link_returns_false(self) -> None:
+        pool = FakePool()  # fetchrow отдаёт None
+        self.assertFalse(run_async(repository_with_pool(pool).unlink_telegram(session())))
+        self.assertEqual(pool.count_matching("DELETE FROM app_core.telegram_dialog_state"), 0)
+
+    def test_profile_reports_password_presence(self) -> None:
+        pool = FakePool()
+        pool.on("fetchval", "FROM app_core.password_credentials", 1)
+        profile = run_async(repository_with_pool(pool).get_profile(session()))
+        self.assertTrue(profile["user"]["has_password"])
+
+
 if __name__ == "__main__":
     unittest.main()
