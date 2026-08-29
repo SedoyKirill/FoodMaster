@@ -146,9 +146,6 @@ class _AppRepo:
 
 
 class _BotRepo:
-    def __init__(self):
-        self.notification_calls = []
-
     async def context_for_user(self, user_id):
         return OWNER
 
@@ -158,11 +155,6 @@ class _BotRepo:
     async def shopping_items(self, household_id):
         return []
 
-    async def notification_settings(self, telegram_id):
-        return {}
-
-    async def set_notification(self, telegram_id, code, enabled, hour):
-        self.notification_calls.append((code, enabled, hour))
 
 
 def buttons(reply):
@@ -421,22 +413,6 @@ class DispatchTests(unittest.TestCase):
             encode_callback("o", "ap", "grill"), TODAY, dialogs=_Dialogs(),
         ))
         self.assertIn("grill", app_repository.appliance_calls[0])
-
-    def test_notification_toggle_reaches_its_handler(self) -> None:
-        """Тумблер напоминаний уходил в чипы кухонь мастера меню.
-
-        Глагол «o» перехватывался целиком: всё, кроме техники, считалось
-        кухней, и нажатие отвечало «Кнопка устарела — откройте мастер заново».
-        """
-        bot_repository = _BotRepo()
-        run_async(handle_callback(
-            _AppRepo(), bot_repository, USER_ID,
-            encode_callback("o", "nt", "shopping"), TODAY, dialogs=_Dialogs(),
-        ))
-        self.assertEqual(
-            [code for code, _enabled, _hour in bot_repository.notification_calls],
-            ["shopping"],
-        )
 
     def test_plan_profile_toggle_through_dispatch(self) -> None:
         app_repository = _AppRepo()

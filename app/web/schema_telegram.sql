@@ -63,19 +63,7 @@ CREATE TABLE IF NOT EXISTS app_core.telegram_dialog_state (
 CREATE INDEX IF NOT EXISTS ix_telegram_dialog_updated
     ON app_core.telegram_dialog_state (updated_at);
 
--- --- §6: напоминания -------------------------------------------------------
--- Ключ снова Telegram from.id: письма уходят в чат, а не в аккаунт, и по этому
--- же идентификатору бот ищет, кому слать. Строка появляется, только когда
--- человек трогает тумблер: пока её нет, действуют умолчания из кода
--- (утреннее меню и сроки годности включены, остальное — по желанию).
--- last_sent_on даёт дедупликацию: цикл крутится раз в минуту, а уведомление
--- должно уйти один раз в день, даже если бот перезапускали.
-CREATE TABLE IF NOT EXISTS app_core.telegram_notifications (
-    user_id BIGINT NOT NULL,
-    kind TEXT NOT NULL,
-    enabled BOOLEAN NOT NULL DEFAULT TRUE,
-    hour SMALLINT NOT NULL DEFAULT 8,
-    last_sent_on DATE,
-    PRIMARY KEY (user_id, kind),
-    CHECK (hour BETWEEN 0 AND 23)
-);
+-- Напоминания убраны по решению владельца 29.08.2026: бот, который пишет
+-- первым, семье не понадобился. Таблица сносится явно — оставлять её значит
+-- держать в схеме то, что никто не читает.
+DROP TABLE IF EXISTS app_core.telegram_notifications;

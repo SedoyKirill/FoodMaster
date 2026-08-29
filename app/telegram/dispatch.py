@@ -203,19 +203,14 @@ async def handle_callback(
                 return result
         if verb == "o":
             # Тумблеры разных экранов различаются областью в первом поле:
-            # «ap» — техника, «nt» — напоминания, «pm»/«pl» — профиль
-            # планирования. Чипы кухонь в мастере меню идут без области, и
-            # раньше всё, кроме техники, уходило к ним — тумблеры уведомлений
-            # отвечали «кнопка устарела».
+            # «ap» — техника, «pm»/«pl» — профиль планирования. Чипы кухонь в
+            # мастере меню идут без области, и когда-то всё, кроме техники,
+            # уходило к ним — чужие тумблеры отвечали «кнопка устарела».
             scope = parts[0] if parts else ""
             tail = parts[1] if len(parts) > 1 else ""
             if scope == "ap":
                 return await settings_scene.toggle_appliance(
                     app_repository, session, tail
-                )
-            if scope == "nt":
-                return await settings_scene.toggle_notification(
-                    bot_repository, user_id, tail
                 )
             if scope in {"pm", "pl"}:
                 return await settings_scene.toggle_plan_profile(
@@ -234,10 +229,6 @@ async def handle_callback(
                 edit=await plan_scene.history_reply(app_repository, session, page)
             )
         # --- библиотека рецептов (§5.7) ---------------------------------------
-        if verb == "n" and parts[:2] == ["st", "notif"]:
-            return CallbackReply(
-                edit=await settings_scene.notifications_reply(bot_repository, user_id)
-            )
         if verb == "n" and parts[:1] == ["st"]:
             result = await settings_scene.handle_navigation(
                 app_repository, dialogs, session, user_id, parts

@@ -23,7 +23,6 @@ from app.web.ratelimit import RateLimiter
 from .callbacks import callback_verb, heavy_placeholder
 from .dispatch import handle_callback, handle_message
 from .fsm import CANCEL_DATA, CANCEL_TEXT, DialogStore
-from .notifications import Notifier
 from .render import CallbackReply, Reply, split_for_telegram
 from .repository import BotRepository, bot_session
 from .router import TOO_FAST_TEXT, Actor, Incoming, Router, parse_update
@@ -576,15 +575,6 @@ async def main() -> None:
         client = TelegramClient(token, http)
         await client.set_my_commands(commands_for(app_repository))
         app = BotApp(client, bot_repository, app_repository, router=router)
-
-        async def deliver(chat_id: int, reply: Reply) -> None:
-            await client.send_message(
-                chat_id, reply.text, reply.keyboard if reply.keyboard else MENU
-            )
-
-        # напоминания живут рядом с опросом, а не внутри него (TZ-M7 §6)
-        notifier = Notifier(bot_repository, app_repository, deliver)
-        notify_task = asyncio.create_task(notifier.run())
         log.info("Бот запущен, ожидаю сообщения (long polling).")
         while True:
             try:

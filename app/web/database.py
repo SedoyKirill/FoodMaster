@@ -2325,11 +2325,6 @@ class AppRepository:
                     "DELETE FROM app_core.telegram_dialog_state WHERE user_id=$1",
                     telegram_id,
                 )
-                # §6: после отвязки напоминания не шлём, и настройки хранить не за чем
-                await connection.execute(
-                    "DELETE FROM app_core.telegram_notifications WHERE user_id=$1",
-                    telegram_id,
-                )
                 await self._audit(
                     connection, session["household_id"], session["user_id"],
                     "auth.telegram_unlinked", "user", session["user_id"],
