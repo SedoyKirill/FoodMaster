@@ -202,14 +202,27 @@ async def handle_callback(
             if result is not None:
                 return result
         if verb == "o":
-            # тумблеры разных экранов: техника в настройках помечена «ap»,
-            # чипы кухонь в мастере меню идут без области
-            if parts[:1] == ["ap"]:
+            # Тумблеры разных экранов различаются областью в первом поле:
+            # «ap» — техника, «nt» — напоминания, «pm»/«pl» — профиль
+            # планирования. Чипы кухонь в мастере меню идут без области, и
+            # раньше всё, кроме техники, уходило к ним — тумблеры уведомлений
+            # отвечали «кнопка устарела».
+            scope = parts[0] if parts else ""
+            tail = parts[1] if len(parts) > 1 else ""
+            if scope == "ap":
                 return await settings_scene.toggle_appliance(
-                    app_repository, session, parts[1] if len(parts) > 1 else ""
+                    app_repository, session, tail
+                )
+            if scope == "nt":
+                return await settings_scene.toggle_notification(
+                    bot_repository, user_id, tail
+                )
+            if scope in {"pm", "pl"}:
+                return await settings_scene.toggle_plan_profile(
+                    app_repository, session, scope, tail
                 )
             return await plan_scene.toggle_cuisine(
-                dialogs, app_repository, user_id, parts[0] if parts else ""
+                dialogs, app_repository, user_id, scope
             )
         if verb == "y" and parts[:1] == ["pd"]:
             return await plan_scene.delete(
@@ -231,10 +244,6 @@ async def handle_callback(
             )
             if result is not None:
                 return result
-        if verb == "o" and parts[:1] == ["nt"]:
-            return await settings_scene.toggle_notification(
-                bot_repository, user_id, parts[1] if len(parts) > 1 else ""
-            )
         if verb == "y" and parts[:1] == ["sp"]:
             return await settings_scene.delete_person(
                 app_repository, session, parts[1] if len(parts) > 1 else ""

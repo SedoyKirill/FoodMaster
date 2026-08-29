@@ -75,9 +75,27 @@ class _AppRepo:
         self.rule_calls = []
         self.removed_rules = []
         self.renames = []
+        self.plan_profile_saves = []
+        self.stored_profile = {
+            "mode": "balanced", "default_days": 7, "weekly_budget_kop": None,
+            "cuisines": [], "cuisine_mode": "only", "weekday_max_minutes": 45,
+            "weekend_max_minutes": None, "breakfast_max_minutes": 25,
+            "meals": ["breakfast", "lunch", "dinner"], "allow_leftovers": True,
+            "novelty": "medium", "max_repeats_per_horizon": 2,
+        }
 
     async def get_profile(self, session):
         return self.data
+
+    async def plan_profile(self, session):
+        return dict(self.stored_profile)
+
+    async def save_plan_profile(self, session, changes):
+        if self.error:
+            raise self.error
+        self.plan_profile_saves.append(dict(changes))
+        self.stored_profile = dict(changes)
+        return dict(changes)
 
     async def dashboard(self, session):
         return {"recipes": 3130, "recipes_ready": 983, "sources": 37,
@@ -128,6 +146,9 @@ class _AppRepo:
 
 
 class _BotRepo:
+    def __init__(self):
+        self.notification_calls = []
+
     async def context_for_user(self, user_id):
         return OWNER
 
@@ -136,6 +157,12 @@ class _BotRepo:
 
     async def shopping_items(self, household_id):
         return []
+
+    async def notification_settings(self, telegram_id):
+        return {}
+
+    async def set_notification(self, telegram_id, code, enabled, hour):
+        self.notification_calls.append((code, enabled, hour))
 
 
 def buttons(reply):
@@ -395,6 +422,30 @@ class DispatchTests(unittest.TestCase):
         ))
         self.assertIn("grill", app_repository.appliance_calls[0])
 
+    def test_notification_toggle_reaches_its_handler(self) -> None:
+        """Тумблер напоминаний уходил в чипы кухонь мастера меню.
+
+        Глагол «o» перехватывался целиком: всё, кроме техники, считалось
+        кухней, и нажатие отвечало «Кнопка устарела — откройте мастер заново».
+        """
+        bot_repository = _BotRepo()
+        run_async(handle_callback(
+            _AppRepo(), bot_repository, USER_ID,
+            encode_callback("o", "nt", "shopping"), TODAY, dialogs=_Dialogs(),
+        ))
+        self.assertEqual(
+            [code for code, _enabled, _hour in bot_repository.notification_calls],
+            ["shopping"],
+        )
+
+    def test_plan_profile_toggle_through_dispatch(self) -> None:
+        app_repository = _AppRepo()
+        run_async(handle_callback(
+            app_repository, _BotRepo(), USER_ID,
+            encode_callback("o", "pl", "left"), TODAY, dialogs=_Dialogs(),
+        ))
+        self.assertFalse(app_repository.plan_profile_saves[-1]["allow_leftovers"])
+
     def test_person_removal_through_dispatch(self) -> None:
         app_repository = _AppRepo()
         run_async(handle_callback(
@@ -505,6 +556,119 @@ class RepositorySqlTests(unittest.TestCase):
         run_async(repository_with_pool(pool).update_appliances(OWNER, ["stove"]))
         _, args = pool.first_matching("INSERT INTO app_core.audit_log")
         self.assertIn("telegram", args)
+
+
+class PlanProfileTests(unittest.TestCase):
+    """«Как планируем» из чата (TZ-M8 §3.4): раньше только браузер."""
+
+    def _open(self, repo=None):
+        repo = repo or _AppRepo()
+        reply = run_async(settings.plan_profile_reply(repo, OWNER))
+        return repo, reply
+
+    def _press(self, repo, parts):
+        return run_async(settings.handle_navigation(
+            repo, _Dialogs(), OWNER, USER_ID, parts
+        ))
+
+    def test_menu_offers_the_section(self) -> None:
+        texts = [
+            button["text"]
+            for row in settings.menu_reply(OWNER).keyboard["inline_keyboard"]
+            for button in row
+        ]
+        self.assertIn("🧭 Как планируем", texts)
+
+    def test_screen_shows_current_profile(self) -> None:
+        _repo, reply = self._open()
+        self.assertIn("Сбалансированно", reply.text)
+        self.assertIn("Дней по умолчанию: 7", reply.text)
+        self.assertIn("На два раза: да", reply.text)
+
+    def test_mode_is_saved(self) -> None:
+        repo = _AppRepo()
+        self._press(repo, ["st", "pmode", "fitness"])
+        self.assertEqual(repo.plan_profile_saves[-1]["mode"], "fitness")
+
+    def test_unknown_mode_is_rejected(self) -> None:
+        repo = _AppRepo()
+        result = self._press(repo, ["st", "pmode", "золотой"])
+        self.assertEqual(result.toast, "Не понял кнопку.")
+        self.assertEqual(repo.plan_profile_saves, [])
+
+    def test_horizon_is_saved(self) -> None:
+        repo = _AppRepo()
+        self._press(repo, ["st", "pdays", "14"])
+        self.assertEqual(repo.plan_profile_saves[-1]["default_days"], 14)
+
+    def test_novelty_is_saved(self) -> None:
+        repo = _AppRepo()
+        self._press(repo, ["st", "pnov", "high"])
+        self.assertEqual(repo.plan_profile_saves[-1]["novelty"], "high")
+
+    def test_saving_one_field_keeps_the_rest(self) -> None:
+        """Репозиторий делает UPSERT всех колонок: неуказанное сбросилось бы."""
+        repo = _AppRepo()
+        repo.stored_profile["weekly_budget_kop"] = 700000
+        self._press(repo, ["st", "pmode", "quick"])
+        saved = repo.plan_profile_saves[-1]
+        self.assertEqual(saved["weekly_budget_kop"], 700000)
+        self.assertEqual(saved["max_repeats_per_horizon"], 2)
+
+    def test_meal_toggle_keeps_day_order(self) -> None:
+        repo = _AppRepo()
+        run_async(settings.toggle_plan_profile(repo, OWNER, "pm", "breakfast"))
+        self.assertEqual(repo.plan_profile_saves[-1]["meals"], ["lunch", "dinner"])
+        run_async(settings.toggle_plan_profile(repo, OWNER, "pm", "breakfast"))
+        self.assertEqual(
+            repo.plan_profile_saves[-1]["meals"], ["breakfast", "lunch", "dinner"]
+        )
+
+    def test_last_meal_cannot_be_switched_off(self) -> None:
+        """План без единого приёма не собрать, и молчать об этом нельзя."""
+        repo = _AppRepo()
+        repo.stored_profile["meals"] = ["dinner"]
+        result = run_async(settings.toggle_plan_profile(repo, OWNER, "pm", "dinner"))
+        self.assertTrue(result.show_alert)
+        self.assertEqual(repo.plan_profile_saves, [])
+
+    def test_leftovers_and_cuisine_mode_toggle(self) -> None:
+        repo = _AppRepo()
+        run_async(settings.toggle_plan_profile(repo, OWNER, "pl", "left"))
+        self.assertFalse(repo.plan_profile_saves[-1]["allow_leftovers"])
+        run_async(settings.toggle_plan_profile(repo, OWNER, "pl", "cmode"))
+        self.assertEqual(repo.plan_profile_saves[-1]["cuisine_mode"], "prefer")
+
+    def test_viewer_cannot_change_the_profile(self) -> None:
+        repo = _AppRepo()
+        result = run_async(settings.toggle_plan_profile(repo, VIEWER, "pl", "left"))
+        self.assertTrue(result.show_alert)
+        self.assertEqual(repo.plan_profile_saves, [])
+
+    def test_weekly_budget_from_free_text(self) -> None:
+        repo = _AppRepo()
+        dialogs = _Dialogs(DialogState(settings.SCENE, "plan_budget", {}))
+        run_async(settings.handle_step(
+            ctx("5000 ₽", dialogs.state, repo, dialogs)
+        ))
+        self.assertEqual(repo.plan_profile_saves[-1]["weekly_budget_kop"], 500000)
+
+    def test_budget_can_be_removed_by_word(self) -> None:
+        repo = _AppRepo()
+        dialogs = _Dialogs(DialogState(settings.SCENE, "plan_budget", {}))
+        run_async(settings.handle_step(
+            ctx("нет", dialogs.state, repo, dialogs)
+        ))
+        self.assertIsNone(repo.plan_profile_saves[-1]["weekly_budget_kop"])
+
+    def test_nonsense_budget_asks_again(self) -> None:
+        repo = _AppRepo()
+        dialogs = _Dialogs(DialogState(settings.SCENE, "plan_budget", {}))
+        reply = run_async(settings.handle_step(
+            ctx("три рубля", dialogs.state, repo, dialogs)
+        ))
+        self.assertIn("от 100 до 100 000", reply.text)
+        self.assertEqual(repo.plan_profile_saves, [])
 
 
 if __name__ == "__main__":

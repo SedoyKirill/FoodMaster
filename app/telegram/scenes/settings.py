@@ -27,6 +27,21 @@ SCENE = "settings.edit"
 
 PERSON_TYPES = {"adult": "Взрослый", "child": "Ребёнок"}
 
+#: Режимы планирования (TZ-M8 §6.4) — те же пять, что в мастере меню и в вебе.
+PLAN_MODES = {
+    "balanced": "⚖️ Сбалансированно",
+    "economy": "💰 Экономно",
+    "variety": "🎲 Разнообразно",
+    "fitness": "💪 Фитнес",
+    "quick": "⚡ Быстро",
+}
+#: сколько нового в меню (§4.5): доля слотов под непробованные блюда
+NOVELTY_LEVELS = {"low": "Проверенное", "medium": "Поровну", "high": "Больше нового"}
+CUISINE_MODES = {"only": "только выбранные", "prefer": "предпочитать"}
+MEAL_NAMES = {"breakfast": "Завтрак", "lunch": "Обед", "dinner": "Ужин"}
+#: горизонты, которые предлагаются кнопками; свободного ввода тут нет
+DAY_CHOICES = (3, 5, 7, 14)
+
 MENU_TEXT = "⚙️ Настройки семьи «{household}» · вы {role}."
 
 ROLE_LABELS = {
@@ -51,6 +66,7 @@ def menu_reply(session: dict[str, Any], taste_ready: bool = False) -> Reply:
          {"text": "🔗 Телеграм", "callback_data": encode_callback("n", "st", "tg")}],
         [{"text": "🔔 Уведомления", "callback_data": encode_callback("n", "st", "notif")},
          {"text": "📊 Данные", "callback_data": encode_callback("n", "st", "data")}],
+        [{"text": "🧭 Как планируем", "callback_data": encode_callback("n", "st", "plan")}],
     ]
     # пункта нет, пока модель вкуса не приехала: кнопка, которая отвечает
     # «пока не умею», хуже отсутствующей кнопки (то же решение, что и в setMyCommands)
@@ -214,6 +230,112 @@ async def toggle_notification(bot_repository: Any, telegram_id: int,
     return CallbackReply(edit=await notifications_reply(bot_repository, telegram_id))
 
 
+# --- как планируем (TZ-M8 §3.4) ------------------------------------------------
+
+def _budget_line(profile: dict[str, Any]) -> str:
+    budget = profile.get("weekly_budget_kop")
+    return f"{int(budget) // 100} ₽ в неделю" if budget else "без ограничения"
+
+
+def _plan_profile_text(profile: dict[str, Any]) -> str:
+    meals = [MEAL_NAMES[code] for code in profile.get("meals") or [] if code in MEAL_NAMES]
+    return "\n".join([
+        "🧭 Как планируем — это подставляется в мастер меню.",
+        f"• Режим: {PLAN_MODES.get(str(profile.get('mode')), profile.get('mode'))}",
+        f"• Дней по умолчанию: {profile.get('default_days')}",
+        f"• Планируем: {', '.join(meals) if meals else 'ничего'}",
+        f"• На два раза: {'да' if profile.get('allow_leftovers') else 'нет'}",
+        f"• Нового в меню: {NOVELTY_LEVELS.get(str(profile.get('novelty')), '—')}",
+        f"• Кухни: {CUISINE_MODES.get(str(profile.get('cuisine_mode')), '—')}",
+        f"• Бюджет: {_budget_line(profile)}",
+    ])
+
+
+async def plan_profile_reply(app_repository: Any, session: dict[str, Any]) -> Reply:
+    """Профиль планирования: что видно, то и меняется одной кнопкой."""
+    profile = await app_repository.plan_profile(session)
+    meals = set(profile.get("meals") or [])
+    rows = [
+        [{"text": "🎛 Режим", "callback_data": encode_callback("n", "st", "pmode")},
+         {"text": "🗓 Горизонт", "callback_data": encode_callback("n", "st", "pdays")}],
+        [{
+            "text": button_text(f"{'✅' if code in meals else '☐'} {name}"),
+            "callback_data": encode_callback("o", "pm", code),
+        } for code, name in MEAL_NAMES.items()],
+        [{
+            "text": button_text(
+                f"{'✅' if profile.get('allow_leftovers') else '☐'} На два раза"
+            ),
+            "callback_data": encode_callback("o", "pl", "left"),
+        }],
+        [{"text": "🆕 Сколько нового", "callback_data": encode_callback("n", "st", "pnov")},
+         {"text": f"🌍 Кухни: {CUISINE_MODES[str(profile.get('cuisine_mode', 'only'))]}",
+          "callback_data": encode_callback("o", "pl", "cmode")}],
+        [{"text": "💰 Бюджет на неделю", "callback_data": encode_callback("n", "st", "pbud")}],
+        _back_row(),
+    ]
+    return Reply(_plan_profile_text(profile), build_keyboard(rows))
+
+
+def _choice_reply(title: str, action: str, options: dict[str, str], current: Any) -> Reply:
+    rows = [[{
+        "text": button_text(f"{'✅' if code == str(current) else '☐'} {label}"),
+        "callback_data": encode_callback("n", "st", action, code),
+    }] for code, label in options.items()]
+    rows.append([{"text": "◀ Назад", "callback_data": encode_callback("n", "st", "plan")}])
+    return Reply(title, build_keyboard(rows))
+
+
+async def save_plan_field(app_repository: Any, session: dict[str, Any],
+                          field: str, value: Any) -> Reply:
+    """Профиль сохраняется целиком: репозиторий делает UPSERT всех колонок и
+    неуказанное сбросил бы к умолчаниям."""
+    profile = await app_repository.plan_profile(session)
+    await app_repository.save_plan_profile(session, {**profile, field: value})
+    return await plan_profile_reply(app_repository, session)
+
+
+async def toggle_plan_profile(app_repository: Any, session: dict[str, Any],
+                             scope: str, code: str) -> CallbackReply:
+    """Тумблеры профиля: приёмы пищи («pm») и флаги («pl»)."""
+    if not _can_edit(session):
+        return CallbackReply(toast=NO_RIGHTS_TEXT, show_alert=True)
+    profile = await app_repository.plan_profile(session)
+    if scope == "pm":
+        if code not in MEAL_NAMES:
+            return CallbackReply(toast="Не понял кнопку.")
+        meals = [item for item in (profile.get("meals") or []) if item in MEAL_NAMES]
+        meals = [item for item in meals if item != code] if code in meals else [*meals, code]
+        if not meals:
+            # План без единого приёма собрать нельзя, и молча выключать всё —
+            # худший способ об этом сообщить.
+            return CallbackReply(
+                toast="Хотя бы один приём пищи нужен.", show_alert=True
+            )
+        # порядок дня, а не порядок нажатий
+        value = [item for item in MEAL_NAMES if item in meals]
+        return CallbackReply(edit=await save_plan_field(
+            app_repository, session, "meals", value))
+    if code == "left":
+        return CallbackReply(edit=await save_plan_field(
+            app_repository, session, "allow_leftovers",
+            not profile.get("allow_leftovers")))
+    if code == "cmode":
+        current = str(profile.get("cuisine_mode", "only"))
+        return CallbackReply(edit=await save_plan_field(
+            app_repository, session, "cuisine_mode",
+            "prefer" if current == "only" else "only"))
+    return CallbackReply(toast="Не понял кнопку.")
+
+
+def ask_weekly_budget(profile: dict[str, Any]) -> Reply:
+    return Reply(
+        "Бюджет на неделю в рублях? Он растягивается на горизонт плана.\n"
+        f"Сейчас: {_budget_line(profile)}. «Нет» — снять ограничение.",
+        build_keyboard([[CANCEL_BUTTON]]),
+    )
+
+
 async def data_reply(app_repository: Any, session: dict[str, Any]) -> Reply:
     counters = await app_repository.dashboard(session)
     lines = [
@@ -314,6 +436,25 @@ async def handle_step(ctx: SceneContext) -> Reply:
         data["target_kcal"] = int(digits)
         return await _store_person(ctx, data)
 
+    if step == "plan_budget":
+        value = text.lower().replace(" ", "").replace("₽", "").replace("руб", "")
+        if value in {"нет", "-", "без", "безбюджета", "любой", "0"}:
+            budget = None
+        else:
+            digits = "".join(char for char in value if char.isdigit())
+            if not digits or not 100 <= int(digits) <= 100_000:
+                profile = await ctx.app_repository.plan_profile(session)
+                return Reply("Сумма от 100 до 100 000 ₽ или «нет».",
+                             ask_weekly_budget(profile).keyboard)
+            budget = int(digits) * 100
+        await ctx.dialogs.save(ctx.actor.user_id, DialogState(SCENE, "menu", {}))
+        try:
+            return await save_plan_field(
+                ctx.app_repository, session, "weekly_budget_kop", budget
+            )
+        except PermissionError as exc:
+            return Reply(str(exc), build_keyboard([_back_row()]))
+
     if step == "rule_term":
         if not 1 <= len(text) <= 100:
             return Reply("Продукт: от 1 до 100 символов.",
@@ -368,6 +509,8 @@ async def handle_navigation(app_repository: Any, dialogs: Any, session: dict[str
         return CallbackReply(edit=await rules_reply(app_repository, session))
     if action == "data":
         return CallbackReply(edit=await data_reply(app_repository, session))
+    if action == "plan":
+        return CallbackReply(edit=await plan_profile_reply(app_repository, session))
     if action == "tg":
         has_password = await app_repository.has_password(session["user_id"])
         return CallbackReply(edit=telegram_reply(session, has_password))
@@ -380,6 +523,40 @@ async def handle_navigation(app_repository: Any, dialogs: Any, session: dict[str
 
     if not _can_edit(session):
         return CallbackReply(toast=NO_RIGHTS_TEXT, show_alert=True)
+
+    if action in {"pmode", "pdays", "pnov", "pbud"}:
+        profile = await app_repository.plan_profile(session)
+        if action == "pmode" and not value:
+            return CallbackReply(edit=_choice_reply(
+                "Как планировать?", "pmode", PLAN_MODES, profile.get("mode")))
+        if action == "pnov" and not value:
+            return CallbackReply(edit=_choice_reply(
+                "Сколько непробованного в меню?", "pnov", NOVELTY_LEVELS,
+                profile.get("novelty")))
+        if action == "pdays" and not value:
+            rows = [[{
+                "text": button_text(
+                    f"{'✅' if days == profile.get('default_days') else '☐'} {days} дн."
+                ),
+                "callback_data": encode_callback("n", "st", "pdays", days),
+            } for days in DAY_CHOICES]]
+            rows.append([{"text": "◀ Назад",
+                          "callback_data": encode_callback("n", "st", "plan")}])
+            return CallbackReply(edit=Reply("На сколько дней планировать обычно?",
+                                            build_keyboard(rows)))
+        if action == "pbud":
+            await dialogs.save(user_id, DialogState(SCENE, "plan_budget", {}))
+            return CallbackReply(edit=ask_weekly_budget(profile))
+        if action == "pmode" and value in PLAN_MODES:
+            return CallbackReply(edit=await save_plan_field(
+                app_repository, session, "mode", value))
+        if action == "pnov" and value in NOVELTY_LEVELS:
+            return CallbackReply(edit=await save_plan_field(
+                app_repository, session, "novelty", value))
+        if action == "pdays" and str(value).isdigit() and int(value) in DAY_CHOICES:
+            return CallbackReply(edit=await save_plan_field(
+                app_repository, session, "default_days", int(value)))
+        return CallbackReply(toast="Не понял кнопку.")
 
     if action == "rename":
         await dialogs.save(user_id, DialogState(SCENE, "rename", {}))
