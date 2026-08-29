@@ -29,8 +29,12 @@ class WeightProfile:
     budget: int = 500
     #: за 100 ккал отклонения слота от цели
     kcal: int = 50
-    #: за 10 г недобора белка в день
-    protein: int = 30
+    #: За 10 г недобора белка в день. Единица целевой функции — 0.1 ₽, то
+    #: есть 300 значит «десять граммов белка стоят тридцати рублей». Стартовые
+    #: 30 (3 ₽) не могли перевесить ничего: белок в целевую входил, но выбор не
+    #: менял. Калибровка 29.08.2026 на живых данных — после волны разметки
+    #: КБЖУ, до неё вес двигал бы то, о чём нет данных.
+    protein: int = 300
     #: множитель аффинити семьи [-1, 1]
     taste: int = 600
     #: за блюдо, о котором семья ничего не знает
@@ -71,22 +75,22 @@ class WeightProfile:
 MODES: dict[str, WeightProfile] = {
     "balanced": WeightProfile(name="balanced"),
     "economy": WeightProfile(
-        name="economy", cost=30, budget=800, kcal=30, protein=10, taste=300,
+        name="economy", cost=30, budget=800, kcal=30, protein=100, taste=300,
         unknown=100, recency=200, variety=200, waste=500, leftover_waste=40,
         leftover=1000, time=50, time_unknown=50, season=150, cuisine=100,
     ),
     "variety": WeightProfile(
-        name="variety", cost=8, budget=400, kcal=40, protein=20, taste=500,
+        name="variety", cost=8, budget=400, kcal=40, protein=200, taste=500,
         unknown=0, recency=900, variety=900, waste=200, leftover_waste=10,
         leftover=500, time=50, time_unknown=50, season=200, cuisine=150,
     ),
     "fitness": WeightProfile(
-        name="fitness", cost=8, budget=400, kcal=120, protein=150, taste=400,
+        name="fitness", cost=8, budget=400, kcal=120, protein=2500, taste=400,
         unknown=150, recency=300, variety=300, waste=200, leftover_waste=10,
         leftover=1000, time=50, time_unknown=50, season=100, cuisine=100,
     ),
     "quick": WeightProfile(
-        name="quick", cost=10, budget=500, kcal=40, protein=20, taste=500,
+        name="quick", cost=10, budget=500, kcal=40, protein=200, taste=500,
         unknown=150, recency=300, variety=300, waste=300, leftover_waste=20,
         leftover=3000, time=600, time_unknown=300, season=50, cuisine=100,
     ),

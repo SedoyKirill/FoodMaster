@@ -83,9 +83,9 @@ class MacroTests(unittest.TestCase):
 
     def test_default_shares_split_energy(self) -> None:
         target = daily_target(make_person(target_kcal=2000), TODAY)
-        self.assertEqual(target.protein_g, 125)  # 2000·0.25 / 4
+        self.assertEqual(target.protein_g, 100)  # 2000·0.20 / 4
         self.assertEqual(target.fat_g, 66)       # 2000·0.30 / 9
-        self.assertEqual(target.carb_g, 225)     # 2000·0.45 / 4
+        self.assertEqual(target.carb_g, 250)     # 2000·0.50 / 4
 
     def test_custom_shares_are_respected(self) -> None:
         person = make_person(

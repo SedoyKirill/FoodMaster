@@ -992,6 +992,7 @@ def build_plan(
     plan_profile: dict[str, Any] | None = None,
     taste_events: list[dict[str, Any]] | None = None,
     mode: str | None = None,
+    weights: Any = None,
 ) -> dict[str, Any]:
     """Фасад TZ-M5R: кандидаты → оценка → оптимизация → масштабирование → покупки.
 
@@ -1003,6 +1004,9 @@ def build_plan(
     ``plan_profile`` — лимиты времени и прочие настройки семьи (§3.4).
     ``mode`` — режим планирования (§6.4): он задаёт веса целевой функции и,
     если ``price_tier`` не передан явно, ценовую стратегию матчера товаров.
+    ``weights`` перекрывает веса режима целиком — это нужно калибровке
+    (``scripts/calibrate_protein_weight.py``), чтобы собрать один и тот же
+    план с разными числами; приложение веса не передаёт.
     """
     from .planning import candidates as candidates_mod
     from .planning import context as context_mod
@@ -1029,7 +1033,7 @@ def build_plan(
     # Режим планирования (§6.4) — единственный источник весов; ценовая
     # стратегия матчера выводится из него, но явный price_tier сильнее.
     plan_mode = mode or (plan_profile or {}).get("mode")
-    weights = weights_mod.weights_for(plan_mode)
+    weights = weights or weights_mod.weights_for(plan_mode)
     price_tier = price_tier or weights_mod.price_tier_for(plan_mode)
 
     # TZ-M8 §3.1–3.2: слот принадлежит тем, кто ест его дома. Приём, который
