@@ -41,6 +41,14 @@ CUISINE_MODES = {"only": "только выбранные", "prefer": "пред�
 MEAL_NAMES = {"breakfast": "Завтрак", "lunch": "Обед", "dinner": "Ужин"}
 #: горизонты, которые предлагаются кнопками; свободного ввода тут нет
 DAY_CHOICES = (3, 5, 7, 14)
+#: сколько раз одно блюдо повторяется за план (CHECK в схеме — 1..7)
+REPEAT_CHOICES = (1, 2, 3, 4)
+#: лимиты времени готовки: поле профиля → как называется и в какой шаг ведёт
+TIME_LIMITS = {
+    "weekday_max_minutes": ("Будни", "plan_wd"),
+    "weekend_max_minutes": ("Выходные", "plan_we"),
+    "breakfast_max_minutes": ("Завтрак", "plan_bf"),
+}
 
 MENU_TEXT = "⚙️ Настройки семьи «{household}» · вы {role}."
 
@@ -237,6 +245,17 @@ def _budget_line(profile: dict[str, Any]) -> str:
     return f"{int(budget) // 100} ₽ в неделю" if budget else "без ограничения"
 
 
+def _minutes_line(value: Any) -> str:
+    return f"{int(value)} мин" if value else "без лимита"
+
+
+def _time_summary(profile: dict[str, Any]) -> str:
+    return ", ".join(
+        f"{title.lower()} {_minutes_line(profile.get(field))}"
+        for field, (title, _step) in TIME_LIMITS.items()
+    )
+
+
 def _plan_profile_text(profile: dict[str, Any]) -> str:
     meals = [MEAL_NAMES[code] for code in profile.get("meals") or [] if code in MEAL_NAMES]
     return "\n".join([
@@ -248,6 +267,9 @@ def _plan_profile_text(profile: dict[str, Any]) -> str:
         f"• Нового в меню: {NOVELTY_LEVELS.get(str(profile.get('novelty')), '—')}",
         f"• Кухни: {CUISINE_MODES.get(str(profile.get('cuisine_mode')), '—')}",
         f"• Бюджет: {_budget_line(profile)}",
+        f"• Время готовки: {_time_summary(profile)}",
+        f"• Повторов блюда за план: не больше "
+        f"{profile.get('max_repeats_per_horizon')}",
     ])
 
 
@@ -272,6 +294,8 @@ async def plan_profile_reply(app_repository: Any, session: dict[str, Any]) -> Re
          {"text": f"🌍 Кухни: {CUISINE_MODES[str(profile.get('cuisine_mode', 'only'))]}",
           "callback_data": encode_callback("o", "pl", "cmode")}],
         [{"text": "💰 Бюджет на неделю", "callback_data": encode_callback("n", "st", "pbud")}],
+        [{"text": "⏱ Время готовки", "callback_data": encode_callback("n", "st", "ptime")},
+         {"text": "🔁 Повторы", "callback_data": encode_callback("n", "st", "prep")}],
         _back_row(),
     ]
     return Reply(_plan_profile_text(profile), build_keyboard(rows))
@@ -293,6 +317,46 @@ async def save_plan_field(app_repository: Any, session: dict[str, Any],
     profile = await app_repository.plan_profile(session)
     await app_repository.save_plan_profile(session, {**profile, field: value})
     return await plan_profile_reply(app_repository, session)
+
+
+def time_limits_reply(profile: dict[str, Any]) -> Reply:
+    """Сколько времени на готовку есть в будни, в выходные и на завтрак.
+
+    Лимит — не запрет: рецепт без указанного времени всё равно попадёт в план
+    (TZ-M8 §3.5), а слишком долгий получит штраф, а не отсев.
+    """
+    lines = ["⏱ Сколько времени на готовку:"]
+    rows = []
+    for field, (title, _step) in TIME_LIMITS.items():
+        lines.append(f"• {title}: {_minutes_line(profile.get(field))}")
+        rows.append([{
+            "text": button_text(f"{title}: {_minutes_line(profile.get(field))}"),
+            "callback_data": encode_callback("n", "st", "ptime", field),
+        }])
+    rows.append([{"text": "◀ Назад", "callback_data": encode_callback("n", "st", "plan")}])
+    return Reply("\n".join(lines), build_keyboard(rows))
+
+
+def ask_minutes(title: str, current: Any) -> Reply:
+    return Reply(
+        f"Сколько минут на готовку — {title.lower()}?\n"
+        f"Сейчас: {_minutes_line(current)}. «Нет» — снять лимит.",
+        build_keyboard([[CANCEL_BUTTON]]),
+    )
+
+
+def repeats_reply(profile: dict[str, Any]) -> Reply:
+    current = profile.get("max_repeats_per_horizon")
+    rows = [[{
+        "text": button_text(f"{'✅' if count == current else '☐'} {count}"),
+        "callback_data": encode_callback("n", "st", "prep", count),
+    } for count in REPEAT_CHOICES]]
+    rows.append([{"text": "◀ Назад", "callback_data": encode_callback("n", "st", "plan")}])
+    return Reply(
+        "Сколько раз одно блюдо может повториться за план?\n"
+        "Единица — все блюда разные; больше — меню дешевле, но однообразнее.",
+        build_keyboard(rows),
+    )
 
 
 async def toggle_plan_profile(app_repository: Any, session: dict[str, Any],
@@ -455,6 +519,29 @@ async def handle_step(ctx: SceneContext) -> Reply:
         except PermissionError as exc:
             return Reply(str(exc), build_keyboard([_back_row()]))
 
+    if step in {field_step for _title, field_step in TIME_LIMITS.values()}:
+        field = next(
+            name for name, (_title, field_step) in TIME_LIMITS.items()
+            if field_step == step
+        )
+        title = TIME_LIMITS[field][0]
+        value = text.lower().replace(" ", "")
+        if value in {"нет", "-", "без", "безлимита", "любое"}:
+            minutes = None
+        else:
+            digits = "".join(char for char in value if char.isdigit())
+            if not digits or not 5 <= int(digits) <= 600:
+                profile = await ctx.app_repository.plan_profile(session)
+                return Reply("Минуты: число от 5 до 600 или «нет».",
+                             ask_minutes(title, profile.get(field)).keyboard)
+            minutes = int(digits)
+        await ctx.dialogs.save(ctx.actor.user_id, DialogState(SCENE, "menu", {}))
+        try:
+            await save_plan_field(ctx.app_repository, session, field, minutes)
+        except PermissionError as exc:
+            return Reply(str(exc), build_keyboard([_back_row()]))
+        return time_limits_reply(await ctx.app_repository.plan_profile(session))
+
     if step == "rule_term":
         if not 1 <= len(text) <= 100:
             return Reply("Продукт: от 1 до 100 символов.",
@@ -523,6 +610,24 @@ async def handle_navigation(app_repository: Any, dialogs: Any, session: dict[str
 
     if not _can_edit(session):
         return CallbackReply(toast=NO_RIGHTS_TEXT, show_alert=True)
+
+    if action == "ptime":
+        profile = await app_repository.plan_profile(session)
+        if not value:
+            return CallbackReply(edit=time_limits_reply(profile))
+        if value not in TIME_LIMITS:
+            return CallbackReply(toast="Не понял кнопку.")
+        title, step = TIME_LIMITS[value]
+        await dialogs.save(user_id, DialogState(SCENE, step, {}))
+        return CallbackReply(edit=ask_minutes(title, profile.get(value)))
+    if action == "prep":
+        profile = await app_repository.plan_profile(session)
+        if not value:
+            return CallbackReply(edit=repeats_reply(profile))
+        if not str(value).isdigit() or int(value) not in REPEAT_CHOICES:
+            return CallbackReply(toast="Не понял кнопку.")
+        return CallbackReply(edit=await save_plan_field(
+            app_repository, session, "max_repeats_per_horizon", int(value)))
 
     if action in {"pmode", "pdays", "pnov", "pbud"}:
         profile = await app_repository.plan_profile(session)

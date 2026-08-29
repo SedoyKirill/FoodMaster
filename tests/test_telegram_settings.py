@@ -645,6 +645,52 @@ class PlanProfileTests(unittest.TestCase):
         self.assertTrue(result.show_alert)
         self.assertEqual(repo.plan_profile_saves, [])
 
+    def test_screen_shows_time_and_repeats(self) -> None:
+        _repo, reply = self._open()
+        self.assertIn("будни 45 мин", reply.text)
+        self.assertIn("выходные без лимита", reply.text)
+        self.assertIn("Повторов блюда за план: не больше 2", reply.text)
+
+    def test_repeats_are_saved(self) -> None:
+        repo = _AppRepo()
+        self._press(repo, ["st", "prep", "1"])
+        self.assertEqual(repo.plan_profile_saves[-1]["max_repeats_per_horizon"], 1)
+
+    def test_repeats_outside_the_range_are_rejected(self) -> None:
+        repo = _AppRepo()
+        result = self._press(repo, ["st", "prep", "9"])
+        self.assertEqual(result.toast, "Не понял кнопку.")
+        self.assertEqual(repo.plan_profile_saves, [])
+
+    def test_time_limit_from_free_text(self) -> None:
+        repo = _AppRepo()
+        dialogs = _Dialogs(DialogState(settings.SCENE, "plan_wd", {}))
+        run_async(settings.handle_step(ctx("30 минут", dialogs.state, repo, dialogs)))
+        self.assertEqual(repo.plan_profile_saves[-1]["weekday_max_minutes"], 30)
+
+    def test_time_limit_can_be_removed(self) -> None:
+        repo = _AppRepo()
+        dialogs = _Dialogs(DialogState(settings.SCENE, "plan_bf", {}))
+        run_async(settings.handle_step(ctx("нет", dialogs.state, repo, dialogs)))
+        self.assertIsNone(repo.plan_profile_saves[-1]["breakfast_max_minutes"])
+
+    def test_absurd_time_limit_asks_again(self) -> None:
+        repo = _AppRepo()
+        dialogs = _Dialogs(DialogState(settings.SCENE, "plan_we", {}))
+        reply = run_async(settings.handle_step(ctx("2", dialogs.state, repo, dialogs)))
+        self.assertIn("от 5 до 600", reply.text)
+        self.assertEqual(repo.plan_profile_saves, [])
+
+    def test_each_limit_writes_its_own_field(self) -> None:
+        """Три лимита ведут в три разных шага — легко перепутать поля."""
+        for step, field in (("plan_wd", "weekday_max_minutes"),
+                            ("plan_we", "weekend_max_minutes"),
+                            ("plan_bf", "breakfast_max_minutes")):
+            repo = _AppRepo()
+            dialogs = _Dialogs(DialogState(settings.SCENE, step, {}))
+            run_async(settings.handle_step(ctx("40", dialogs.state, repo, dialogs)))
+            self.assertEqual(repo.plan_profile_saves[-1][field], 40, field)
+
     def test_weekly_budget_from_free_text(self) -> None:
         repo = _AppRepo()
         dialogs = _Dialogs(DialogState(settings.SCENE, "plan_budget", {}))
