@@ -16,7 +16,6 @@ from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from app.web.payloads import PRICE_TIERS
 
 from ..callbacks import encode_callback, pack_uuid, unpack_uuid
 from ..fsm import CANCEL_BUTTON, DialogState
@@ -29,21 +28,32 @@ from . import SceneContext
 #: имя сцены в telegram_dialog_state
 SCENE = "plan.new"
 
-#: §5.3, шаг 2. До TZ-M8 горизонт ограничен семью днями: и PlanPayload, и
-#: CHECK в meal_plans допускают 1–7. Четырнадцать приедут вместе с M8 T3.
-DAY_CHOICES = (3, 5, 7)
+#: §5.3, шаг 2. Две недели пришли с TZ-M8 §3.4: ротация блюд на неделе не
+#: видна, а на четырнадцати днях — видна.
+DAY_CHOICES = (3, 5, 7, 14)
 BUDGET_CHOICES = (3000, 5000)
-#: §5.3, шаг 4. Пять режимов планирования — это TZ-M8; пока три ценовые
-#: стратегии, ровно те же, что в форме браузера.
-TIER_LABELS = {
-    "economy": "💰 Экономно",
+#: §5.3, шаг 4. Режимы планирования (TZ-M8 §6.4) — те же пять, что в форме
+#: браузера. До M8 здесь спрашивалась ценовая стратегия; она никуда не делась,
+#: но выводится из режима и человека больше не спрашивается.
+MODE_LABELS = {
     "balanced": "⚖️ Сбалансированно",
-    "premium": "✨ Премиально",
+    "economy": "💰 Экономно",
+    "variety": "🎲 Разнообразно",
+    "fitness": "💪 Фитнес",
+    "quick": "⚡ Быстро",
+}
+#: чем режим жертвует — строкой под кнопками, иначе выбор вслепую
+MODE_HINTS = {
+    "balanced": "цена, вкус и разнообразие поровну",
+    "economy": "дешевле; чаще повторы и остатки в дело",
+    "variety": "меньше повторов, цена на втором плане",
+    "fitness": "держит калории и белок каждый день",
+    "quick": "короткое время готовки важнее цены",
 }
 #: сколько кухонь показываем чипами: клавиатура должна оставаться читаемой
 CUISINE_LIMIT = 12
 
-STEPS = ("start", "days", "budget", "tier", "cuisines", "confirm")
+STEPS = ("start", "days", "budget", "mode", "cuisines", "confirm")
 
 _WEEKDAY_NAMES = (
     "понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье",
@@ -137,8 +147,8 @@ def _chosen_lines(data: dict[str, Any]) -> list[str]:
     if "budget_kop" in data:
         budget = data["budget_kop"]
         lines.append(f"Бюджет: {budget // 100} ₽" if budget else "Бюджет: без ограничения")
-    if data.get("price_tier"):
-        lines.append(f"Режим: {TIER_LABELS[data['price_tier']]}")
+    if data.get("mode"):
+        lines.append(f"Режим: {MODE_LABELS[data['mode']]}")
     if "cuisines" in data:
         chosen = data["cuisines"]
         lines.append("Кухни: " + (", ".join(chosen) if chosen else "любые"))
@@ -172,16 +182,18 @@ def step_reply(step: str, data: dict[str, Any], cuisines: list[str] | None = Non
         text = "С какого дня составить меню? Можно написать дату: «12.09»."
     elif step == "days":
         rows = [[_step_button("days", days, f"{days}") for days in DAY_CHOICES]]
-        text = "На сколько дней? Можно написать число от 1 до 7."
+        text = f"На сколько дней? Можно написать число от 1 до {max(DAY_CHOICES)}."
     elif step == "budget":
         rows = [
             [_step_button("budget", amount, f"{amount} ₽") for amount in BUDGET_CHOICES],
             [_step_button("budget", "none", "Без бюджета")],
         ]
         text = "Какой бюджет на продукты? Можно написать сумму в рублях."
-    elif step == "tier":
-        rows = [[_step_button("tier", code, label)] for code, label in TIER_LABELS.items()]
-        text = "Как выбирать продукты?"
+    elif step == "mode":
+        rows = [[_step_button("mode", code, label)] for code, label in MODE_LABELS.items()]
+        text = "Как планировать?\n" + "\n".join(
+            f"{label} — {MODE_HINTS[code]}" for code, label in MODE_LABELS.items()
+        )
     elif step == "cuisines":
         chosen = set(data.get("cuisines") or [])
         chips = [
@@ -238,7 +250,7 @@ async def handle_step(ctx: SceneContext) -> Reply:
         if isinstance(budget, str):
             return Reply(budget, step_reply(step, data).keyboard)
         data["budget_kop"] = budget
-    elif step == "tier":
+    elif step == "mode":
         return Reply("Выберите режим кнопкой.", step_reply(step, data).keyboard)
     elif step == "cuisines":
         return Reply("Отмечайте кухни кнопками и жмите «Готово».",
@@ -298,10 +310,10 @@ async def handle_callback(
         data["days"] = int(value)
     elif field == "budget":
         data["budget_kop"] = None if value == "none" else int(value) * 100
-    elif field == "tier":
-        if value not in PRICE_TIERS:
+    elif field == "mode":
+        if value not in MODE_LABELS:
             return CallbackReply(toast="Не понял кнопку.")
-        data["price_tier"] = value
+        data["mode"] = value
     elif field == "cuisines":
         data["cuisines"] = [] if value == "any" else list(data.get("cuisines") or [])
         await dialogs.save(user_id, DialogState(SCENE, "confirm", data))
@@ -351,7 +363,9 @@ async def build(app_repository: Any, dialogs: Any, session: dict[str, Any],
             days=int(data.get("days") or DAY_CHOICES[0]),
             budget_kop=data.get("budget_kop"),
             cuisines=list(data.get("cuisines") or []),
-            price_tier=data.get("price_tier") or "balanced",
+            # Режим задаёт и веса целевой функции, и ценовую стратегию
+            # матчера (TZ-M8 §6.4) — price_tier отдельно не передаётся.
+            mode=data.get("mode"),
         )
     except PermissionError as exc:
         await dialogs.clear(user_id)
@@ -401,9 +415,9 @@ def plan_header(plan: dict[str, Any]) -> str:
         # бы склонять, а пользы от слова здесь нет
         lines.append(f"Сопоставлено с каталогом: {matched} из {total} ({share} %)")
 
-    tier = TIER_LABELS.get(str(plan.get("price_tier")))
-    if tier:
-        lines.append(f"Режим: {tier}")
+    mode = MODE_LABELS.get(str(plan.get("mode")))
+    if mode:
+        lines.append(f"Режим: {mode}")
     warnings = plan.get("warnings") or []
     if warnings:
         lines.append(f"Предупреждений: {len(warnings)}")

@@ -45,7 +45,7 @@ def make_plan(days=3, budget_kop=500000, cost_kop=412000, plan_id=PLAN_ID):
         "id": str(plan_id), "starts_on": "2026-09-01", "days": days,
         "budget_kop": budget_kop, "estimated_cost_kop": cost_kop,
         "matched_cost_items": 23, "total_cost_items": 25,
-        "price_tier": "balanced", "warnings": ["Рецепты требуют проверки."],
+        "mode": "balanced", "warnings": ["Рецепты требуют проверки."],
         "meals": meals, "shopping": [],
     }
 
@@ -196,7 +196,7 @@ class WizardTests(unittest.TestCase):
             _AppRepo(), dialogs, CONTEXT, USER_ID, ["pl", "budget", "none"], TODAY
         ))
         self.assertIsNone(dialogs.state.data["budget_kop"])
-        self.assertEqual(dialogs.state.step, "tier")
+        self.assertEqual(dialogs.state.step, "mode")
 
     def test_cuisine_chips_toggle(self) -> None:
         dialogs = _Dialogs(DialogState(plan.SCENE, "cuisines", {}))
@@ -216,18 +216,32 @@ class WizardTests(unittest.TestCase):
 
     def test_library_without_cuisines_skips_the_question(self) -> None:
         """Спрашивать про кухни, которых нет в библиотеке, незачем."""
-        dialogs = _Dialogs(DialogState(plan.SCENE, "tier", {}))
+        dialogs = _Dialogs(DialogState(plan.SCENE, "mode", {}))
         run_async(plan.handle_callback(
-            _AppRepo(cuisines=[]), dialogs, CONTEXT, USER_ID, ["pl", "tier", "economy"], TODAY
+            _AppRepo(cuisines=[]), dialogs, CONTEXT, USER_ID, ["pl", "mode", "economy"], TODAY
         ))
         self.assertEqual(dialogs.state.step, "confirm")
 
-    def test_unknown_tier_is_rejected(self) -> None:
-        dialogs = _Dialogs(DialogState(plan.SCENE, "tier", {}))
+    def test_mode_is_remembered(self) -> None:
+        """Режим — это веса целевой функции, а не подпись в сводке (§6.4)."""
+        dialogs = _Dialogs(DialogState(plan.SCENE, "mode", {}))
+        run_async(plan.handle_callback(
+            _AppRepo(), dialogs, CONTEXT, USER_ID, ["pl", "mode", "fitness"], TODAY
+        ))
+        self.assertEqual(dialogs.state.data["mode"], "fitness")
+
+    def test_unknown_mode_is_rejected(self) -> None:
+        dialogs = _Dialogs(DialogState(plan.SCENE, "mode", {}))
         result = run_async(plan.handle_callback(
-            _AppRepo(), dialogs, CONTEXT, USER_ID, ["pl", "tier", "золотой"], TODAY
+            _AppRepo(), dialogs, CONTEXT, USER_ID, ["pl", "mode", "золотой"], TODAY
         ))
         self.assertEqual(result.toast, "Не понял кнопку.")
+
+    def test_two_week_horizon_is_offered(self) -> None:
+        """Две недели пришли с M8; до него мастер знал только неделю."""
+        self.assertIn(14, plan.DAY_CHOICES)
+        self.assertEqual(plan.parse_days("14"), 14)
+        self.assertIsNone(plan.parse_days("15"))
 
     def test_stale_wizard_button_says_so(self) -> None:
         result = run_async(plan.handle_callback(
@@ -240,7 +254,7 @@ class BuildTests(unittest.TestCase):
     def _dialogs(self):
         return _Dialogs(DialogState(plan.SCENE, "confirm", {
             "starts_on": "2026-09-01", "days": 5, "budget_kop": 500000,
-            "price_tier": "economy", "cuisines": ["georgian"],
+            "mode": "economy", "cuisines": ["georgian"],
         }))
 
     def test_build_passes_collected_answers(self) -> None:
@@ -249,7 +263,7 @@ class BuildTests(unittest.TestCase):
         run_async(plan.build(app_repository, dialogs, CONTEXT, USER_ID, TODAY))
         self.assertEqual(app_repository.create_calls[0], {
             "starts_on": date(2026, 9, 1), "days": 5, "budget_kop": 500000,
-            "cuisines": ["georgian"], "price_tier": "economy",
+            "cuisines": ["georgian"], "mode": "economy",
         })
         self.assertEqual(dialogs.cleared, 1)  # мастер закрыт
 
