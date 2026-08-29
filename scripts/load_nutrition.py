@@ -3,9 +3,9 @@
 Запуск: DATABASE_URL=postgresql://ration:ration@localhost:5432/ration \
     python scripts/load_nutrition.py
 Идемпотентно: UPSERT по имени. Невалидные записи отбрасываются с логом:
-kcal вне [0..900], БЖУ вне [0..100], либо энергия из БЖУ (4Б+9Ж+4У)
-существенно превышает заявленную ккал (перекачанные макросы). Недобор
-энергии допустим — алкоголь и органические кислоты дают ккал вне БЖУ.
+kcal вне [0..900], БЖУ вне [0..100], либо энергия из БЖУ существенно
+превышает заявленную ккал (перекачанные макросы). Недобор энергии допустим —
+алкоголь и органические кислоты дают ккал вне БЖУ.
 """
 
 import asyncio
@@ -34,23 +34,38 @@ def valid_row(item: dict) -> str | None:
     for label, value in (("Б", protein), ("Ж", fat), ("У", carb)):
         if not (0 <= value <= 100):
             return f"{label} {value} вне [0..100]"
-    computed = 4 * protein + 9 * fat + 4 * carb
+    # Углеводы считаются по 2 ккал/г, а не по 4: у специй, отрубей и
+    # разрыхлителя основная часть «углеводов» — клетчатка и карбонаты, которые
+    # организм так не усваивает. С коэффициентом 4 проверка отбраковывала
+    # настоящие справочные значения (душистый перец 263 ккал при 72 г
+    # углеводов, разрыхлитель 53 при 28) — то есть выбрасывала все специи
+    # разом. Колонки клетчатки в справочнике нет, поэтому берётся усреднение.
+    computed = 4 * protein + 9 * fat + 2 * carb
     if computed > kcal * 1.35 + 30:
         return f"БЖУ дают {computed:.0f} ккал при заявленных {kcal:.0f}"
     piece = item.get("piece_mass_g")
     if piece is not None:
+        # Масса штуки вне разумных границ (арбуз на 5 кг) — повод выбросить
+        # само поле, а не всю запись: КБЖУ арбуза остаётся верным, теряется
+        # только пересчёт «2 штуки» в граммы.
         try:
             if not (0 < float(piece) <= 1000):
-                return f"piece_mass_g {piece} вне (0..1000]"
+                item["piece_mass_g"] = None
         except (TypeError, ValueError):
-            return "piece_mass_g не число"
+            item["piece_mass_g"] = None
     return None
 
 
 async def main() -> None:
     conn = await asyncpg.connect(os.environ["DATABASE_URL"])
     loaded = rejected = 0
-    for path in sorted(glob.glob("data/nutrition/extracted/batch-*.json")):
+    # Пачки первой разметки лежат как batch-*.json, ответы волны TZ-M8 —
+    # как wave-batch-*.json. Загрузка идемпотентна, так что порядок не важен.
+    paths = sorted(
+        glob.glob("data/nutrition/extracted/batch-*.json")
+        + glob.glob("data/nutrition/extracted/wave-batch-*.json")
+    )
+    for path in paths:
         try:
             items = json.loads(open(path, encoding="utf-8-sig").read())
             assert isinstance(items, list)
