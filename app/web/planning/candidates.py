@@ -39,16 +39,25 @@ class Synonyms:
 
     @classmethod
     def from_rows(cls, rows: list[dict[str, Any]]) -> "Synonyms":
+        """Словарь из строк таблицы; неизвестный домен игнорируется.
+
+        Раньше «всё, что не group» попадало в словоформы. Когда M8 завёл
+        третий домен ``protein_base``, старая версия кода прочитала его строки
+        как словоформы и начала переименовывать продукты в коды: молоко стало
+        «dairy», яйцо — «eggs», и список покупок предлагал купить «meat».
+        Незнакомый вид лучше пропустить: следующий домен появится так же.
+        """
         forms: dict[str, str] = {}
         groups: dict[str, str] = {}
         bases: dict[str, str] = {}
-        by_kind = {"group": groups, "protein_base": bases}
+        by_kind = {"form": forms, "group": groups, "protein_base": bases}
         for row in rows:
             term = str(row.get("term") or "").strip().casefold()
             canonical = str(row.get("canonical") or "").strip().casefold()
-            if not term or not canonical:
+            target = by_kind.get(str(row.get("kind") or "form"))
+            if not term or not canonical or target is None:
                 continue
-            by_kind.get(str(row.get("kind")), forms)[term] = canonical
+            target[term] = canonical
         return cls(forms, groups, bases)
 
     def canonical_token(self, token: str) -> str:

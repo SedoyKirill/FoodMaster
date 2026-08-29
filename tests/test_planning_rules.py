@@ -64,6 +64,43 @@ def plan_for(recipes, rules, synonyms=SYNONYM_ROWS, appliances=(), people=None):
     )
 
 
+class SynonymDomainTests(unittest.TestCase):
+    """Домены словаря не перетекают друг в друга (дефект 29.08.2026).
+
+    M8 завёл третий вид синонимов — белковую базу. Работавший в это время
+    старый код читал «всё, что не group» как словоформу, поэтому строка
+    «молоко → dairy» переименовала молоко в списке покупок: семье
+    предлагалось купить «dairy», «eggs» и «meat». Незнакомый домен должен
+    пропускаться, а не толковаться наугад.
+    """
+
+    ROWS = [
+        {"term": "молока", "canonical": "молоко", "kind": "form"},
+        {"term": "молоко", "canonical": "dairy", "kind": "protein_base"},
+        {"term": "фундук", "canonical": "орех", "kind": "group"},
+        {"term": "нечто", "canonical": "ерунда", "kind": "домен-из-будущего"},
+    ]
+
+    def test_protein_base_is_not_a_word_form(self) -> None:
+        synonyms = Synonyms.from_rows(self.ROWS)
+        self.assertEqual(synonyms.canonical_token("молоко"), "молоко")
+        self.assertEqual(synonyms.bases["молоко"], "dairy")
+
+    def test_word_forms_still_work(self) -> None:
+        synonyms = Synonyms.from_rows(self.ROWS)
+        self.assertEqual(synonyms.canonical_token("молока"), "молоко")
+
+    def test_unknown_domain_is_ignored_entirely(self) -> None:
+        synonyms = Synonyms.from_rows(self.ROWS)
+        for domain in (synonyms.forms, synonyms.groups, synonyms.bases):
+            self.assertNotIn("нечто", domain)
+
+    def test_row_without_kind_is_a_word_form(self) -> None:
+        """Старые строки писались без вида — они словоформы."""
+        synonyms = Synonyms.from_rows([{"term": "муки", "canonical": "мука"}])
+        self.assertEqual(synonyms.canonical_token("муки"), "мука")
+
+
 class SynonymRuleTests(unittest.TestCase):
     def test_allergy_matches_through_group_synonym(self) -> None:
         """Тест 1: правило «орехи» исключает рецепт с «фундук»."""
